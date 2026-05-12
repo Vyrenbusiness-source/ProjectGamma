@@ -1,0 +1,20 @@
+/* ProjectGamma · Desktop · Brand-Animation
+ * Leichter Atem-Effekt für den Markennamen in der Titlebar/Crumb.
+ * Isoliertes Modul — bläht styles.css nicht auf.
+ */
+
+@keyframes pg-brand-pulse {
+  0%   { letter-spacing: 0.00em; opacity: 0.86; }
+  50%  { letter-spacing: 0.06em; opacity: 1.00; }
+  100% { letter-spacing: 0.00em; opacity: 0.86; }
+}
+
+.brand-anim {
+  display: inline-block;
+  animation: pg-brand-pulse 2.6s ease-in-out infinite;
+  will-change: letter-spacing, opacity;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .brand-anim { animation: none; }
+}

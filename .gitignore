@@ -37,8 +37,10 @@ mobile-app/_screenshot-*.png
 mobile-app/_*.log
 mobile-app/_*.txt
 
-# Release-folder (zu groß für git; build artifact)
-release/
+# Release-folder: source-distribution + APK fürs Phone wird gepusht.
+# Nur die node_modules-kopien innerhalb ausschließen — start.bat installiert sie
+# beim ersten run sowieso neu.
+release/**/node_modules/
 
 # Cloudflared binary (auto-downloaded zur runtime, ~25 MB)
 sync-server/bin/

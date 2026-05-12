@@ -1,0 +1,239 @@
+// MembersModal · multi-user schicht 2 UI.
+// Listet mitglieder, owner darf einladen/entfernen. Endpoints:
+//   GET    /api/projects/:id/members
+//   POST   /api/projects/:id/members        { email, role }
+//   DELETE /api/projects/:id/members/:userId
+//
+// Isoliertes modul (window.MembersModal), feature-first.
+
+(function () {
+  const { useState, useEffect, useCallback } = React;
+  if (!React) return;
+
+  function MembersModal({ projectId, onClose }) {
+    const client = window.useSync ? window.useSync() : null;
+    const [members, setMembers] = useState(null);
+    const [myUserId, setMyUserId] = useState(null);
+    const [loading, setLoading] = useState(true);
+    const [error, setError] = useState(null);
+    const [inviteOpen, setInviteOpen] = useState(false);
+    const [inviteEmail, setInviteEmail] = useState("");
+    const [inviteRole, setInviteRole] = useState("member");
+    const [inviteBusy, setInviteBusy] = useState(false);
+
+    const headers = useCallback(() => ({
+      authorization: "Bearer " + client.token,
+      "content-type": "application/json",
+    }), [client]);
+
+    const refresh = useCallback(async () => {
+      if (!client) return;
+      setLoading(true); setError(null);
+      try {
+        // Wer bin ich? — bei pair-token kommt 401 → myUserId bleibt null
+        try {
+          const meRes = await fetch(client.serverUrl + "/api/auth/me", {
+            headers: { authorization: "Bearer " + client.token },
+          });
+          if (meRes.ok) {
+            const j = await meRes.json();
+            setMyUserId(j.user?.id || null);
+          } else { setMyUserId(null); }
+        } catch (_) { setMyUserId(null); }
+
+        const r = await fetch(
+          client.serverUrl + "/api/projects/" + encodeURIComponent(projectId) + "/members",
+          { headers: { authorization: "Bearer " + client.token } },
+        );
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(data.error || ("fehler " + r.status));
+        setMembers(data.members || []);
+      } catch (e) {
+        setError((e && e.message) || "fehler");
+        setMembers(null);
+      } finally {
+        setLoading(false);
+      }
+    }, [client, projectId]);
+
+    useEffect(() => { refresh(); }, [refresh]);
+
+    const amOwner = (() => {
+      if (!myUserId || !members) return false;
+      const me = members.find((m) => m.userId === myUserId);
+      return me && me.role === "owner";
+    })();
+
+    const isPairToken = !myUserId; // pair-tokens haben keinen user → legacy vollzugriff
+    const canInvite = amOwner || isPairToken;
+
+    const submitInvite = async () => {
+      const email = inviteEmail.trim();
+      if (!email) return;
+      setInviteBusy(true);
+      try {
+        const r = await fetch(
+          client.serverUrl + "/api/projects/" + encodeURIComponent(projectId) + "/members",
+          { method: "POST", headers: headers(),
+            body: JSON.stringify({ email, role: inviteRole }) },
+        );
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(data.error || ("fehler " + r.status));
+        setInviteEmail(""); setInviteOpen(false);
+        refresh();
+      } catch (e) {
+        alert(e.message);
+      } finally {
+        setInviteBusy(false);
+      }
+    };
+
+    const remove = async (m) => {
+      if (!confirm("„" + (m.email || m.userId) + "“ aus dem projekt entfernen?")) return;
+      try {
+        const r = await fetch(
+          client.serverUrl + "/api/projects/" + encodeURIComponent(projectId) + "/members/" +
+            encodeURIComponent(m.userId),
+          { method: "DELETE", headers: { authorization: "Bearer " + client.token } },
+        );
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(data.error || ("fehler " + r.status));
+        refresh();
+      } catch (e) {
+        alert(e.message);
+      }
+    };
+
+    const downloadArchive = async () => {
+      try {
+        const r = await fetch(client.serverUrl + "/api/projects/" + encodeURIComponent(projectId) + "/archive",
+          { method: "POST", headers: { authorization: "Bearer " + client.token } });
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.error || ("fehler " + r.status));
+        // Browser-download via temporary anchor
+        const a = document.createElement("a");
+        a.href = client.serverUrl + data.url;
+        a.download = "";
+        document.body.appendChild(a); a.click();
+        setTimeout(() => document.body.removeChild(a), 1000);
+      } catch (e) { alert("archiv-fehler: " + e.message); }
+    };
+
+    return (
+      <div className="modal-bg" onClick={onClose}>
+        <div className="modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 540 }}>
+          <div className="modal-head">
+            <div>
+              <div className="eyebrow">// projekt-mitglieder</div>
+              <h2 className="h2">mitglieder &amp; rollen</h2>
+            </div>
+            <button className="btn tiny" onClick={onClose}>×</button>
+          </div>
+          <div style={{
+            display: "flex", gap: 8, alignItems: "center",
+            padding: 10, marginBottom: 12,
+            border: "1.5px dashed var(--line)", borderRadius: 6,
+          }}>
+            <span style={{ fontSize: 18 }}>📦</span>
+            <div style={{ flex: 1, fontSize: 12, color: "var(--ink-soft)", lineHeight: 1.4 }}>
+              <strong>projekt-archiv</strong> · server zipt den projektordner für team-download
+            </div>
+            <button className="btn tiny primary" onClick={downloadArchive}>archiv erstellen + download</button>
+          </div>
+
+          {isPairToken && (
+            <div style={{
+              padding: 8, marginBottom: 12,
+              border: "1.5px dashed var(--line)", borderRadius: 6,
+              fontSize: 11.5, color: "var(--ink-soft)", fontFamily: "monospace", lineHeight: 1.5,
+            }}>
+              du bist mit einem <strong>pair-token</strong> verbunden (legacy
+              vollzugriff). für rollen-checks logge dich mit einem account ein
+              („🔐 account").
+            </div>
+          )}
+
+          {loading ? (
+            <div className="empty" style={{ padding: 20 }}>lade…</div>
+          ) : error ? (
+            <div style={{ color: "#c33", padding: 8, border: "1.5px solid #c33", borderRadius: 6 }}>
+              {error}
+            </div>
+          ) : !members || members.length === 0 ? (
+            <div className="empty" style={{ padding: 14 }}>
+              keine mitglieder. lege einen account-user an („🔐 account") oder lade einen ein.
+            </div>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              {members.map((m) => {
+                const me = myUserId && m.userId === myUserId;
+                const canRemove = canInvite && !me;
+                return (
+                  <div key={m.userId} style={{
+                    display: "flex", alignItems: "center", gap: 10,
+                    padding: "8px 10px",
+                    border: "2px solid var(--ink)", borderRadius: 6, background: "var(--paper)",
+                  }}>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontFamily: "monospace", fontSize: 13, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis" }}>
+                        {m.email || m.userId}
+                        {me && <span className="chip" style={{ marginLeft: 6 }}>du</span>}
+                      </div>
+                      <div style={{ marginTop: 3 }}>
+                        <span className={"chip" + (m.role === "owner" ? " solid" : "")}>
+                          {m.role}
+                        </span>
+                      </div>
+                    </div>
+                    {canRemove && (
+                      <button className="btn tiny danger" onClick={() => remove(m)} title="entfernen">×</button>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {canInvite && !inviteOpen && (
+            <div style={{ marginTop: 14 }}>
+              <button className="btn primary" onClick={() => setInviteOpen(true)}>
+                + mitglied einladen
+              </button>
+            </div>
+          )}
+
+          {canInvite && inviteOpen && (
+            <div style={{ marginTop: 14, padding: 10, border: "2px dashed var(--ink)", borderRadius: 6 }}>
+              <div className="eyebrow" style={{ marginBottom: 8 }}>// neuer member</div>
+              <label className="field">
+                <span className="eyebrow">email</span>
+                <input className="input" type="email" autoFocus
+                       value={inviteEmail} onChange={(e) => setInviteEmail(e.target.value)}
+                       placeholder="user@example.com" />
+              </label>
+              <div className="field">
+                <span className="eyebrow">rolle</span>
+                <div style={{ display: "flex", gap: 6, marginTop: 4 }}>
+                  {["owner", "member", "viewer"].map((r) => (
+                    <button key={r}
+                      className={"btn tiny" + (inviteRole === r ? " primary" : "")}
+                      onClick={() => setInviteRole(r)}>{r}</button>
+                  ))}
+                </div>
+              </div>
+              <div style={{ display: "flex", gap: 8, marginTop: 10, justifyContent: "flex-end" }}>
+                <button className="btn" onClick={() => { setInviteOpen(false); setInviteEmail(""); }} disabled={inviteBusy}>abbrechen</button>
+                <button className="btn primary" onClick={submitInvite}
+                        disabled={inviteBusy || !inviteEmail.trim()}>
+                  {inviteBusy ? "…" : "einladen →"}
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  window.MembersModal = MembersModal;
+})();

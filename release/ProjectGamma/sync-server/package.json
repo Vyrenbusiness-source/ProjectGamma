@@ -1,0 +1,16 @@
+{
+  "name": "projectgamma-sync-server",
+  "version": "1.0.0",
+  "description": "Sync server for ProjectGamma desktop + mobile",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test test/auth_guards.test.js lib/safe_path.test.js lib/spawn_guard.test.js lib/ws_session_guard.test.js lib/default_project_path.test.js lib/claim_rate_limit.test.js lib/rule_diff_queue.test.js lib/sqlite_store.test.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.0",
+    "nat-upnp": "^1.1.1",
+    "ws": "^8.18.0"
+  }
+}
