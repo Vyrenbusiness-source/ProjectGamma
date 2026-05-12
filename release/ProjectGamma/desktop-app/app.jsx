@@ -548,7 +548,7 @@ function MainHead({ project, activeTab, onTab, onAction, onDelete }) {
           {!collapsed && (
             <>
               <div className="sub" style={{ display: "flex", gap: 8, alignItems: "center", maxWidth: "100%", overflow: "hidden" }}>
-                <select className="tech-select" value={project.tech}
+                <select className="tech-select" value={project.tech || "andere"}
                         onChange={e => patch({ tech: e.target.value })}>
                   {TECH_OPTIONS.map(t => <option key={t} value={t}>{t}</option>)}
                 </select>
@@ -2126,7 +2126,10 @@ function App() {
     }
     if (a === "openIDE") {
       if (!project.path) { showToast("kein lokaler pfad gesetzt — bitte oben pflegen"); return; }
-      window.location.href = "vscode://file/" + project.path.replace(/\\/g, "/");
+      // URL-encode damit pfade mit leerzeichen/sonderzeichen (z.B. "C:/My Projects/foo")
+      // korrekt an vscode übergeben werden statt zu brechen.
+      const normalized = project.path.replace(/\\/g, "/");
+      window.location.href = "vscode://file/" + encodeURI(normalized);
       showToast("öffne in vscode…");
     }
     if (a === "share") {
@@ -2193,7 +2196,7 @@ function App() {
         <span className="crumb"><span className="brand-anim">ProjectGamma</span> · {project?.name || "—"} · {TABS.find(t => t.id === client.activeTab)?.label || ""}</span>
         <div className="right">
           <span className={"cc-dot" + (client.connected ? " live" : "")}>
-            {client.connected ? `server · ${client.serverUrl.replace("http://", "")}` : "server getrennt"}
+            {client.connected ? `server · ${client.serverUrl.replace(/^https?:\/\//, "")}` : "server getrennt"}
           </span>
           {window.OfflineQueuePanel ? <window.OfflineQueuePanel client={client} /> : null}
         </div>

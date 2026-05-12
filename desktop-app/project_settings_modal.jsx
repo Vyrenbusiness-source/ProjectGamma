@@ -113,12 +113,18 @@
               ) : (
                 <ul className="goals" style={{ marginTop: 8 }}>
                   {goals.map((g, i) => (
-                    <li key={i}>
+                    // key bewusst stabil pro position+text — sonst übernimmt das input bei
+                    // remove den state der nachrückenden zeile.
+                    <li key={`${i}:${g}`}>
                       <input className="input" style={{ flex: 1, border: "none", padding: 0, background: "transparent" }}
                              defaultValue={g}
                              onBlur={e => {
                                const v = e.target.value.trim();
-                               if (v && v !== g) editGoal(i, v);
+                               if (v === g) return;
+                               // Leer geräumt → als löschen behandeln statt silent drop
+                               // (sonst denkt der user die löschung wurde gespeichert).
+                               if (!v) { removeGoal(i); return; }
+                               editGoal(i, v);
                              }} />
                       <button className="x-btn" onClick={() => removeGoal(i)} title="ziel entfernen">×</button>
                     </li>
@@ -159,7 +165,10 @@
                                defaultValue={f.name}
                                onBlur={e => {
                                  const v = e.target.value.trim();
-                                 if (v && v !== f.name) renameFile(f.id, v);
+                                 if (v === f.name) return;
+                                 // Leer geräumt → als löschen behandeln (sonst silent drop)
+                                 if (!v) { removeFile(f.id); return; }
+                                 renameFile(f.id, v);
                                }} />
                         <div className="tree-actions">
                           <button className="x-btn" title="einrücken" onClick={() => indentFile(f.id, +1)}>→</button>
@@ -188,11 +197,21 @@
   // Description-section mit AI-summarize-button. Kurze description landet
   // im Header (clamp), lange version wird in `descriptionLong` gehalten.
   function SectionDescription({ project, client, patch }) {
-    const [text, setText] = useState(project.description || project.descriptionLong || "");
+    const serverValue = project.description || project.descriptionLong || "";
+    const [text, setText] = useState(serverValue);
     const [busy, setBusy] = useState(false);
     const [err, setErr] = useState(null);
     const [preview, setPreview] = useState(null); // { summary, originalLength }
-    const dirty = text !== (project.description || project.descriptionLong || "");
+    const [focused, setFocused] = useState(false);
+    const dirty = text !== serverValue;
+    // Live-update sync: wenn der server-wert sich ändert (zB ein team-mate hat
+    // parallel editiert), zieh den neuen wert ins textarea — aber NUR wenn der
+    // user gerade nicht tippt und nichts ungespeichertes vorliegt.
+    React.useEffect(() => {
+      if (focused || dirty) return;
+      if (text !== serverValue) setText(serverValue);
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [serverValue]);
 
     const commit = () => {
       if (text === (project.description || project.descriptionLong || "")) return;
@@ -248,7 +267,8 @@
                   placeholder="kurzbeschreibung des projekts — was, für wen, warum"
                   value={text}
                   onChange={e => setText(e.target.value)}
-                  onBlur={commit} />
+                  onFocus={() => setFocused(true)}
+                  onBlur={() => { setFocused(false); commit(); }} />
         {err && <div style={{ color: "#c33", fontSize: 12, marginTop: 4 }}>⚠ {err}</div>}
         {preview && (
           <div style={{ marginTop: 8, padding: 10, border: "1.5px dashed var(--ink)", borderRadius: 6, background: "rgba(0,150,80,0.05)" }}>

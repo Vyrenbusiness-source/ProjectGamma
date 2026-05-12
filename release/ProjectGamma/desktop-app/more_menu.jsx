@@ -3,8 +3,10 @@
 // Aktionen: openIDE, share, syncNow, openSettings, löschen.
 
 (function () {
+  // React-guard ZUERST — destrukturieren wirft sonst wenn React global fehlt
+  // (z.B. CDN-load-fail), und window.MoreMenu würde dann nie registriert.
+  if (typeof React === "undefined" || !React) return;
   const { useState, useEffect, useRef } = React;
-  if (!React) return;
 
   function MoreMenu({ onAction, onDelete, hasPath }) {
     const [open, setOpen] = useState(false);

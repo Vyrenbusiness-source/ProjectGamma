@@ -245,11 +245,15 @@ class SyncClient {
   }
 
   /// Mutation. Bevorzugt WS, fällt zurück auf offline-queue + HTTP.
-  /// Bei !connected wird der dispatch in offlineQueue gespiegelt
-  /// (optimistisches UI) und nach reconnect via drainAndSend gesendet.
+  /// Bei !connected ODER ws.readyState != OPEN(1) wird das mut in die offline-queue
+  /// gespiegelt — verhindert silent-drop wenn der WS gerade closing/connecting ist
+  /// während `connected` noch stale auf true steht.
+  /// Fire-and-forget: kein await für server-ack; UI rendert optimistisch und
+  /// drainAndSend schickt die queue nach reconnect.
   async mutate(type, payload = {}) {
     const mut = { type, payload };
-    if (this.connected && this.ws && this.ws.readyState === 1) {
+    const wsReady = this.ws && this.ws.readyState === 1;
+    if (this.connected && wsReady) {
       this._send({ type: "MUT", mutation: mut });
       return;
     }
@@ -318,7 +322,10 @@ class SyncClient {
 
   setActiveProject(id) {
     this.activeProjectId = id;
-    localStorage.setItem(SYNC_LS_ACTIVE, id);
+    // Null-guard: ohne den check landet beim löschen des letzten projekts der
+    // string "null" im localStorage und beim nächsten boot ist activeId truthy.
+    if (id) localStorage.setItem(SYNC_LS_ACTIVE, id);
+    else    localStorage.removeItem(SYNC_LS_ACTIVE);
     this._emit();
   }
   setActiveTab(id) {

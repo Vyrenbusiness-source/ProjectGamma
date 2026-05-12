@@ -38,9 +38,19 @@ mobile-app/_*.log
 mobile-app/_*.txt
 
 # Release-folder: source-distribution + APK fürs Phone wird gepusht.
-# Nur die node_modules-kopien innerhalb ausschließen — start.bat installiert sie
-# beim ersten run sowieso neu.
+# Aber: alle privaten/runtime-files ausschließen, falls user sync-server
+# innerhalb des release-folders gestartet hat — sqlite-state, sessions, settings,
+# uploads etc. dürfen NIE ins git.
 release/**/node_modules/
+release/**/store.sqlite*
+release/**/op_log.sqlite*
+release/**/sessions.json
+release/**/user_settings.json
+release/**/.mcp.resolved.*
+release/**/.pg-uploads/
+release/**/.pg-archives/
+release/**/tls/
+release/**/bin/
 
 # Cloudflared binary (auto-downloaded zur runtime, ~25 MB)
 sync-server/bin/
