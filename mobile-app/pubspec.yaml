@@ -1,0 +1,39 @@
+name: projectgamma_mobile
+description: "ProjectGamma Mobile · Cloud-Code Sync"
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.11.5
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+  http: ^1.2.2
+  web_socket_channel: ^3.0.1
+  shared_preferences: ^2.3.2
+  mobile_scanner: ^5.2.3
+  app_links: ^6.3.2
+  flutter_local_notifications: ^17.2.4
+  crypto: ^3.0.3
+  path_provider: ^2.1.4
+  open_filex: ^4.5.0
+  image_picker: ^1.1.2
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_launcher_icons: ^0.14.1
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/Logo.png
+
+flutter_launcher_icons:
+  android: true
+  ios: false
+  image_path: "assets/Logo.png"
+  adaptive_icon_background: "#faf8f3"
+  adaptive_icon_foreground: "assets/Logo.png"

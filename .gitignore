@@ -1,0 +1,64 @@
+# Build-artefakte
+node_modules/
+**/build/
+**/.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+android/.gradle/
+android/local.properties
+
+# Lokale state-/auth-daten — NIEMALS veröffentlichen
+sync-server/store.json
+sync-server/store.sqlite*
+sync-server/sessions.json
+sync-server/op_log.sqlite*
+sync-server/user_settings.json
+sync-server/tls/
+sync-server/.mcp.resolved.*.json
+sync-server/.pg-uploads/
+sync-server/.pg-archives/
+
+# Audit-/test-screenshots
+desktop-app/_audit-*.png
+desktop-app/_collab-*.png
+desktop-app/_test-*.png
+
+# Mobile builds
+mobile-app/build/
+mobile-app/.dart_tool/
+mobile-app/android/.gradle/
+mobile-app/android/local.properties
+mobile-app/android/app/debug.keystore
+mobile-app/ios/Pods/
+mobile-app/store.sqlite*
+mobile-app/_phone-*.png
+mobile-app/_phone-*.xml
+mobile-app/_screenshot-*.png
+mobile-app/_*.log
+mobile-app/_*.txt
+
+# Release-folder (zu groß für git; build artifact)
+release/
+
+# Ssh-keys (auch wenn lokal abgelegt)
+*.pem
+*_rsa
+*_ed25519
+deploy_key*
+
+# IDE / OS
+.vscode/
+.idea/
+*.iml
+.DS_Store
+Thumbs.db
+
+# Logs / debug-leftover
+*.log
+sync-server/_dump.js
+sync-server/_http_check.txt
+desktop-app/_test-*.png
+desktop-app/_http_err.log
+
+# Flutter SDK (lokal entpackt — nicht in repo)
+Flutter/

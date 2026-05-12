@@ -1,0 +1,88 @@
+Ja. Hier ist die Idee sauberer und professioneller beschrieben:
+
+## App-Konzept: Projekt-Manager mit Cloud-Code-Integration
+
+Ich möchte eine **Dart-/Flutter-Anwendung** entwickeln, mit der ich Softwareprojekte verwalten und direkt mit einer **Cloud-Code-API** verbinden kann.
+
+Die App soll es ermöglichen, ein bestehendes Projekt auszuwählen oder ein neues Projekt anzulegen. Nach der Auswahl verbindet sich die Anwendung automatisch mit meiner Cloud-Code-API beziehungsweise meldet sich dort an. Cloud Code soll anschließend Zugriff auf die Projektstruktur, offene Aufgaben, Regeln und Projektziele erhalten.
+
+## Kernfunktionen
+
+### 1. Projektauswahl
+
+Der Nutzer kann in der App ein Projekt auswählen. Jedes Projekt besitzt:
+
+* Projektname
+* Projektbeschreibung
+* Dateistruktur
+* offene Aufgaben
+* erledigte Aufgaben
+* globale Projektregeln
+* Ideenliste
+* Cloud-Code-Verbindungsstatus
+
+### 2. Cloud-Code-Verbindung
+
+Die App verbindet sich automatisch mit der Cloud-Code-API. Cloud Code soll innerhalb des ausgewählten Projekts arbeiten können und dabei:
+
+* offene Punkte einsehen
+* Aufgaben priorisieren
+* Code- oder Strukturprobleme erkennen
+* Projektstruktur bereinigen
+* neue Checkmarks hinzufügen
+* erledigte Punkte abhaken
+* den Fortschritt dauerhaft speichern
+
+### 3. Projektweite Regeln
+
+Für jedes Projekt können Regeln definiert werden, die immer gelten. Beispiel:
+
+* kein unnötiger Code
+* klare Ordnerstruktur
+* jede neue Funktion muss dokumentiert werden
+* keine Änderung ohne Checkmark
+* bestehende Architektur respektieren
+* mobile und Desktop-Synchronisation beachten
+
+Cloud Code muss bei jeder Arbeit am Projekt diese Regeln automatisch berücksichtigen.
+
+### 4. Aufgaben- und Checkmark-System
+
+Die App enthält ein sauberes Aufgaben-System. Cloud Code kann:
+
+* neue Aufgaben erstellen
+* Aufgaben in Unterpunkte zerlegen
+* Aufgaben als erledigt markieren
+* technische Schulden dokumentieren
+* offene Probleme erkennen
+* Fortschritt aktualisieren
+
+### 5. Mobile Ideen-Erfassung
+
+Über die Handy-App kann ich jederzeit neue Ideen hinzufügen. Diese Ideen werden mit dem Projekt synchronisiert.
+
+Beispiel:
+
+> „Füge ein Belohnungssystem hinzu.“
+
+Wenn ich später das Projekt am PC öffne, erkennt die App automatisch die neue Idee und Cloud Code kann daraus Aufgaben erstellen oder direkt daran weiterarbeiten.
+
+### 6. Synchronisation zwischen Handy und PC
+
+Alle Projektdaten sollen zentral gespeichert werden, zum Beispiel über eine Datenbank oder Cloud-Synchronisation. Dadurch sind Handy-App und PC-Version immer auf demselben Stand.
+
+Synchronisiert werden:
+
+* Ideen
+* Aufgaben
+* Checkmarks
+* Projektregeln
+* Cloud-Code-Status
+* Projektfortschritt
+* letzte Änderungen
+
+## Kurzbeschreibung
+
+Die Anwendung ist ein intelligenter Projekt-Manager für Entwickler. Sie verbindet Flutter/Dart mit einer Cloud-Code-API, damit Cloud Code dauerhaft an einem ausgewählten Projekt arbeiten kann. Der Nutzer kann Regeln, Aufgaben und Ideen verwalten. Neue Ideen lassen sich mobil hinzufügen und werden automatisch mit der PC-Version synchronisiert, sodass Cloud Code später direkt daran weiterarbeiten kann.
+
+Design siehe folder projectgamma

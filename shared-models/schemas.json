@@ -1,0 +1,46 @@
+{
+  "$comment": "Shared-Models-Quelle. Felder werden zu Dart + JS generiert. Typen: string, int, double, bool, list<T>, map<string,T>. ?-Suffix = nullable.",
+  "models": {
+    "Task": {
+      "fields": {
+        "id": "string",
+        "title": "string",
+        "done": "bool",
+        "group": "string",
+        "createdAt": "int",
+        "updatedAt": "int",
+        "ownerUserId": "string?",
+        "tags": "list<string>"
+      }
+    },
+    "Idea": {
+      "fields": {
+        "id": "string",
+        "text": "string",
+        "createdAt": "int",
+        "convertedTaskId": "string?"
+      }
+    },
+    "RuleDiff": {
+      "fields": {
+        "id": "string",
+        "kind": "string",
+        "text": "string",
+        "status": "string",
+        "createdAt": "int",
+        "approvedAt": "int?"
+      }
+    },
+    "Conflict": {
+      "fields": {
+        "id": "string",
+        "field": "string",
+        "localValue": "string?",
+        "remoteValue": "string?",
+        "status": "string",
+        "createdAt": "int",
+        "resolvedWith": "string?"
+      }
+    }
+  }
+}
