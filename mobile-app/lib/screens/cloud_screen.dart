@@ -200,6 +200,12 @@ class _CloudScreenState extends State<CloudScreen> {
           if (p['pendingQuestion'] != null && (p['pendingQuestion'] as String).isNotEmpty)
             _CcQuestionCard(
               question: (p['pendingQuestion'] as String),
+              autoAnswer: p['ccAutoAnswer'] == true,
+              autoAnswerDelaySec: (p['ccAutoAnswerDelaySec'] is num ? (p['ccAutoAnswerDelaySec'] as num).toInt() : 30),
+              pendingAt: (p['pendingQuestionAt'] is num ? (p['pendingQuestionAt'] as num).toInt() : null),
+              onToggleAutoAnswer: (on) {
+                client.mutate('TOGGLE_CC_AUTO_ANSWER', {'projectId': p['id'], 'on': on});
+              },
               onAnswer: (answer) async {
                 final q = (p['pendingQuestion'] as String);
                 final replyPrompt = answer.trim().isEmpty
@@ -253,17 +259,51 @@ class _CloudScreenState extends State<CloudScreen> {
 class _CcQuestionCard extends StatefulWidget {
   final String question;
   final void Function(String answer) onAnswer;
-  const _CcQuestionCard({required this.question, required this.onAnswer});
+  final bool autoAnswer;
+  final int autoAnswerDelaySec;
+  final int? pendingAt;
+  final void Function(bool on) onToggleAutoAnswer;
+  const _CcQuestionCard({
+    required this.question,
+    required this.onAnswer,
+    required this.autoAnswer,
+    required this.autoAnswerDelaySec,
+    required this.pendingAt,
+    required this.onToggleAutoAnswer,
+  });
   @override
   State<_CcQuestionCard> createState() => _CcQuestionCardState();
 }
 
 class _CcQuestionCardState extends State<_CcQuestionCard> {
   final _ctrl = TextEditingController();
+  Timer? _tick;
   @override
-  void dispose() { _ctrl.dispose(); super.dispose(); }
+  void initState() {
+    super.initState();
+    if (widget.autoAnswer) {
+      _tick = Timer.periodic(const Duration(seconds: 1), (_) { if (mounted) setState(() {}); });
+    }
+  }
+  @override
+  void didUpdateWidget(_CcQuestionCard old) {
+    super.didUpdateWidget(old);
+    if (widget.autoAnswer && _tick == null) {
+      _tick = Timer.periodic(const Duration(seconds: 1), (_) { if (mounted) setState(() {}); });
+    } else if (!widget.autoAnswer && _tick != null) {
+      _tick?.cancel(); _tick = null;
+    }
+  }
+  @override
+  void dispose() { _tick?.cancel(); _ctrl.dispose(); super.dispose(); }
   @override
   Widget build(BuildContext context) {
+    int? remainingSec;
+    if (widget.autoAnswer && widget.pendingAt != null) {
+      final elapsed = DateTime.now().millisecondsSinceEpoch - widget.pendingAt!;
+      remainingSec = (widget.autoAnswerDelaySec * 1000 - elapsed) ~/ 1000;
+      if (remainingSec < 0) remainingSec = 0;
+    }
     return Container(
       padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
       decoration: BoxDecoration(
@@ -272,10 +312,37 @@ class _CcQuestionCardState extends State<_CcQuestionCard> {
         borderRadius: BorderRadius.circular(8),
       ),
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        const PgEyebrow('claude hat eine rückfrage'),
+        Row(children: [
+          const Expanded(child: PgEyebrow('claude hat eine rückfrage')),
+          // Auto-answer toggle inline
+          GestureDetector(
+            onTap: () => widget.onToggleAutoAnswer(!widget.autoAnswer),
+            child: Row(mainAxisSize: MainAxisSize.min, children: [
+              SizedBox(
+                width: 16, height: 16,
+                child: Checkbox(
+                  value: widget.autoAnswer,
+                  onChanged: (v) => widget.onToggleAutoAnswer(v ?? false),
+                  materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                ),
+              ),
+              const SizedBox(width: 4),
+              const Text('auto-answer', style: TextStyle(fontSize: 11, color: pgInkSoft)),
+            ]),
+          ),
+        ]),
         const SizedBox(height: 6),
         Text('❓ ${widget.question}',
           style: const TextStyle(fontSize: 14, height: 1.4, fontWeight: FontWeight.w500)),
+        if (remainingSec != null) ...[
+          const SizedBox(height: 6),
+          Text('⏱ auto-antwort in ${remainingSec}s — jetzt antworten zum stoppen',
+            style: TextStyle(
+              fontSize: 12,
+              color: remainingSec <= 5 ? pgDanger : const Color(0xFFCC8800),
+              fontWeight: FontWeight.w600,
+            )),
+        ],
         const SizedBox(height: 10),
         TextField(controller: _ctrl,
           decoration: const InputDecoration(

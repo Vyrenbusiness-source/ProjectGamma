@@ -517,8 +517,13 @@ function MainHead({ project, activeTab, onTab, onAction, onDelete }) {
     ideas: (project.ideas || []).filter(i => i.status === "unprocessed").length,
   };
   // Cloud-code hat eine offene Frage → tab visuell hervorheben (atmender ❓-dot)
-  // damit user sie nicht übersieht.
-  const ccPending = !!(project.pendingQuestion && (project.pendingQuestion.text || project.pendingQuestion.question));
+  // damit user sie nicht übersieht. pendingQuestion ist ein string (siehe
+  // SET_PENDING_QUESTION mutation). Frühere version checkte .text/.question →
+  // war immer false. Jetzt: string-check.
+  const pqRaw = project.pendingQuestion;
+  const ccPending = typeof pqRaw === "string"
+    ? pqRaw.trim().length > 0
+    : !!(pqRaw && (pqRaw.text || pqRaw.question));
   // Einklapp-toggle: header schrumpft auf 1 zeile (titel + tabs + buttons).
   // Persistent in localStorage damit es nicht bei jedem reload zurückspringt.
   const [collapsed, setCollapsed] = useState(() => {
@@ -1559,18 +1564,52 @@ const ACT_GLYPHS = {
 // Cc-Rückfrage-Widget: claude hat eine frage zum projekt → user antwortet,
 // skipped („mach autonom weiter") oder verwirft. Erscheint OBERHALB des
 // freien prompts wenn project.pendingQuestion gesetzt ist.
-function CcPendingQuestion({ question, onAnswer }) {
+// Wenn auto-answer aktiv: zeigt countdown bis zur auto-antwort.
+function CcPendingQuestion({ question, onAnswer, autoAnswer, autoAnswerDelaySec, pendingAt, onToggleAutoAnswer, onChangeDelay }) {
   const [answer, setAnswer] = useState("");
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    if (!autoAnswer) return;
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, [autoAnswer]);
+  const remainingMs = autoAnswer
+    ? Math.max(0, (pendingAt || now) + (autoAnswerDelaySec * 1000) - now)
+    : null;
+  const remainingSec = remainingMs == null ? null : Math.ceil(remainingMs / 1000);
+
   return (
     <div className="box" style={{
       marginBottom: 12,
       border: "2px solid var(--ink)",
       background: "rgba(255, 240, 200, 0.3)",
     }}>
-      <div className="eyebrow">// claude hat eine rückfrage</div>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <div className="eyebrow">// claude hat eine rückfrage</div>
+        {/* Auto-answer toggle inline. Pro projekt persistent (server-state). */}
+        <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 11, color: "var(--ink-soft)", cursor: "pointer" }}>
+          <input type="checkbox" checked={!!autoAnswer} onChange={(e) => onToggleAutoAnswer(e.target.checked)} />
+          auto-answer
+          {autoAnswer && (
+            <>
+              <span style={{ marginLeft: 4 }}>nach</span>
+              <input type="number" min={5} max={600} step={5}
+                     value={autoAnswerDelaySec || 30}
+                     onChange={(e) => onChangeDelay(Number(e.target.value))}
+                     style={{ width: 50, padding: "2px 4px", fontSize: 11, fontFamily: "JetBrains Mono, monospace", border: "1px solid var(--line)", borderRadius: 4 }} />
+              <span>s</span>
+            </>
+          )}
+        </label>
+      </div>
       <div style={{ fontSize: 13.5, lineHeight: 1.5, padding: "8px 0", fontWeight: 500 }}>
         ❓ {question}
       </div>
+      {autoAnswer && remainingSec !== null && (
+        <div style={{ fontSize: 12, color: remainingSec <= 5 ? "#c33" : "#cc8800", marginBottom: 6, fontWeight: 600 }}>
+          ⏱ auto-antwort in {remainingSec}s — jetzt antworten zum stoppen
+        </div>
+      )}
       <div style={{ display: "flex", gap: 6, alignItems: "stretch" }}>
         <input className="input" placeholder="antwort eingeben (oder leer = autonom weiter)"
           value={answer} onChange={(e) => setAnswer(e.target.value)}
@@ -1582,7 +1621,9 @@ function CcPendingQuestion({ question, onAnswer }) {
           title="ohne antwort weiterarbeiten">autonom weiter</button>
       </div>
       <div style={{ fontSize: 10.5, color: "var(--ink-faint)", marginTop: 4 }}>
-        wenn unbeantwortet bleibt: claude entscheidet selbst und arbeitet weiter
+        {autoAnswer
+          ? "auto-answer aktiv: server beantwortet bei ablauf selber"
+          : "wenn unbeantwortet bleibt: nichts passiert — auto-answer aktivieren für automatisches weiterarbeiten"}
       </div>
     </div>
   );
@@ -1685,7 +1726,17 @@ function ScreenCloud({ project, onCcRun, onCcStop, ccStatus, ccOutput, ccRunning
         </div>
       </div>
 
-      {pendingQuestion && <CcPendingQuestion question={pendingQuestion} onAnswer={answerQuestion} />}
+      {pendingQuestion && (
+        <CcPendingQuestion
+          question={pendingQuestion}
+          onAnswer={answerQuestion}
+          autoAnswer={!!project.ccAutoAnswer}
+          autoAnswerDelaySec={project.ccAutoAnswerDelaySec || 30}
+          pendingAt={project.pendingQuestionAt}
+          onToggleAutoAnswer={(on) => sync.mutate("TOGGLE_CC_AUTO_ANSWER", { projectId: project.id, on })}
+          onChangeDelay={(delaySec) => sync.mutate("TOGGLE_CC_AUTO_ANSWER", { projectId: project.id, on: true, delaySec })}
+        />
+      )}
 
       <div className="box" style={{ marginBottom: 12 }}>
         <div className="eyebrow">// freier prompt {attachments.length > 0 && <span style={{ opacity: 0.5 }}>· {attachments.length} anhänge</span>}</div>

@@ -136,8 +136,9 @@ class _MainShellState extends State<MainShell> {
 
   Widget _buildBottomNav(List<_Tab> tabs, Map<String, dynamic>? p) {
     // pendingQuestion → cloud-tab highlighten (analog zum desktop).
+    // Server speichert es als String (siehe SET_PENDING_QUESTION mutation).
     final pq = p == null ? null : p['pendingQuestion'];
-    final ccPending = pq != null && pq.toString().trim().isNotEmpty;
+    final ccPending = pq is String && pq.trim().isNotEmpty;
     final items = <Widget>[];
     for (int i = 0; i < tabs.length; i++) {
       final tab = tabs[i];

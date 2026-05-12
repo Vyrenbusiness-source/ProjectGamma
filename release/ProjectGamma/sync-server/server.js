@@ -355,6 +355,38 @@ async function autoPumpTick() {
 }
 setInterval(autoPumpTick, 25 * 1000);
 
+// Auto-answer-ticker: wenn projekt.ccAutoAnswer=true UND eine pendingQuestion
+// länger als delaySec offen ist, schicken wir automatisch ein "autonom-weiter"
+// als prompt. Alle 3s prüfen für brauchbare granularität ohne CPU-belastung.
+const _autoAnsweredAt = new Map(); // projectId -> last-answered-timestamp (verhindert burst)
+async function autoAnswerTick() {
+  if (!state.ccRunning) return;
+  if (NOW() < _ccApiLimitedUntil) return;
+  for (const project of state.projects) {
+    if (!project.ccAutoAnswer) continue;
+    const pq = typeof project.pendingQuestion === "string" ? project.pendingQuestion.trim() : "";
+    if (!pq) continue;
+    if (ccJobs.has(project.id)) continue; // läuft schon → nicht eingreifen
+    const delay = Math.max(5, Math.min(600, project.ccAutoAnswerDelaySec || 30)) * 1000;
+    const since = NOW() - (project.pendingQuestionAt || 0);
+    if (since < delay) continue;
+    // Cooldown gegen burst, falls cc gleich wieder eine frage stellt
+    const lastAnswered = _autoAnsweredAt.get(project.id) || 0;
+    if (NOW() - lastAnswered < 10_000) continue;
+    _autoAnsweredAt.set(project.id, NOW());
+    console.log(`[auto-answer] ${project.name}: pq nach ${Math.round(since / 1000)}s autonom beantworten`);
+    const prompt = `Frage von dir war: ${pq}\nKeine antwort vom user (auto-answer-mode aktiv, ${Math.round(delay/1000)}s gewartet). Mach autonom weiter mit deiner besten annahme.`;
+    applyMutation("CLEAR_PENDING_QUESTION", { projectId: project.id });
+    applyMutation("ADD_ACTIVITY", { projectId: project.id, event: {
+      type: "info",
+      text: `auto-answer: keine antwort nach ${Math.round(delay/1000)}s → cc macht autonom weiter`,
+    }});
+    broadcastState();
+    triggerCc(project.id, null, prompt).catch(e => console.log("[auto-answer] error:", e.message));
+  }
+}
+setInterval(autoAnswerTick, 3 * 1000);
+
 // 6-stelliger Code (Buchstaben + Ziffern, ohne Verwechslungsgefahr O/0/I/1/L)
 function genPairingCode() {
   const ALPHA = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
@@ -626,6 +658,16 @@ const MUT = {
   CLEAR_PENDING_QUESTION(s, { projectId }) {
     s.projects = s.projects.map(p => p.id !== projectId ? p : ({
       ...p, pendingQuestion: null, pendingQuestionAt: null,
+    }));
+  },
+  // Auto-answer-mode: wenn an, beantwortet der server pendingQuestions
+  // automatisch nach N sekunden mit "decide yourself and continue".
+  // Per-projekt persistiert (user kann pro projekt entscheiden).
+  TOGGLE_CC_AUTO_ANSWER(s, { projectId, on, delaySec }) {
+    s.projects = s.projects.map(p => p.id !== projectId ? p : ({
+      ...p,
+      ccAutoAnswer: typeof on === "boolean" ? on : !p.ccAutoAnswer,
+      ccAutoAnswerDelaySec: Math.max(5, Math.min(600, Number(delaySec) || p.ccAutoAnswerDelaySec || 30)),
     }));
   },
   ADD_SYNC_LOG(s, { entry }) {
