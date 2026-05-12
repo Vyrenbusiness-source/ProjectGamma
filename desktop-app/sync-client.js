@@ -2,7 +2,23 @@
    HTTP-API + WebSocket gegen Sync-Server (default localhost:7892).
    Persistiert Token in localStorage. Listener bekommen jedes neue STATE-Frame. */
 
-const SYNC_DEFAULT_URL = "http://localhost:7892";
+// Default-URL: bevorzugt same-origin (wenn die desktop-app vom sync-server
+// selbst gehostet wird), sonst localhost:7892 (separate dev-server).
+// Same-origin macht das setup auch auf anderen rechnern/IPs ohne änderung
+// brauchbar — und vermeidet CORS-issues.
+function _defaultSyncUrl() {
+  try {
+    if (typeof window !== "undefined" && window.location && window.location.origin
+        && window.location.protocol.startsWith("http")) {
+      const o = window.location.origin;
+      // localhost:7891 → der alte split-mode → fallback zu :7892
+      if (/:7891$/.test(o)) return "http://localhost:7892";
+      return o;
+    }
+  } catch (_) {}
+  return "http://localhost:7892";
+}
+const SYNC_DEFAULT_URL = _defaultSyncUrl();
 const SYNC_LS_TOKEN     = "projectgamma.sync.token";
 const SYNC_LS_URL       = "projectgamma.sync.url";
 const SYNC_LS_DEVICE    = "projectgamma.sync.deviceName";

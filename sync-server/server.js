@@ -969,10 +969,22 @@ app.use(cors());
 // json-body-limit hoch: 8 MB für base64-attachments (bilder)
 app.use(express.json({ limit: "8mb" }));
 
-// Root: Browser-Anfragen landen oft hier statt auf Port 7891 (Desktop-UI).
-// Statt "Cannot GET /" leiten wir zur Desktop-App auf demselben Host weiter
-// bzw. zeigen einen klaren Hinweis für API-Clients.
-app.get("/", (req, res) => {
+// Desktop-App static serving — damit der user keinen zusätzlichen
+// python/npx http-server braucht. Wenn `../desktop-app/index.html` existiert,
+// werden die JSX/CSS/JS aus diesem ordner direkt vom sync-server serviert.
+// → start.bat braucht jetzt nur node, keine zweite runtime.
+const DESKTOP_APP_DIR = path.join(__dirname, "..", "desktop-app");
+const desktopUiAvailable = fs.existsSync(path.join(DESKTOP_APP_DIR, "index.html"));
+if (desktopUiAvailable) {
+  app.use(express.static(DESKTOP_APP_DIR, { index: "index.html", extensions: ["html"] }));
+  console.log("[ui] desktop-app static serving von", DESKTOP_APP_DIR);
+} else {
+  console.log("[ui] desktop-app folder nicht gefunden — static serving deaktiviert");
+}
+
+// Fallback-root: wenn nicht statisch verfügbar, klare API-info statt 404.
+app.get("/", (req, res, next) => {
+  if (desktopUiAvailable) return next();
   const wantsHtml = String(req.headers.accept || "").includes("text/html");
   if (wantsHtml) {
     const host = (req.headers.host || "").split(":")[0] || "localhost";

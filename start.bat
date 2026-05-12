@@ -1,55 +1,84 @@
 @echo off
 REM ProjectGamma · One-Click-Start
-REM Startet Sync-Server (port 7892) + Desktop-HTTP-Server (port 7891)
-REM und oeffnet die Desktop-App im Standard-Browser.
+REM Doppelklick startet alles: deps installieren -> server -> browser oeffnen
+REM Voraussetzung: Node.js (https://nodejs.org/de/download).
+title ProjectGamma . launcher
 
 setlocal
 set ROOT=%~dp0
-set DESKTOP=%ROOT%desktop-app
 set SERVER=%ROOT%sync-server
 set ADB=%LOCALAPPDATA%\Android\Sdk\platform-tools\adb.exe
 
 echo ============================================
-echo   ProjectGamma · Start
+echo   ProjectGamma . launcher
 echo ============================================
 echo.
-echo  ROOT:    %ROOT%
-echo  Server:  %SERVER%
-echo  Desktop: %DESKTOP%
-echo.
 
-REM 1) Sync-Server (Port 7892, Node)
-echo [1/3] Starte Sync-Server (Port 7892)...
-start "ProjectGamma · Sync-Server" cmd /k "cd /d "%SERVER%" && node server.js"
-
-REM 2) Desktop-Static-Server (Port 7891)
-echo [2/3] Starte Desktop-HTTP-Server (Port 7891)...
-start "ProjectGamma · Desktop-Server" cmd /k "cd /d "%DESKTOP%" && python -m http.server 7891"
-
-REM 3) ADB-Reverse fuer Phone (USB-Tethering optional)
-if exist "%ADB%" (
-  echo [3/3] ADB-Reverse-Tunnel (Port 7892, falls Phone via USB)...
-  "%ADB%" reverse tcp:7892 tcp:7892 2>nul
-) else (
-  echo [3/3] ADB nicht gefunden - Phone muss LAN-IP nutzen.
+REM 1) Node-check
+where node >nul 2>nul
+if errorlevel 1 (
+  echo [FEHLT] node.js ist nicht installiert.
+  echo.
+  echo Bitte installieren von:
+  echo   https://nodejs.org/de/download
+  echo.
+  echo Nach der installation einfach diese .bat erneut doppelklicken.
+  echo.
+  pause
+  exit /b 1
 )
 
-REM Kurz warten, dann Browser oeffnen
-timeout /t 3 /nobreak >nul
+REM 2) Erstinstall der abhaengigkeiten (express, ws, cors, nat-upnp).
+REM    Lauft NUR wenn node_modules fehlt -> kein delay bei normalem start.
+if not exist "%SERVER%\node_modules" (
+  echo [setup] erste installation - abhaengigkeiten herunterladen...
+  echo         das dauert ca. 30-60 sekunden, nur beim ersten start.
+  echo.
+  pushd "%SERVER%"
+  call npm install --omit=dev --silent
+  if errorlevel 1 (
+    echo.
+    echo [FEHLER] npm install fehlgeschlagen.
+    echo Pruefe deine internet-verbindung und versuche es nochmal.
+    pause
+    popd
+    exit /b 1
+  )
+  popd
+  echo [setup] fertig.
+  echo.
+)
+
+REM 3) Sync-Server starten (serviert auch die desktop-app static auf port 7892).
+echo [1/2] starte ProjectGamma-server  (port 7892)...
+start "ProjectGamma . server" cmd /k "cd /d "%SERVER%" && node server.js"
+
+REM 4) ADB-reverse (USB-tunnel fuer handy, optional)
+if exist "%ADB%" (
+  echo [2/2] adb-reverse tcp:7892 (handy via USB optional)
+  "%ADB%" reverse tcp:7892 tcp:7892 2>nul
+) else (
+  echo [2/2] adb nicht gefunden - handy verbindet via WLAN oder internet-tunnel
+)
+
+REM 5) Kurz warten, browser oeffnen.
+timeout /t 4 /nobreak >nul
 echo.
-echo Oeffne Desktop-App im Browser...
-start "" "http://localhost:7891/index.html"
+echo oeffne ProjectGamma im browser...
+start "" "http://localhost:7892/"
 
 echo.
 echo ============================================
-echo   Bereit!
+echo   bereit!
 echo ============================================
 echo.
-echo   Desktop:    http://localhost:7891
-echo   Sync-API:   http://localhost:7892
-echo   Mobile-IP:  siehe Sync-Server-Fenster (LAN-IPs)
+echo   browser:     http://localhost:7892
 echo.
-echo   Schliesse diese Fenster (oder STRG+C in den Server-Fenstern)
-echo   um das Programm zu beenden.
+echo   handy verbinden:
+echo     - im browser auf "+ handy verbinden" klicken
+echo     - QR scannen mit der ProjectGamma-app (APK in mobile\)
+echo     - kein gleiches WLAN? -> "internet-tunnel start" im pair-dialog
+echo.
+echo   beenden: das server-fenster schliessen (oder STRG+C drueck en).
 echo.
 pause

@@ -54,6 +54,13 @@ deploy_key*
 
 # IDE / OS
 .vscode/
+.claude/
+
+# Branding-assets im root (nicht im public repo; mobile-app/assets/Logo.png bleibt - app-icon)
+/Logo.png
+
+# Lokale planning-notes (privat)
+todo.txt
 .idea/
 *.iml
 .DS_Store
