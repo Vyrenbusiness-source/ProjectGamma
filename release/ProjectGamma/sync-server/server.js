@@ -842,7 +842,8 @@ function applyMutation(type, payload, ctx) {
   try {
     if (type === "ADD_MESSAGE" && payload && payload.message) {
       const proj = state.projects.find(p => p.id === payload.projectId);
-      const lastMsg = proj && proj.messages && proj.messages[proj.messages.length - 1];
+      // Optional-chain + .at(-1): safe wenn messages fehlt oder leer.
+      const lastMsg = proj?.messages?.at(-1) ?? null;
       if (lastMsg && Array.isArray(lastMsg.mentions) && lastMsg.mentions.length > 0) {
         emitPush({
           type: "chat_mention",

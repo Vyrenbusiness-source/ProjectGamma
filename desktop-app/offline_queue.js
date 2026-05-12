@@ -34,11 +34,21 @@ function createOfflineQueue(opts) {
 
   function enforceCap() {
     if (items.length <= max) return;
-    const keep = [];
+    // Strikt auf `max` cappen, pending bevorzugen.
+    // Reihenfolge in items[]: neueste zuerst (siehe list()). Wir behalten also
+    // die jüngsten pending zuerst, füllen mit anderen auf bis cap erreicht.
+    const pending = [];
+    const other = [];
     for (const i of items) {
-      if (keep.length < max || i.status === "pending") keep.push(i);
+      (i.status === "pending" ? pending : other).push(i);
     }
-    items = keep.slice(0, Math.max(max, items.filter(i => i.status === "pending").length));
+    if (pending.length >= max) {
+      // Worst-case: nur pending, ältere werden gedroppt (data-loss möglich, aber
+      // bei max=200 default akzeptabel + UI warnt vorher via queue-badge).
+      items = pending.slice(0, max);
+    } else {
+      items = [...pending, ...other.slice(0, max - pending.length)];
+    }
   }
 
   function enqueue(type, payload) {

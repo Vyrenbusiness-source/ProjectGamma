@@ -90,14 +90,27 @@ class OfflineQueue {
 
   void _enforceCap() {
     if (_items.length <= max) return;
-    final keep = <QueueItem>[];
+    // Strikt auf `max` cappen, pending bevorzugen — analog zu desktop-app/offline_queue.js.
+    // Reihenfolge: neueste zuerst (insert(0,...)). Wir behalten alle pending,
+    // füllen mit other (sent/failed) auf bis cap voll.
+    final pending = <QueueItem>[];
+    final other = <QueueItem>[];
     for (final i in _items) {
-      if (keep.length < max || i.status == QueueStatus.pending) keep.add(i);
+      if (i.status == QueueStatus.pending) {
+        pending.add(i);
+      } else {
+        other.add(i);
+      }
     }
-    _items
-      ..clear()
-      ..addAll(keep);
-    if (_items.length > max) _items.removeRange(max, _items.length);
+    _items.clear();
+    if (pending.length >= max) {
+      // Nur pending → ältere droppen (data-loss möglich; UI warnt via badge).
+      _items.addAll(pending.take(max));
+    } else {
+      _items
+        ..addAll(pending)
+        ..addAll(other.take(max - pending.length));
+    }
   }
 
   List<QueueItem> get list => List.unmodifiable(_items);

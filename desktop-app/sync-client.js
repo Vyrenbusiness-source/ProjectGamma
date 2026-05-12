@@ -348,9 +348,13 @@ class SyncClient {
   // Convenience accessors
   get projects() { return this.state?.projects || []; }
   get activeProject() {
+    // Welcome-state-fähig: returnt null wenn keine projekte da sind.
+    // UI rendert dann den welcome-screen statt mit undefined zu crashen.
+    const list = this.projects;
+    if (!list.length) return null;
     const id = this.activeProjectId;
-    if (!id) return this.projects[0];
-    return this.projects.find(p => p.id === id) || this.projects[0];
+    if (!id) return list[0];
+    return list.find(p => p.id === id) || list[0];
   }
   get syncLog() { return this.state?.syncLog || []; }
   get sessions() { return this.state?.sessions || []; }
