@@ -79,6 +79,6 @@ echo     - im browser auf "+ handy verbinden" klicken
 echo     - QR scannen mit der ProjectGamma-app (APK in mobile\)
 echo     - kein gleiches WLAN? -> "internet-tunnel start" im pair-dialog
 echo.
-echo   beenden: das server-fenster schliessen (oder STRG+C drueck en).
+echo   beenden: das server-fenster schliessen (oder STRG+C druecken).
 echo.
 pause
