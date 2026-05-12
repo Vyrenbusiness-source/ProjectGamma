@@ -40,6 +40,12 @@ mobile-app/_*.txt
 # Release-folder (zu groß für git; build artifact)
 release/
 
+# Cloudflared binary (auto-downloaded zur runtime, ~25 MB)
+sync-server/bin/
+
+# Lokale test-screenshots (UI-validation via chrome-devtools-mcp)
+test-screens/
+
 # Ssh-keys (auch wenn lokal abgelegt)
 *.pem
 *_rsa

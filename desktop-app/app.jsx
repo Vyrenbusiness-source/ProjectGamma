@@ -180,13 +180,17 @@ function BootPairing({ onReady }) {
 // QR-Block: rendert pgamma://pair?host=…&port=…&code=… mit qrcode-generator.
 // host wird aus lanInfo (erste LAN-IP) abgeleitet; ohne lanInfo verstecken
 // wir den QR sichtbar mit hinweis (kein silent skip).
-function PairQr({ pairing, lanInfo, expired }) {
+function PairQr({ pairing, lanInfo, tunnel, expired }) {
   const pq = (typeof window !== "undefined") ? window.pair_qr : null;
   if (!pq || !pairing || expired) return null;
-  const host = lanInfo?.ips?.[0];
-  const port = lanInfo?.port;
+  // Tunnel aktiv → host = cloudflare-domain, port=443, scheme=wss. Mobile löst
+  // das selbst via TLS auf.
+  const useTunnel = tunnel && tunnel.status === "active" && tunnel.url;
+  const tunnelHost = useTunnel ? (tunnel.url.match(/^https:\/\/([^/]+)/i) || [])[1] : null;
+  const host = tunnelHost || lanInfo?.ips?.[0];
+  const port = useTunnel ? 443 : lanInfo?.port;
   if (!host || !port) {
-    return <div className="pair-meta" style={{ opacity: 0.7 }}>QR nicht verfügbar (keine LAN-IP gefunden)</div>;
+    return <div className="pair-meta" style={{ opacity: 0.7 }}>QR nicht verfügbar (keine LAN-IP + kein tunnel)</div>;
   }
   let svg = null;
   try {
@@ -195,6 +199,7 @@ function PairQr({ pairing, lanInfo, expired }) {
       publicIp: pairing.publicIp || null,
       // Audit-fix: alle LAN-IPs einbetten — mobile probiert sie alle
       hosts: Array.isArray(lanInfo?.ips) ? lanInfo.ips : [],
+      scheme: useTunnel ? "wss" : undefined,
     });
     svg = pq.toQrSvg(payload, { cellSize: 4, margin: 2 });
   } catch (e) {
@@ -215,9 +220,43 @@ function PairCodeModal({ onClose }) {
   const [error, setError] = useState(null);
   const [tick, setTick] = useState(0);
   const [lanInfo, setLanInfo] = useState(null);
+  const [tunnel, setTunnel] = useState({ status: "idle", url: null, error: null });
+  const [tunnelBusy, setTunnelBusy] = useState(false);
   const sessionsBefore = useRef(null);
 
   useEffect(() => { fetchLanInfo(client.serverUrl).then(setLanInfo); }, [client.serverUrl]);
+  // Tunnel-status laden + alle 3s pollen während starting/active.
+  useEffect(() => {
+    let alive = true;
+    async function poll() {
+      try {
+        const r = await fetch(client.serverUrl + "/api/tunnel/status").then(r => r.json());
+        if (alive) setTunnel(r);
+      } catch (_) {}
+    }
+    poll();
+    const iv = setInterval(poll, 3000);
+    return () => { alive = false; clearInterval(iv); };
+  }, [client.serverUrl]);
+
+  const toggleTunnel = async () => {
+    setTunnelBusy(true);
+    try {
+      const endpoint = tunnel.status === "active" || tunnel.status === "starting" ? "/api/tunnel/stop" : "/api/tunnel/start";
+      const r = await fetch(client.serverUrl + endpoint, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer " + client.token },
+      }).then(r => r.json());
+      setTunnel(r);
+      // Nach tunnel-start/stop einen neuen pairing-code generieren — qrPayload
+      // codiert nur den aktuellen route-status.
+      if (pairing) await regenerate();
+    } catch (e) {
+      setTunnel(t => ({ ...t, error: e.message }));
+    } finally {
+      setTunnelBusy(false);
+    }
+  };
 
   // Bei Mount: falls noch kein Code → generieren
   useEffect(() => {
@@ -298,7 +337,7 @@ function PairCodeModal({ onClose }) {
             <div className={"pair-code" + (expired ? " expired" : "")}>
               {pairing.code.split("").map((c, i) => <span key={i}>{c}</span>)}
             </div>
-            <PairQr pairing={pairing} lanInfo={lanInfo} expired={expired} />
+            <PairQr pairing={pairing} lanInfo={lanInfo} tunnel={tunnel} expired={expired} />
             <div className="pair-meta">
               {expired
                 ? <span style={{ color: "#c33" }}>code abgelaufen</span>
@@ -308,33 +347,85 @@ function PairCodeModal({ onClose }) {
           </>
         )}
 
+        {/* Cloudflare-tunnel-toggle: macht den server übers internet erreichbar,
+            ohne port-forward oder gleiche WLAN. */}
+        <div className="box" style={{ marginTop: 4, padding: 12, background: tunnel.status === "active" ? "rgba(0,150,80,0.06)" : "transparent" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
+            <div style={{ flex: 1 }}>
+              <div className="eyebrow">// 🌐 internet-tunnel (cloudflare)</div>
+              <div style={{ fontSize: 12, color: "var(--ink-soft)", marginTop: 4, lineHeight: 1.45 }}>
+                {tunnel.status === "active"
+                  ? <>aktiv — handy kann sich überall verbinden (kein gleiches WLAN nötig)</>
+                  : tunnel.status === "starting"
+                    ? <>tunnel wird gestartet… (binary wird ggf. heruntergeladen, ~30s beim ersten mal)</>
+                    : tunnel.status === "error"
+                      ? <span style={{ color: "#c33" }}>fehler: {tunnel.error}</span>
+                      : <>aus — pairing geht nur über LAN/WLAN. einschalten = handy kann übers internet rein.</>
+                }
+              </div>
+              {tunnel.url && (
+                <code style={{ display: "inline-block", marginTop: 6, fontSize: 11, color: "var(--ink-faint)", wordBreak: "break-all" }}>
+                  {tunnel.url}
+                </code>
+              )}
+            </div>
+            <button className="btn tiny"
+                    onClick={toggleTunnel}
+                    disabled={tunnelBusy || tunnel.status === "starting"}>
+              {tunnelBusy ? "…" :
+                tunnel.status === "active" || tunnel.status === "starting" ? "× stop" : "▶ start"}
+            </button>
+          </div>
+        </div>
+
         <div className="pair-instructions">
           <div className="eyebrow">// schritte</div>
           <ol>
             <li>app auf handy öffnen</li>
             <li>
-              server-url eingeben — gleiche WLAN voraussetzung:
-              {lanInfo?.ips?.length ? (
-                <div className="ip-list">
-                  {lanInfo.ips.map(ip => {
-                    const url = `http://${ip}:${lanInfo.port}`;
-                    return (
-                      <button key={ip} className="ip-copy"
-                              onClick={() => { navigator.clipboard?.writeText(url); }}
-                              title="in zwischenablage kopieren">
-                        <code>{url}</code>
-                        <span className="ip-copy-icon">⧉</span>
-                      </button>
-                    );
-                  })}
-                  <div className="ip-tip">
-                    oder „server suchen" tippen in der mobile-app · per USB mit
-                    <code>adb reverse tcp:{lanInfo.port} tcp:{lanInfo.port}</code> auch
-                    <code>http://localhost:{lanInfo.port}</code>
+              {tunnel.status === "active" && tunnel.url ? (
+                <>
+                  server-url ist im QR — oder manuell:
+                  <div className="ip-list">
+                    <button className="ip-copy"
+                            onClick={() => { navigator.clipboard?.writeText(tunnel.url); }}
+                            title="in zwischenablage kopieren">
+                      <code>{tunnel.url}</code>
+                      <span className="ip-copy-icon">⧉</span>
+                    </button>
+                    <div className="ip-tip">
+                      tunnel-URL funktioniert <strong>überall</strong> (4G/anderes WLAN/draußen) — kein port-forward nötig.
+                    </div>
                   </div>
-                </div>
+                </>
               ) : (
-                <code> {client.serverUrl}</code>
+                <>
+                  server-url eingeben — gleiche WLAN voraussetzung:
+                  {lanInfo?.ips?.length ? (
+                    <div className="ip-list">
+                      {lanInfo.ips.map(ip => {
+                        const url = `http://${ip}:${lanInfo.port}`;
+                        return (
+                          <button key={ip} className="ip-copy"
+                                  onClick={() => { navigator.clipboard?.writeText(url); }}
+                                  title="in zwischenablage kopieren">
+                            <code>{url}</code>
+                            <span className="ip-copy-icon">⧉</span>
+                          </button>
+                        );
+                      })}
+                      <div className="ip-tip">
+                        oder „server suchen" tippen in der mobile-app · per USB mit
+                        <code>adb reverse tcp:{lanInfo.port} tcp:{lanInfo.port}</code> auch
+                        <code>http://localhost:{lanInfo.port}</code>
+                        <br/>
+                        <em>tipp:</em> für verbindung außerhalb des WLANs einfach oben „🌐 internet-tunnel start" klicken.
+                      </div>
+                    </div>
+                  ) : (
+                    <code> {client.serverUrl}</code>
+                  )}
+                </>
               )}
             </li>
             <li>diesen code eingeben: <strong>{pairing?.code || "—"}</strong></li>
@@ -380,11 +471,17 @@ function Confirm({ title, message, confirmLabel = "ok", cancelLabel = "abbrechen
 
 // ─── Sidebar ──────────────────────────────────────────────────
 function Sidebar({ projects, activeId, onSelect, onNew, ccRunning }) {
-  const active = projects.find(p => p.id === activeId);
+  // Clean sidebar: pro projekt nur stern + name. zahlen liegen jetzt in den
+  // stat-chips der übersicht — hier würden sie nur ablenken.
+  // Sortierung: favoriten zuerst, sonst alphabetisch.
+  const sorted = [...projects].sort((a, b) => {
+    if (!!b.starred - !!a.starred) return !!b.starred - !!a.starred;
+    return (a.name || "").localeCompare(b.name || "");
+  });
   return (
     <div className="side">
       <div className="eyebrow">// projekte</div>
-      {projects.map(p => (
+      {sorted.map(p => (
         <div key={p.id}
              className={"proj-item" + (p.id === activeId ? " active" : "")}
              onClick={() => onSelect(p.id)}>
@@ -394,7 +491,6 @@ function Sidebar({ projects, activeId, onSelect, onNew, ccRunning }) {
             {p.starred ? "★" : "☆"}
           </span>
           <span className="name">{p.name}</span>
-          <span className="badge">{(p.tasks || []).filter(t => !t.done).length}</span>
         </div>
       ))}
       <button className="new-btn" onClick={onNew}>+ neues projekt</button>
@@ -402,10 +498,6 @@ function Sidebar({ projects, activeId, onSelect, onNew, ccRunning }) {
       <div className="cc-ambient">
         <span className={"cc-dot" + (ccRunning ? " live" : "")}>
           cloud-code · {ccRunning ? "arbeitet" : "pause"}
-        </span>
-        <span className="meta">
-          {active ? (active.tasks || []).filter(t => !t.done).length + " task offen" : "—"}
-          {" · last sync "}{active ? relTime(active.lastSync) : "—"}
         </span>
       </div>
     </div>
@@ -448,7 +540,24 @@ function MainHead({ project, activeTab, onTab, onAction, onDelete }) {
                       placeholder="kurzbeschreibung hinzufügen…"
                       style={{ flex: 1, minWidth: 200 }} />
           </div>
-          <div className="sub" style={{ marginTop: 4, fontFamily: "JetBrains Mono, monospace", fontSize: 11, color: project.path ? "var(--ink-faint)" : "var(--ink-faint)" }}>
+          {/* Ziele-preview · dezent unter beschreibung. klick öffnet projekt-details. */}
+          {(() => {
+            const goals = project.goals || [];
+            if (goals.length === 0) return null;
+            const preview = goals.slice(0, 3).join("  ·  ");
+            const more = goals.length > 3 ? `  +${goals.length - 3}` : "";
+            return (
+              <div className="sub goals-preview"
+                   style={{ marginTop: 4, fontSize: 11.5, color: "var(--ink-soft)", cursor: "pointer", display: "flex", alignItems: "center", gap: 6 }}
+                   onClick={() => onAction("openProjectSettings")}
+                   title="projekt-details bearbeiten">
+                <span style={{ color: "var(--ink-faint)" }}>ziele:</span>
+                <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{preview}{more}</span>
+                <span style={{ color: "var(--ink-faint)" }}>✎</span>
+              </div>
+            );
+          })()}
+          <div className="sub" style={{ marginTop: 4, fontFamily: "JetBrains Mono, monospace", fontSize: 11, color: "var(--ink-faint)" }}>
             <Editable value={project.path || ""}
                       onChange={v => patch({ path: v.trim() })}
                       placeholder="+ lokalen pfad hinzufügen (für IDE-launch)" />
@@ -645,179 +754,329 @@ function OnboardStep({ n, title, body, cta, onClick }) {
   );
 }
 
-function ScreenOverview({ project, allProjects, onSelectProject, onNewProject }) {
-  const [adding, setAdding] = useState({ goal: false, file: false });
-  const [draft, setDraft] = useState({ goal: "", file: "", fileDepth: 0 });
+// Stat-Chip: groß zahl + label, klick wechselt tab.
+function StatChip({ label, value, accent, onClick }) {
+  return (
+    <button onClick={onClick}
+            className="stat-chip"
+            style={{
+              flex: 1, padding: "14px 8px",
+              background: accent ? "var(--ink)" : "var(--paper)",
+              color: accent ? "var(--paper)" : "var(--ink)",
+              border: "2px solid var(--ink)", borderRadius: 10,
+              cursor: onClick ? "pointer" : "default",
+              display: "flex", flexDirection: "column", alignItems: "center", gap: 2,
+              fontFamily: "inherit",
+            }}>
+      <span style={{ fontFamily: "JetBrains Mono, monospace", fontSize: 22, fontWeight: 700, lineHeight: 1 }}>
+        {value}
+      </span>
+      <span style={{ fontSize: 10.5, opacity: 0.75, fontFamily: "JetBrains Mono, monospace" }}>
+        {label}
+      </span>
+    </button>
+  );
+}
 
-  const tasks = project.tasks || [], rules = project.rules || [], ideas = project.ideas || [], activity = project.activity || [];
-  const goals = project.goals || [], files = project.files || [];
+// Mini-Chat: kompakte preview der letzten 3 nachrichten + input.
+// Draft wird beim projekt-wechsel zurückgesetzt — sonst landet text im falschen projekt.
+function MiniChat({ project, myEmail }) {
+  const [draft, setDraft] = useState("");
+  useEffect(() => { setDraft(""); }, [project.id]);
+  const messages = project.messages || [];
+  const last = messages.slice(-3);
 
+  const send = () => {
+    const t = draft.trim();
+    if (!t) return;
+    sync.mutate("ADD_MESSAGE", { projectId: project.id, message: { text: t } });
+    setDraft("");
+  };
+
+  return (
+    <div className="box" style={{ display: "flex", flexDirection: "column", minHeight: 200 }}>
+      <div className="eyebrow">// projekt-chat <span style={{ opacity: 0.5 }}>· {messages.length}</span></div>
+      <div style={{
+        flex: 1, marginTop: 8, marginBottom: 8,
+        minHeight: 80,
+        background: "rgba(0,0,0,0.02)",
+        border: "1.5px dashed var(--line)", borderRadius: 6,
+        padding: 8, display: "flex", flexDirection: "column", gap: 6,
+        justifyContent: last.length === 0 ? "center" : "flex-end",
+      }}>
+        {last.length === 0 ? (
+          <div style={{ color: "var(--ink-faint)", fontSize: 12, fontStyle: "italic", textAlign: "center" }}>
+            noch keine nachrichten. schreib was, deine team-mitglieder sehen es live.
+          </div>
+        ) : last.map(m => {
+          const author = m.authorEmail || (m.author && m.author.startsWith("device:") ? m.author.slice(7) : (m.author || "?"));
+          const isOwn = myEmail && author === myEmail;
+          return (
+            <div key={m.id} style={{
+              display: "flex", justifyContent: isOwn ? "flex-end" : "flex-start",
+            }}>
+              <div style={{
+                maxWidth: "82%", padding: "4px 9px",
+                background: isOwn ? "var(--ink)" : "var(--paper)",
+                color: isOwn ? "var(--paper)" : "var(--ink)",
+                border: "1.5px solid var(--ink)", borderRadius: 8,
+                borderBottomRightRadius: isOwn ? 2 : 8,
+                borderBottomLeftRadius: isOwn ? 8 : 2,
+                fontSize: 12.5, lineHeight: 1.35,
+              }}>
+                {!isOwn && <div style={{ fontSize: 10, opacity: 0.6, marginBottom: 1 }}>{author}</div>}
+                {m.text}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      <div style={{ display: "flex", gap: 6 }}>
+        <input className="input" style={{ flex: 1 }}
+               placeholder="nachricht an team…"
+               value={draft}
+               onChange={e => setDraft(e.target.value)}
+               onKeyDown={e => {
+                 if ((e.metaKey || e.ctrlKey) && e.key === "Enter") send();
+                 else if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+               }} />
+        <button className="btn primary tiny" onClick={send} disabled={!draft.trim()}>senden</button>
+      </div>
+      <div style={{ fontSize: 10, color: "var(--ink-faint)", marginTop: 4, textAlign: "right" }}>
+        ⌘/Strg+Enter · senden
+      </div>
+    </div>
+  );
+}
+
+// Slim suggestions-list (ohne bugs, ohne ablenkung). Bugs liegen unten als secondary block.
+function SuggestionsSlim({ project }) {
+  const suggestions = project.suggestions || [];
+  const [busy, setBusy] = useState(false);
+  const timerRef = useRef(null);
+  // Cleanup beim unmount + projekt-wechsel verhindert react-warning auf entladener component.
+  useEffect(() => () => { if (timerRef.current) clearTimeout(timerRef.current); }, []);
+  const trigger = async () => {
+    setBusy(true);
+    try { await sync.ccSuggest(project.id); } catch (e) {}
+    if (timerRef.current) clearTimeout(timerRef.current);
+    timerRef.current = setTimeout(() => setBusy(false), 60000);
+  };
+  const accept = (s) => {
+    sync.mutate("ADD_TASK", { projectId: project.id, task: {
+      title: s.title, done: false, group: "next",
+      meta: "vorschlag · " + s.category + " · " + s.effort,
+      priority: s.effort === "low" ? 4 : s.effort === "high" ? 2 : 3,
+      subtasks: [],
+    }});
+    sync.mutate("SET_SUGGESTION_STATUS", { projectId: project.id, suggestionId: s.id, status: "accepted" });
+  };
+  const reject = (id) => sync.mutate("SET_SUGGESTION_STATUS", { projectId: project.id, suggestionId: id, status: "rejected" });
+  const remove = (id) => sync.mutate("REMOVE_SUGGESTION", { projectId: project.id, suggestionId: id });
+  const pending = suggestions.filter(s => s.status === "pending");
+
+  return (
+    <div className="box">
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+        <span className="eyebrow">
+          // vorschläge {pending.length > 0 && <span className="chip" style={{ marginLeft: 6 }}>{pending.length}</span>}
+        </span>
+        <button className="btn tiny primary" onClick={trigger} disabled={busy}>
+          {busy ? "läuft…" : "💡 generieren"}
+        </button>
+      </div>
+      {suggestions.length === 0
+        ? <div className="empty"><div>noch keine vorschläge.</div><div style={{ fontSize: 11, marginTop: 4 }}>klick auf „generieren" — claude analysiert die app + schlägt verbesserungen vor</div></div>
+        : (
+          <div className="suggest-list">
+            {suggestions.slice(0, 12).map(s => (
+              <div key={s.id} className={"suggest-item status-" + s.status}>
+                <div className="suggest-head">
+                  <span className={"chip cat-" + s.category}>{s.category}</span>
+                  <span className="chip">aufwand: {s.effort}</span>
+                  <span className="grow" />
+                  <span className="status-tag">{s.status}</span>
+                </div>
+                <div className="suggest-title">{s.title}</div>
+                {s.reason && <div className="suggest-reason">{s.reason}</div>}
+                {s.status === "pending"
+                  ? (
+                    <div className="suggest-actions">
+                      <button className="btn tiny primary" onClick={() => accept(s)}>✓ als aufgabe</button>
+                      <button className="btn tiny" onClick={() => reject(s.id)}>✕ ablehnen</button>
+                    </div>
+                  ) : (
+                    <div className="suggest-actions">
+                      <button className="btn tiny danger" onClick={() => remove(s.id)}>× entfernen</button>
+                    </div>
+                  )
+                }
+              </div>
+            ))}
+          </div>
+        )
+      }
+    </div>
+  );
+}
+
+// Bugs-block: nur sichtbar wenn es welche gibt — sonst clutter weg.
+function BugsBlock({ project }) {
+  const bugs = project.bugs || [];
+  const [busy, setBusy] = useState(false);
+  const timerRef = useRef(null);
+  useEffect(() => () => { if (timerRef.current) clearTimeout(timerRef.current); }, []);
+  const trigger = async () => {
+    setBusy(true);
+    try { await sync.ccBughunt(project.id); } catch (e) {}
+    if (timerRef.current) clearTimeout(timerRef.current);
+    timerRef.current = setTimeout(() => setBusy(false), 60000);
+  };
+  const accept = (b) => {
+    sync.mutate("ADD_TASK", { projectId: project.id, task: {
+      title: `[bug] ${b.description}` + (b.location ? ` (${b.location})` : ""),
+      done: false, group: "next",
+      meta: "bug · " + b.severity,
+      priority: b.severity === "high" ? 5 : b.severity === "medium" ? 4 : 3,
+      subtasks: b.fix ? [{ title: "fix-hint: " + b.fix.slice(0, 100), done: false }] : [],
+    }});
+    sync.mutate("SET_BUG_STATUS", { projectId: project.id, bugId: b.id, status: "fixing" });
+  };
+  const dismiss = (id) => sync.mutate("SET_BUG_STATUS", { projectId: project.id, bugId: id, status: "dismissed" });
+  const remove = (id) => sync.mutate("REMOVE_BUG", { projectId: project.id, bugId: id });
+  const toggleAuto = () => sync.mutate("TOGGLE_BUG_AUTO_FIX", { projectId: project.id, on: !project.bugAutoFix });
+  const pending = bugs.filter(b => b.status === "pending");
+
+  // Wenn keine bugs UND nicht gerade gesucht wird: kompakte action-row statt voller box.
+  if (bugs.length === 0 && !busy) {
+    return (
+      <div className="box" style={{
+        display: "flex", justifyContent: "space-between", alignItems: "center",
+        padding: "10px 14px",
+      }}>
+        <span style={{ fontSize: 12, color: "var(--ink-soft)" }}>
+          <span className="eyebrow" style={{ marginRight: 8 }}>// bugs</span>
+          keine bugs gefunden.
+        </span>
+        <button className="btn tiny" onClick={trigger}>🐞 hunt starten</button>
+      </div>
+    );
+  }
+  return (
+    <div className="box">
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+        <span className="eyebrow">// bugs {pending.length > 0 && <span className="chip" style={{ marginLeft: 6, color: "#c33", borderColor: "#c33" }}>{pending.length}</span>}</span>
+        <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+          <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 11, color: "var(--ink-soft)", cursor: "pointer" }}>
+            <input type="checkbox" checked={!!project.bugAutoFix} onChange={toggleAuto} />
+            auto-fix
+          </label>
+          <button className="btn tiny primary" onClick={trigger} disabled={busy}>
+            {busy ? "läuft…" : "🐞 hunt"}
+          </button>
+        </div>
+      </div>
+      <div className="suggest-list">
+        {bugs.slice(0, 10).map(b => (
+          <div key={b.id} className={"bug-item severity-" + b.severity + " status-" + b.status}>
+            <div className="suggest-head">
+              <span className={"chip sev-" + b.severity}>{b.severity}</span>
+              {b.location && <span className="chip mono">{b.location}</span>}
+              <span className="grow" />
+              <span className="status-tag">{b.status}</span>
+            </div>
+            <div className="suggest-title">{b.description}</div>
+            {b.fix && <div className="suggest-reason">→ {b.fix}</div>}
+            {b.status === "pending"
+              ? (
+                <div className="suggest-actions">
+                  <button className="btn tiny primary" onClick={() => accept(b)}>⚡ fixen lassen</button>
+                  <button className="btn tiny" onClick={() => dismiss(b.id)}>✕ verwerfen</button>
+                </div>
+              ) : (
+                <div className="suggest-actions">
+                  <button className="btn tiny danger" onClick={() => remove(b.id)}>× entfernen</button>
+                </div>
+              )
+            }
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ─── Übersicht · neue 4-block-anordnung ────────────────────────
+// 1) Onboarding-3-schritte  |  Mini-Chat
+// 2) Stat-chips (aufgaben · regeln · ideen · cc-status)
+// 3) Vorschläge  |  Notizen + Termine (gestapelt)
+// 4) Bugs (nur wenn welche da sind)
+function ScreenOverview({ project, onOpenMembers, onOpenPair, onSetTab }) {
+  const tasks = project.tasks || [], rules = project.rules || [], ideas = project.ideas || [];
   const stats = {
     open: tasks.filter(t => !t.done).length,
-    done: tasks.filter(t => t.done).length,
     rules: rules.filter(r => r.active).length,
     ideas: ideas.filter(i => i.status === "unprocessed").length,
-    activity: activity.length,
   };
-
-  const setGoals = (g) => sync.mutate("SET_GOALS", { projectId: project.id, goals: g });
-  const setFiles = (f) => sync.mutate("SET_FILES", { projectId: project.id, files: f });
-
-  const addGoal = () => {
-    const v = draft.goal.trim();
-    if (!v) { setAdding(a => ({ ...a, goal: false })); return; }
-    setGoals([...goals, v]);
-    setDraft(d => ({ ...d, goal: "" }));
-    setAdding(a => ({ ...a, goal: false }));
-  };
-  const removeGoal = (i) => setGoals(goals.filter((_, idx) => idx !== i));
-  const editGoal = (i, v) => { const next = [...goals]; next[i] = v; setGoals(next); };
-
-  const addFile = () => {
-    const v = draft.file.trim();
-    if (!v) { setAdding(a => ({ ...a, file: false })); return; }
-    setFiles([...files, { id: uid(), name: v, depth: Number(draft.fileDepth) || 0 }]);
-    setDraft(d => ({ ...d, file: "", fileDepth: 0 }));
-    setAdding(a => ({ ...a, file: false }));
-  };
-  const removeFile = (id) => setFiles(files.filter(f => f.id !== id));
-  const renameFile = (id, name) => setFiles(files.map(f => f.id === id ? { ...f, name } : f));
-  const indentFile = (id, delta) => setFiles(files.map(f => f.id === id ? { ...f, depth: Math.max(0, Math.min(5, f.depth + delta)) } : f));
-
-  // Empty-state CTA: wenn projekt frisch ist (keine tasks, keine messages,
-  // keine team-members) → zeige onboarding-banner mit konkreten next-steps.
-  const isEmpty = stats.open === 0 && stats.done === 0 && stats.ideas === 0 &&
-                  ((project.messages || []).length === 0);
+  const ccRunning = !!(sync.state?.ccRunning);
+  // Multi-user: sync.user.email. Pair-token-only: sync.deviceName als label.
+  const myEmail = (sync.user && sync.user.email) || sync.deviceName || null;
+  const NotesSection = window.TeamNotesSection;
+  const AppointmentsSection = window.TeamAppointmentsSection;
 
   return (
     <>
-      {isEmpty && (
-        <div className="box" style={{
-          marginBottom: 14,
-          border: "2px dashed var(--ink)",
-          background: "rgba(0,0,0,0.02)",
-        }}>
-          <div className="eyebrow">// los geht's · 3 schritte</div>
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10, marginTop: 8 }}>
-            <OnboardStep n="1" title="aufgaben anlegen"
-              body="im aufgaben-tab dein erstes todo eintippen. cloud-code arbeitet später automatisch durch die liste."
-              cta="→ aufgaben-tab" onClick={() => sync.setActiveTab && sync.setActiveTab("tasks")} />
-            <OnboardStep n="2" title="team einladen"
-              body="andere accounts hinzufügen (sehen + mitarbeiten). funktioniert über internet ohne extra setup."
-              cta="👥 mitglieder" onClick={() => sync.notify && document.querySelector('[title="mitglieder einladen / verwalten"]')?.click()} />
-            <OnboardStep n="3" title="handy verbinden"
-              body="QR-code scannen am handy — dann hast du dieselben aufgaben + chat überall."
-              cta="+ handy" onClick={() => document.querySelector('[title*="QR"]')?.click()} />
-          </div>
-        </div>
-      )}
+      {/* Device/Conflict-banners bleiben oben (selten sichtbar, aber kritisch wenn aktiv) */}
       {window.DevicePanel ? <window.DevicePanel project={project}
                                                  me={{ deviceType: "desktop" }}
                                                  apiBase={sync.serverUrl}
                                                  token={sync.token} /> : null}
+
+      {/* Block 1 — Onboarding + Mini-Chat */}
       <div className="two-col">
         <div className="box">
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
-            <span className="eyebrow">// dateistruktur</span>
-            <button className="btn tiny" onClick={() => setAdding(a => ({ ...a, file: !a.file }))}>+ datei/ordner</button>
-          </div>
-          {adding.file && (
-            <div style={{ display: "flex", gap: 6, marginBottom: 8, alignItems: "center" }}>
-              <input className="input"
-                     placeholder="z.B. lib/services/ oder pubspec.yaml"
-                     autoFocus
-                     value={draft.file}
-                     onChange={e => setDraft(d => ({ ...d, file: e.target.value }))}
-                     onKeyDown={e => { if (e.key === "Enter") addFile(); if (e.key === "Escape") setAdding(a => ({ ...a, file: false })); }} />
-              <select className="input" style={{ width: 80 }}
-                      value={draft.fileDepth}
-                      onChange={e => setDraft(d => ({ ...d, fileDepth: e.target.value }))}>
-                {[0,1,2,3,4,5].map(d => <option key={d} value={d}>↘ {d}</option>)}
-              </select>
-              <button className="btn primary tiny" onClick={addFile}>add</button>
-            </div>
-          )}
-          {files.length === 0 && !adding.file && <div className="empty"><div>noch keine struktur erfasst.</div></div>}
-          <div className="tree">
-            {files.map(f => {
-              const isDir = /\/$/.test(f.name);
-              return (
-                <div key={f.id} className="tree-row" style={{ "--depth": f.depth }}>
-                  <span className="tree-glyph">{isDir ? "📁" : "📄"}</span>
-                  <Editable value={f.name} onChange={v => renameFile(f.id, v.trim() || f.name)} className="tree-name" />
-                  <div className="tree-actions">
-                    <button className="x-btn" title="einrücken" onClick={() => indentFile(f.id, +1)}>→</button>
-                    <button className="x-btn" title="ausrücken" onClick={() => indentFile(f.id, -1)}>←</button>
-                    <button className="x-btn" title="entfernen" onClick={() => removeFile(f.id)}>×</button>
-                  </div>
-                </div>
-              );
-            })}
+          <div className="eyebrow">// los geht's · 3 schritte</div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 10, marginTop: 8 }}>
+            <OnboardStep n="1" title="idee erfassen"
+              body="im ideen-tab tippst du was dir gerade einfällt. später machst du daraus aufgaben."
+              cta="→ ideen-tab" onClick={() => onSetTab && onSetTab("ideas")} />
+            <OnboardStep n="2" title="team einladen"
+              body={"oben „mitglieder verwalten“ → email eintippen. ihr seht dann beide dieselben aufgaben + chat."}
+              cta="👥 mitglieder" onClick={onOpenMembers} />
+            <OnboardStep n="3" title="mit team chatten"
+              body="rechts im chat oder im team-tab: nachrichten, notizen + termine teilen — live synchronisiert."
+              cta="→ team-tab" onClick={() => onSetTab && onSetTab("team")} />
           </div>
         </div>
+        <MiniChat project={project} myEmail={myEmail} />
+      </div>
 
-        <div className="box">
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
-            <span className="eyebrow">// projektziele</span>
-            <button className="btn tiny" onClick={() => setAdding(a => ({ ...a, goal: !a.goal }))}>+ ziel</button>
-          </div>
-          {adding.goal && (
-            <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
-              <input className="input" placeholder="was soll erreicht werden?" autoFocus
-                     value={draft.goal} onChange={e => setDraft(d => ({ ...d, goal: e.target.value }))}
-                     onKeyDown={e => { if (e.key === "Enter") addGoal(); if (e.key === "Escape") setAdding(a => ({ ...a, goal: false })); }} />
-              <button className="btn primary tiny" onClick={addGoal}>add</button>
-            </div>
-          )}
-          {goals.length === 0 && !adding.goal && <div className="empty"><div>noch keine ziele formuliert.</div></div>}
-          <ul className="goals">
-            {goals.map((g, i) => (
-              <li key={i}>
-                <Editable value={g} onChange={v => editGoal(i, v.trim() || g)} className="goal-text" />
-                <button className="x-btn" onClick={() => removeGoal(i)}>×</button>
-              </li>
-            ))}
-          </ul>
-          <hr className="div" />
-          <div className="eyebrow">// stats</div>
-          <div className="stat">
-            ▸ aufgaben offen — <strong>{stats.open}</strong><br/>
-            ▸ erledigt — <strong>{stats.done}</strong><br/>
-            ▸ regeln aktiv — <strong>{stats.rules}</strong><br/>
-            ▸ ideen unbearbeitet — <strong>{stats.ideas}</strong><br/>
-            ▸ aktivitäts-log — <strong>{stats.activity}</strong>
-          </div>
+      {/* Block 2 — Stat-chips */}
+      <div style={{ display: "flex", gap: 12, marginTop: 14 }}>
+        <StatChip label="aufgaben" value={stats.open} accent={stats.open > 0}
+                  onClick={() => onSetTab && onSetTab("tasks")} />
+        <StatChip label="regeln" value={stats.rules}
+                  onClick={() => onSetTab && onSetTab("rules")} />
+        <StatChip label="ideen" value={stats.ideas} accent={stats.ideas > 0}
+                  onClick={() => onSetTab && onSetTab("ideas")} />
+        <StatChip label={ccRunning ? "aktiv" : "pause"} value={ccRunning ? "⚡" : "○"}
+                  onClick={() => onSetTab && onSetTab("cloud")} />
+      </div>
+
+      {/* Block 3 — Vorschläge | Notizen + Termine */}
+      <div className="two-col" style={{ marginTop: 14 }}>
+        <SuggestionsSlim project={project} />
+        <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+          {NotesSection ? <NotesSection project={project} sync={sync} /> :
+            <div className="box"><div className="eyebrow">// notizen</div><div className="empty"><div>team-modul lädt…</div></div></div>}
+          {AppointmentsSection ? <AppointmentsSection project={project} sync={sync} myEmail={myEmail} /> :
+            <div className="box"><div className="eyebrow">// termine</div><div className="empty"><div>team-modul lädt…</div></div></div>}
         </div>
       </div>
 
-      <hr className="div" />
-
-      <SuggestionsAndBugs project={project} />
-
-      <hr className="div" />
-
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 10 }}>
-        <h2 className="h2">alle projekte</h2>
-        <button className="btn primary tiny" onClick={onNewProject}>+ neu</button>
-      </div>
-      <div className="cards">
-        {allProjects.map((p, i) => (
-          <div key={p.id} className={"card " + (i % 3 === 0 ? "tilt-l" : i % 3 === 2 ? "tilt-r" : "")}
-               onClick={() => onSelectProject(p.id)}>
-            <div className="row">
-              <h2 className="h2">{p.starred ? "★ " : ""}{p.name}</h2>
-              <span className="cc-dot">cc {relTime(p.lastSync)}</span>
-            </div>
-            <div className="stats">
-              <span>{(p.tasks || []).filter(t => !t.done).length} aufgaben</span>
-              <span>·</span>
-              <span>{(p.ideas || []).filter(i => i.status === "unprocessed").length} ideen</span>
-              <span>·</span>
-              <span>{(p.rules || []).filter(r => r.active).length} regeln</span>
-            </div>
-            <div className="spark">fortschritt · {progressBar(p)}</div>
-          </div>
-        ))}
+      {/* Block 4 — Bugs (kompakt wenn leer, voll wenn welche da) */}
+      <div style={{ marginTop: 14 }}>
+        <BugsBlock project={project} />
       </div>
     </>
   );
@@ -1759,6 +2018,7 @@ function App() {
   const [showAuth, setShowAuth] = useState(false);
   const [showMembers, setShowMembers] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [showProjSettings, setShowProjSettings] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(null);
   const [toast, setToast] = useState(null);
 
@@ -1836,6 +2096,7 @@ function App() {
     if (a === "openAuth") setShowAuth(true);
     if (a === "openMembers") setShowMembers(true);
     if (a === "openSettings") setShowSettings(true);
+    if (a === "openProjectSettings") setShowProjSettings(true);
   };
 
   const createProject = (p) => {
@@ -1902,9 +2163,9 @@ function App() {
             <div className="main-body" data-tab={client.activeTab}>
               {client.activeTab === "overview" && (
                 <ScreenOverview project={project}
-                                allProjects={projects}
-                                onSelectProject={(id) => { client.setActiveProject(id); client.setActiveTab("overview"); }}
-                                onNewProject={() => setShowNew(true)} />
+                                onOpenMembers={() => setShowMembers(true)}
+                                onOpenPair={() => setShowPair(true)}
+                                onSetTab={(id) => client.setActiveTab(id)} />
               )}
               {client.activeTab === "tasks" && <ScreenTasks project={project} onCcRun={(taskId) => onCcRun({ taskId })} />}
               {client.activeTab === "rules" && <ScreenRules project={project} />}
@@ -1938,6 +2199,9 @@ function App() {
       {showAuth && window.AccountAuthModal && <window.AccountAuthModal onClose={() => setShowAuth(false)} />}
       {showMembers && project && window.MembersModal && <window.MembersModal projectId={project.id} onClose={() => setShowMembers(false)} />}
       {showSettings && window.SettingsModal && <window.SettingsModal onClose={() => setShowSettings(false)} />}
+      {showProjSettings && project && window.ProjectSettingsModal && (
+        <window.ProjectSettingsModal project={project} onClose={() => setShowProjSettings(false)} />
+      )}
       {confirmDelete && (
         <Confirm title="projekt löschen?"
                  message={`„${projects.find(p => p.id === confirmDelete)?.name || "?"}“ wird unwiderruflich gelöscht — alle aufgaben, regeln, ideen.`}

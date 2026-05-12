@@ -32,12 +32,16 @@
             borderRadius: 8, padding: 4, minWidth: 180, zIndex: 100,
             boxShadow: "3px 3px 0 rgba(0,0,0,0.08)",
           }}>
+            <Item label="✎ projekt-details" hint="beschreibung · ziele · dateien"
+              onClick={choose(() => onAction("openProjectSettings"))} />
             <Item label="↻ sync jetzt" onClick={choose(() => onAction("syncNow"))} />
             <Item label="📤 export (json)" onClick={choose(() => onAction("share"))} />
             <Item label="📂 öffnen in IDE" disabled={!hasPath}
               hint={hasPath ? "" : "pfad fehlt"}
               onClick={choose(() => onAction("openIDE"))} />
-            <Item label="⚙ einstellungen" onClick={choose(() => onAction("openSettings"))} />
+            <div style={{ height: 1, background: "var(--ink-faint)", margin: "4px 6px" }} />
+            <Item label="⚙ globale settings" hint="API-keys · cli-status"
+              onClick={choose(() => onAction("openSettings"))} />
             <div style={{ height: 1, background: "var(--ink-faint)", margin: "4px 6px" }} />
             <Item label="× projekt löschen" danger onClick={choose(onDelete)} />
           </div>

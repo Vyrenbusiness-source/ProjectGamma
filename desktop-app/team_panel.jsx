@@ -318,4 +318,8 @@
   }
 
   window.TeamPanel = TeamPanel;
+  // Einzelne sektionen exportieren, damit die übersicht sie kompakt einbetten kann.
+  window.TeamChatSection = ChatSection;
+  window.TeamNotesSection = NotesSection;
+  window.TeamAppointmentsSection = AppointmentsSection;
 })();

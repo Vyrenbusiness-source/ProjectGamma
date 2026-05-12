@@ -35,6 +35,7 @@ const { buildOpAppendFrame, selectRecipients } = require("./lib/op_broadcast");
 const { createUserSettingsStore, KNOWN_KEYS: SETTING_KEYS } = require("./lib/user_settings");
 const { createUpnpPortmap } = require("./lib/upnp_portmap");
 const { createPublicIpResolver } = require("./lib/public_ip");
+const { createCloudflareTunnel } = require("./lib/cloudflare_tunnel");
 const { checkAll: depsCheckAll, missingRequired: depsMissingRequired } = require("./lib/deps_check");
 
 function emitPush(event) {
@@ -272,6 +273,21 @@ publicIpResolver.resolve().then((r) => {
   if (r.ip) console.log("[public-ip]", r.ip, "(cached:", r.cached, ")");
   else console.log("[public-ip] unbekannt:", r.error);
 }).catch(() => {});
+
+// Cloudflare Quick-Tunnel: optional, manuell via /api/tunnel/start gestartet.
+// Macht den server über internet erreichbar ohne port-forward / public-IP.
+// Bei opt-in via env PG_CLOUDFLARE=1 wird der tunnel beim boot automatisch gestartet.
+const cloudflareTunnel = createCloudflareTunnel({
+  baseDir: __dirname,
+  localPort: PORT,
+  logger: console,
+});
+if (process.env.PG_CLOUDFLARE === "1" || process.env.PG_CLOUDFLARE === "true") {
+  cloudflareTunnel.start().then((r) => {
+    if (r.url) console.log("[cloudflare] auto-start tunnel:", r.url);
+    else console.warn("[cloudflare] auto-start fehlgeschlagen:", r.error);
+  });
+}
 
 let saveTimer = null;
 function persist() {
@@ -1004,22 +1020,43 @@ app.get("/api/network-info", (req, res) => {
   lanIps.sort((a, b) => _rankLanIp(b) - _rankLanIp(a));
   // Public-route-optionen, in präferenz-reihenfolge.
   const routes = [];
-  // 1. UPnP-public (router hat port-mapping automatisch gesetzt)
+  // 1. Cloudflare-Tunnel (https, hinter NAT/CGNAT erreichbar) — wenn aktiv die
+  //    zuverlässigste route, daher first.
+  const cf = cloudflareTunnel.getStatus();
+  if (cf.status === "active" && cf.url) {
+    routes.push({ kind: "cloudflare", url: cf.url, public: true, scheme: "wss" });
+  }
+  // 2. UPnP-public (router hat port-mapping automatisch gesetzt)
   const upnp = upnpPortmap.getStatus();
   if (upnp.status === "active" && upnp.externalIp) {
     routes.push({ kind: "upnp", url: "http://" + upnp.externalIp + ":" + PORT, public: true });
   }
-  // 2. manueller port-forward (server kennt seine public-IP, port-status
+  // 3. manueller port-forward (server kennt seine public-IP, port-status
   //    nicht garantiert — mobile testet selbst via /health)
   const pubIp = publicIpResolver.getCached();
   if (pubIp.ip && !routes.find((r) => r.url.includes(pubIp.ip))) {
     routes.push({ kind: "public-ip", url: "http://" + pubIp.ip + ":" + PORT, public: true, needsPortForward: true });
   }
-  // 3. LAN-IPs (jeweils einzeln, schnell wenn beide im selben netz)
+  // 4. LAN-IPs (jeweils einzeln, schnell wenn beide im selben netz)
   for (const ip of lanIps) {
     routes.push({ kind: "lan", url: "http://" + ip + ":" + PORT, public: false });
   }
-  res.json({ port: PORT, ips: lanIps, routes });
+  res.json({ port: PORT, ips: lanIps, routes, tunnel: cf });
+});
+
+// Cloudflare Tunnel control — desktop-only (lokal/trusted).
+app.post("/api/tunnel/start", authMw, async (req, res) => {
+  if (!isDesktopSession(req.session)) return res.status(403).json({ error: "desktop session required" });
+  const r = await cloudflareTunnel.start();
+  res.json(r);
+});
+app.post("/api/tunnel/stop", authMw, (req, res) => {
+  if (!isDesktopSession(req.session)) return res.status(403).json({ error: "desktop session required" });
+  const r = cloudflareTunnel.stop();
+  res.json(r);
+});
+app.get("/api/tunnel/status", (req, res) => {
+  res.json(cloudflareTunnel.getStatus());
 });
 
 // Pair init: Desktop ruft auf → bekommt 6-stelligen Code zurück.
@@ -1032,19 +1069,34 @@ app.post("/api/pair/init", (req, res) => {
   pairings.set(code, { code, expiresAt, hostName, ts: NOW() });
   console.log("[pair] init code:", code, "host:", hostName);
   // QR-Payload: kompakter String, Mobile-App parst host+port+code aus URL.
-  // Schema: pgamma://pair?port=<port>&code=<code>&pub=<public-ip>
-  // pub = optionale public-IP für internet-fallback (offene ports), damit
-  // mobile auch über internet connecten kann ohne LAN.
+  // Schema-priorität:
+  //   1. Cloudflare-tunnel (aktiv) → host=<tunnel-host>, port=443, scheme=wss
+  //      → mobile verbindet sich übers internet ohne LAN/port-forward.
+  //   2. Sonst: LAN-IP/UPnP-IP — host wird nicht hardcoded, mobile probiert
+  //      die alt-hosts aus dem `hosts`-array durch.
   const fp = TLS_INFO.fingerprint;
-  const scheme = TLS_INFO.mode === "off" ? "ws" : "wss";
-  const fpQ = fp ? `&fp=${fp}` : "";
   const pubIp = publicIpResolver.getCached().ip;
+  const cf = cloudflareTunnel.getStatus();
+  let scheme = TLS_INFO.mode === "off" ? "ws" : "wss";
+  let hostQ = "";
+  let portQ = `&port=${PORT}`;
+  if (cf.status === "active" && cf.url) {
+    // cloudflare gibt uns eine https://<random>.trycloudflare.com — host extrahieren.
+    const m = cf.url.match(/^https:\/\/([^/]+)/i);
+    if (m) {
+      hostQ = `&host=${m[1]}`;
+      scheme = "wss";
+      portQ = "&port=443";
+    }
+  }
+  const fpQ = fp ? `&fp=${fp}` : "";
   const pubQ = pubIp ? `&pub=${pubIp}` : "";
-  const qrPayload = `pgamma://pair?port=${PORT}&code=${code}&scheme=${scheme}${fpQ}${pubQ}`;
+  const qrPayload = `pgamma://pair?${portQ.slice(1)}&code=${code}&scheme=${scheme}${hostQ}${fpQ}${pubQ}`;
   res.json({
     code, expiresAt, qrPayload,
     certFingerprint: fp, tlsMode: TLS_INFO.mode,
     publicIp: pubIp || null,
+    tunnel: cf,
   });
 });
 

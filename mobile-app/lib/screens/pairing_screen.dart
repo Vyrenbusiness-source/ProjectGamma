@@ -79,6 +79,17 @@ class _PairingScreenState extends State<PairingScreen> {
     final port = uri.queryParameters['port']?.trim() ?? '7892';
     final code = uri.queryParameters['code']?.trim().toUpperCase() ?? '';
     final publicIp = uri.queryParameters['pub']?.trim() ?? '';
+    // scheme: 'ws' (default, http) oder 'wss' (cloudflare-tunnel, https).
+    // Bei wss → URL = https://<host>[:port], port=443 wird weggelassen.
+    final scheme = (uri.queryParameters['scheme']?.trim() ?? 'ws').toLowerCase();
+    final isSecure = scheme == 'wss';
+    final httpScheme = isSecure ? 'https' : 'http';
+    String buildUrl(String h) {
+      // Bei https + port 443 (default) den port nicht in die URL — manche TLS-stacks
+      // sind picky bei explicit ":443".
+      if (isSecure && port == '443') return '$httpScheme://$h';
+      return '$httpScheme://$h:$port';
+    }
     // Alternative LAN-IPs (audit-fix): desktop bettet alle adapter-IPs ein,
     // damit mobile sie alle probieren kann (haupt-IP ist evtl. VPN-adapter).
     final hostsParam = uri.queryParameters['hosts']?.trim() ?? '';
@@ -97,16 +108,16 @@ class _PairingScreenState extends State<PairingScreen> {
       if (publicIp.isNotEmpty) publicIp,
     ];
     for (final h in candidates) {
-      if (await SyncClient.testServer('http://$h:$port')) {
+      if (await SyncClient.testServer(buildUrl(h))) {
         chosenHost = h;
         break;
       }
     }
     setState(() {
-      _server.text = 'http://$chosenHost:$port';
+      _server.text = buildUrl(chosenHost);
       _code.text = code;
-      _publicIpFallback = publicIp.isNotEmpty ? 'http://$publicIp:$port' : null;
-      _altHosts = altHosts.map((h) => 'http://$h:$port').toList();
+      _publicIpFallback = publicIp.isNotEmpty ? buildUrl(publicIp) : null;
+      _altHosts = altHosts.map(buildUrl).toList();
       _error = null;
       _serverStatus = _ServerStatus.unknown;
     });

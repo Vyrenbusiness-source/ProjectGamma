@@ -35,7 +35,10 @@
     // Verhindert „QR zeigt auf VPN-adapter-IP, phone kann's nicht erreichen".
     const alt = Array.isArray(args && args.hosts) ? args.hosts.filter(x => x && x !== host) : [];
     const altQ = alt.length ? "&hosts=" + encodeURIComponent(alt.join(",")) : "";
-    return `pgamma://pair?host=${h}&port=${portNum}&code=${c}${pubQ}${altQ}`;
+    // Optional scheme (ws|wss) für tunnel-mode (cloudflare gibt https, mobile muss wss nutzen).
+    const scheme = args && args.scheme ? String(args.scheme) : "";
+    const schemeQ = scheme ? "&scheme=" + encodeURIComponent(scheme) : "";
+    return `pgamma://pair?host=${h}&port=${portNum}&code=${c}${pubQ}${altQ}${schemeQ}`;
   }
 
   /**

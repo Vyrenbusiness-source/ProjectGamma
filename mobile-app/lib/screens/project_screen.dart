@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import '../theme.dart';
 import '../sync_client.dart';
 import '../features/members/members_screen.dart';
+import 'project_details_screen.dart';
 
 class ProjectScreen extends StatefulWidget {
   const ProjectScreen({super.key});
@@ -54,33 +55,29 @@ class _ProjectScreenState extends State<ProjectScreen> {
       ..sort((a, b) => ((b['priority'] is num ? (b['priority'] as num).toInt() : 3)).compareTo((a['priority'] is num ? (a['priority'] as num).toInt() : 3)));
     final nextTask = inProgress.isNotEmpty ? inProgress.first : null;
 
-    final messages = ((p['messages'] as List?) ?? const []).length;
-    final isFresh = open == 0 && unprocIdeas == 0 && messages == 0;
-
     return ListView(
       padding: const EdgeInsets.fromLTRB(16, 12, 16, 32),
       children: [
-        // Onboarding-banner für frische projekte
-        if (isFresh)
-          Container(
-            margin: const EdgeInsets.only(bottom: 14),
-            padding: const EdgeInsets.fromLTRB(14, 12, 14, 14),
-            decoration: BoxDecoration(
-              color: pgPaper,
-              border: Border.all(color: pgInk, width: 2, style: BorderStyle.solid),
-              borderRadius: BorderRadius.circular(8),
-            ),
-            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              const PgEyebrow('los geht\'s · 3 schritte'),
-              const SizedBox(height: 8),
-              _OnboardStep(n: '1', title: 'idee erfassen',
-                body: 'unten in „schnelle idee" tippen + speichern. ideen werden vom team gesehen.'),
-              _OnboardStep(n: '2', title: 'team einladen',
-                body: 'oben „mitglieder verwalten" → email eintippen. ihr seht dann beide dieselben aufgaben + chat.'),
-              _OnboardStep(n: '3', title: 'mit team chatten',
-                body: 'im team-tab unten könnt ihr nachrichten + notizen + termine teilen.'),
-            ]),
+        // Onboarding-banner immer sichtbar — passt zum desktop-layout und mockup.
+        Container(
+          margin: const EdgeInsets.only(bottom: 14),
+          padding: const EdgeInsets.fromLTRB(14, 12, 14, 14),
+          decoration: BoxDecoration(
+            color: pgPaper,
+            border: Border.all(color: pgInk, width: 2, style: BorderStyle.solid),
+            borderRadius: BorderRadius.circular(8),
           ),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            const PgEyebrow('los geht\'s · 3 schritte'),
+            const SizedBox(height: 8),
+            _OnboardStep(n: '1', title: 'idee erfassen',
+              body: 'unten in „schnelle idee" tippen + speichern. ideen werden vom team gesehen.'),
+            _OnboardStep(n: '2', title: 'team einladen',
+              body: 'oben „mitglieder verwalten" → email eintippen. ihr seht dann beide dieselben aufgaben + chat.'),
+            _OnboardStep(n: '3', title: 'mit team chatten',
+              body: 'im team-tab unten könnt ihr nachrichten + notizen + termine teilen.'),
+          ]),
+        ),
         // QUICK STATS — vier Kacheln auf einer Zeile
         Row(children: [
           Expanded(child: _Stat('aufgaben', open, accent: open > 0)),
@@ -95,23 +92,21 @@ class _ProjectScreenState extends State<ProjectScreen> {
         const SizedBox(height: 18),
 
         // MITGLIEDER · navigations-row (multi-user schicht 2)
-        InkWell(
+        _NavRow(
+          icon: Icons.group_outlined,
+          label: 'mitglieder verwalten',
           onTap: () => Navigator.of(context).push(
             MaterialPageRoute(builder: (_) => MembersScreen(projectId: p['id'] as String)),
           ),
-          child: Container(
-            padding: const EdgeInsets.fromLTRB(14, 10, 10, 10),
-            decoration: BoxDecoration(
-              border: Border.all(color: pgInkFaint, width: 1.5),
-              borderRadius: BorderRadius.circular(8),
-            ),
-            child: Row(children: const [
-              Icon(Icons.group_outlined, size: 18, color: pgInk),
-              SizedBox(width: 10),
-              Expanded(child: Text('mitglieder verwalten',
-                style: TextStyle(fontSize: 13.5, color: pgInk))),
-              Icon(Icons.chevron_right, size: 18, color: pgInkFaint),
-            ]),
+        ),
+        const SizedBox(height: 8),
+        // PROJEKT-DETAILS · beschreibung · ziele · dateien · pfad
+        _NavRow(
+          icon: Icons.edit_note_outlined,
+          label: 'projekt-details',
+          hint: goals.isEmpty ? 'beschreibung · ziele · dateien' : '${goals.length} ziele · pfad · dateien',
+          onTap: () => Navigator.of(context).push(
+            MaterialPageRoute(builder: (_) => const ProjectDetailsScreen()),
           ),
         ),
         const SizedBox(height: 14),
@@ -179,22 +174,30 @@ class _ProjectScreenState extends State<ProjectScreen> {
           const SizedBox(height: 18),
         ],
 
-        // PROJEKTZIELE — kompakte Bullet-Liste
+        // ZIELE-preview · 1-zeilig · tap = projekt-details
         if (goals.isNotEmpty) ...[
-          const PgEyebrow('projektziele'),
-          const SizedBox(height: 4),
-          for (final g in goals) Padding(
-            padding: const EdgeInsets.symmetric(vertical: 3, horizontal: 2),
-            child: Row(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Text('▸ ', style: TextStyle(color: pgInkSoft, fontFamily: 'monospace')),
-                Expanded(child: Text(g.toString(),
-                  style: const TextStyle(fontSize: 13, height: 1.45))),
-              ],
+          InkWell(
+            onTap: () => Navigator.of(context).push(
+              MaterialPageRoute(builder: (_) => const ProjectDetailsScreen()),
+            ),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 2),
+              child: Row(children: [
+                const Text('ziele: ',
+                  style: TextStyle(fontSize: 11.5, color: pgInkFaint, fontFamily: 'monospace')),
+                Expanded(
+                  child: Text(
+                    goals.take(3).join('  ·  ') + (goals.length > 3 ? '  +${goals.length - 3}' : ''),
+                    style: const TextStyle(fontSize: 12.5, color: pgInkSoft, height: 1.4),
+                    maxLines: 2, overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+                const SizedBox(width: 6),
+                const Icon(Icons.edit, size: 13, color: pgInkFaint),
+              ]),
             ),
           ),
-          const SizedBox(height: 18),
+          const SizedBox(height: 14),
         ],
 
         // LETZTE AKTIVITÄT (top 3)
@@ -315,6 +318,41 @@ class _OnboardStep extends StatelessWidget {
           ]),
         ),
       ]),
+    );
+  }
+}
+
+// Reusable nav-row · icon · label · optionaler hint rechts · chevron.
+class _NavRow extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final String? hint;
+  final VoidCallback onTap;
+  const _NavRow({required this.icon, required this.label, required this.onTap, this.hint});
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(8),
+      child: Container(
+        padding: const EdgeInsets.fromLTRB(14, 10, 10, 10),
+        decoration: BoxDecoration(
+          border: Border.all(color: pgInkFaint, width: 1.5),
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Row(children: [
+          Icon(icon, size: 18, color: pgInk),
+          const SizedBox(width: 10),
+          Expanded(child: Text(label,
+            style: const TextStyle(fontSize: 13.5, color: pgInk))),
+          if (hint != null) ...[
+            Text(hint!,
+              style: const TextStyle(fontSize: 11, color: pgInkFaint, fontFamily: 'monospace')),
+            const SizedBox(width: 6),
+          ],
+          const Icon(Icons.chevron_right, size: 18, color: pgInkFaint),
+        ]),
+      ),
     );
   }
 }
