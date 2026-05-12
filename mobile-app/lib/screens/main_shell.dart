@@ -1,6 +1,7 @@
 // MainShell · BottomNav mit 5 Tabs: Projekt, Aufgaben, Regeln, Ideen, Cloud.
 // Cloud-Tab vereint cc-control, devices, sync-verlauf, vorschläge, bugs in
 // collapsable sections.
+import 'dart:async';
 import 'package:flutter/material.dart';
 import '../theme.dart';
 import '../sync_client.dart';
@@ -40,36 +41,7 @@ class _MainShellState extends State<MainShell> {
     ];
 
     if (client.state == null) {
-      return Scaffold(
-        backgroundColor: pgPaper,
-        body: SafeArea(
-          child: Center(
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                Image.asset('assets/Logo.png', width: 80, height: 80),
-                const SizedBox(height: 24),
-                const CircularProgressIndicator(color: pgInk),
-                const SizedBox(height: 16),
-                const Text('verbinde…', style: TextStyle(color: pgInkSoft)),
-                const SizedBox(height: 24),
-                if (client.lastError != null)
-                  Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 32),
-                    child: Text(client.lastError!,
-                      textAlign: TextAlign.center,
-                      style: const TextStyle(color: pgDanger, fontSize: 12)),
-                  ),
-                const SizedBox(height: 16),
-                TextButton(
-                  onPressed: () => client.logout(),
-                  child: const Text('neu pairen', style: TextStyle(color: pgInk, decoration: TextDecoration.underline)),
-                ),
-              ],
-            ),
-          ),
-        ),
-      );
+      return _ConnectingScreen(client: client);
     }
 
     return Scaffold(
@@ -200,6 +172,126 @@ class _Tab {
   final IconData icon;
   final Widget body;
   const _Tab(this.label, this.icon, this.body);
+}
+
+// Verbinde-screen mit timeout-feedback: nach 8s erscheint hinweis dass etwas
+// nicht stimmt, plus prominenter "neu pairen"-button. Vorher konnte user im
+// endlosen "verbinde…" hängen ohne klares signal.
+class _ConnectingScreen extends StatefulWidget {
+  final SyncClient client;
+  const _ConnectingScreen({required this.client});
+  @override
+  State<_ConnectingScreen> createState() => _ConnectingScreenState();
+}
+
+class _ConnectingScreenState extends State<_ConnectingScreen> {
+  Timer? _slowTimer;
+  bool _slow = false;
+  bool _loggingOut = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _slowTimer = Timer(const Duration(seconds: 8), () {
+      if (mounted) setState(() => _slow = true);
+    });
+  }
+
+  @override
+  void dispose() {
+    _slowTimer?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _retry() async {
+    if (!widget.client.hasSession) return;
+    setState(() { _slow = false; });
+    _slowTimer?.cancel();
+    _slowTimer = Timer(const Duration(seconds: 8), () {
+      if (mounted) setState(() => _slow = true);
+    });
+    await widget.client.connect();
+  }
+
+  Future<void> _resetPairing() async {
+    if (_loggingOut) return;
+    setState(() => _loggingOut = true);
+    await widget.client.logout();
+    // notifyListeners triggert root-rebuild → PairingScreen rendert.
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final err = widget.client.lastError;
+    return Scaffold(
+      backgroundColor: pgPaper,
+      body: SafeArea(
+        child: Center(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 32),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Image.asset('assets/Logo.png', width: 80, height: 80),
+                const SizedBox(height: 24),
+                if (!_slow) ...[
+                  const CircularProgressIndicator(color: pgInk),
+                  const SizedBox(height: 16),
+                  const Text('verbinde…', style: TextStyle(color: pgInkSoft)),
+                ] else ...[
+                  const Icon(Icons.signal_wifi_off, size: 36, color: pgDanger),
+                  const SizedBox(height: 12),
+                  const Text('server nicht erreichbar',
+                    style: TextStyle(fontSize: 16, color: pgInk, fontWeight: FontWeight.w700)),
+                  const SizedBox(height: 6),
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 8),
+                    child: Text(
+                      widget.client.serverUrl != null
+                        ? 'Versuche Verbindung zu ${widget.client.serverUrl}'
+                        : 'Keine Server-URL gesetzt',
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(fontSize: 12, color: pgInkSoft),
+                    ),
+                  ),
+                ],
+                if (err != null) ...[
+                  const SizedBox(height: 12),
+                  Container(
+                    padding: const EdgeInsets.all(10),
+                    decoration: BoxDecoration(
+                      border: Border.all(color: pgDanger, width: 1.5),
+                      borderRadius: BorderRadius.circular(6),
+                    ),
+                    child: Text(err,
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(color: pgDanger, fontSize: 11.5)),
+                  ),
+                ],
+                const SizedBox(height: 24),
+                if (_slow)
+                  ElevatedButton.icon(
+                    onPressed: _retry,
+                    icon: const Icon(Icons.refresh, size: 18),
+                    label: const Text('erneut versuchen'),
+                  ),
+                const SizedBox(height: 8),
+                TextButton.icon(
+                  onPressed: _loggingOut ? null : _resetPairing,
+                  icon: _loggingOut
+                    ? const SizedBox(width: 14, height: 14,
+                        child: CircularProgressIndicator(strokeWidth: 2, color: pgInk))
+                    : const Icon(Icons.logout, size: 18, color: pgInk),
+                  label: Text(_loggingOut ? 'beende session…' : 'neu pairen',
+                    style: const TextStyle(color: pgInk, decoration: TextDecoration.underline)),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 // Tab-icon mit optionalem ❓-pending-dot rechts oben.

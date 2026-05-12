@@ -238,24 +238,38 @@ class SyncClient extends ChangeNotifier {
     _heartbeat = null;
     _reconnectTimer?.cancel();
     _reconnectTimer = null;
-    try { await _ws?.sink.close(); } catch (_) {}
+    // sink.close() kann bei unreachable-server hängen — timeout-cap damit
+    // logout() nicht im "neu pairen"-button stecken bleibt.
+    try {
+      await _ws?.sink.close().timeout(const Duration(seconds: 2));
+    } catch (_) {}
     _ws = null;
     _connected = false;
   }
 
   Future<void> logout() async {
-    await disconnect();
+    // SYNCHRON state cleanen + listener feuern ZUERST. So switcht das UI sofort
+    // zur PairingScreen, auch wenn disconnect-cleanup im hintergrund hängt
+    // (z.B. weil server unreachable + sink.close() blockiert).
     _serverUrl = null;
     _token = null;
     _deviceName = null;
     activeProjectId = null;
     state = null;
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.remove('serverUrl');
-    await prefs.remove('token');
-    await prefs.remove('deviceName');
-    await prefs.remove('activeProjectId');
+    lastError = null;
+    _reconnectAttempt = 0;
     notifyListeners();
+    // Disconnect fire-and-forget — UI ist schon weiter.
+    // ignore: unawaited_futures
+    disconnect();
+    // Prefs cleanen (asynchron, blockt UI nicht)
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.remove('serverUrl');
+      await prefs.remove('token');
+      await prefs.remove('deviceName');
+      await prefs.remove('activeProjectId');
+    } catch (_) {}
   }
 
   void _onMessage(dynamic raw) {
