@@ -50,8 +50,5 @@ Work in progress. Mobile and desktop scaffolds, `sync-server` modules
 rule linter) exist as isolated, tested units; wiring is ongoing.
 
 
-<img width="329" height="693" alt="7" src="https://github.com/user-attachments/assets/640a8a69-4ae9-45dc-af39-1e9c0af20c2e" />
-<img width="1723" height="840" alt="4" src="https://github.com/user-attachments/assets/8c8b445d-0227-4ef9-b5a9-b47699650633" />
-<img width="842" height="503" alt="3" src="https://github.com/user-attachments/assets/a84da7ef-f535-4537-9c97-916a38d7730b" />
-<img width="1922" height="823" alt="2" src="https://github.com/user-attachments/assets/1b876238-f55d-43e5-ac43-21e49e370e4d" />
-<img width="1917" height="916" alt="1" src="https://github.com/user-attachments/assets/2882d26b-0a5a-4897-940c-e9540120b040" />
+<img width="1536" height="1024" alt="ChatGPT Image May 12, 2026, 10_20_40 PM" src="https://github.com/user-attachments/assets/a61c5be2-d812-4ccb-9f9d-8feb20c47d2e" />
+
