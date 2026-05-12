@@ -40,9 +40,6 @@
               hint={hasPath ? "" : "pfad fehlt"}
               onClick={choose(() => onAction("openIDE"))} />
             <div style={{ height: 1, background: "var(--ink-faint)", margin: "4px 6px" }} />
-            <Item label="⚙ globale settings" hint="API-keys · cli-status"
-              onClick={choose(() => onAction("openSettings"))} />
-            <div style={{ height: 1, background: "var(--ink-faint)", margin: "4px 6px" }} />
             <Item label="× projekt löschen" danger onClick={choose(onDelete)} />
           </div>
         )}

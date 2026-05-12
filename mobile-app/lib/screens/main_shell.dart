@@ -130,53 +130,55 @@ class _MainShellState extends State<MainShell> {
         ),
       ),
       body: SafeArea(top: false, child: tabs[_idx].body),
-      bottomNavigationBar: Container(
-        decoration: const BoxDecoration(
-          color: pgPaper,
-          border: Border(top: BorderSide(color: pgInk, width: 2)),
-        ),
-        child: SafeArea(
-          top: false,
-          child: Row(
-            mainAxisAlignment: MainAxisAlignment.spaceAround,
-            children: [
-              for (int i = 0; i < tabs.length; i++)
-                Expanded(
-                  child: InkWell(
-                    onTap: () => setState(() => _idx = i),
-                    child: Padding(
-                      padding: const EdgeInsets.symmetric(vertical: 8),
-                      child: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Container(
-                            width: 22, height: 22,
-                            decoration: BoxDecoration(
-                              color: _idx == i ? pgInk : Colors.transparent,
-                              border: Border.all(color: pgInk, width: 1.5),
-                              borderRadius: BorderRadius.circular(4),
-                            ),
-                            child: Icon(tabs[i].icon, size: 13, color: _idx == i ? pgPaper : pgInk),
-                          ),
-                          const SizedBox(height: 3),
-                          Text(
-                            tabs[i].label,
-                            style: TextStyle(
-                              fontFamily: 'monospace',
-                              fontSize: 9.5,
-                              color: _idx == i ? pgInk : pgInkSoft,
-                              fontWeight: _idx == i ? FontWeight.w600 : FontWeight.w400,
-                            ),
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                        ],
-                      ),
-                    ),
+      bottomNavigationBar: _buildBottomNav(tabs, p),
+    );
+  }
+
+  Widget _buildBottomNav(List<_Tab> tabs, Map<String, dynamic>? p) {
+    // pendingQuestion → cloud-tab highlighten (analog zum desktop).
+    final pq = p == null ? null : p['pendingQuestion'];
+    final ccPending = pq != null && pq.toString().trim().isNotEmpty;
+    final items = <Widget>[];
+    for (int i = 0; i < tabs.length; i++) {
+      final tab = tabs[i];
+      final active = _idx == i;
+      final pending = tab.label == 'cloud' && ccPending && !active;
+      items.add(Expanded(
+        child: InkWell(
+          onTap: () => setState(() => _idx = i),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(vertical: 8),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                _TabIcon(tab: tab, active: active, pending: pending),
+                const SizedBox(height: 3),
+                Text(
+                  tab.label,
+                  style: TextStyle(
+                    fontFamily: 'monospace',
+                    fontSize: 9.5,
+                    color: pending
+                      ? const Color(0xFFCC8800)
+                      : (active ? pgInk : pgInkSoft),
+                    fontWeight: (active || pending) ? FontWeight.w600 : FontWeight.w400,
                   ),
+                  overflow: TextOverflow.ellipsis,
                 ),
-            ],
+              ],
+            ),
           ),
         ),
+      ));
+    }
+    return Container(
+      decoration: const BoxDecoration(
+        color: pgPaper,
+        border: Border(top: BorderSide(color: pgInk, width: 2)),
+      ),
+      child: SafeArea(
+        top: false,
+        child: Row(mainAxisAlignment: MainAxisAlignment.spaceAround, children: items),
       ),
     );
   }
@@ -197,5 +199,45 @@ class _Tab {
   final IconData icon;
   final Widget body;
   const _Tab(this.label, this.icon, this.body);
+}
+
+// Tab-icon mit optionalem ❓-pending-dot rechts oben.
+class _TabIcon extends StatelessWidget {
+  final _Tab tab;
+  final bool active;
+  final bool pending;
+  const _TabIcon({required this.tab, required this.active, required this.pending});
+  @override
+  Widget build(BuildContext context) {
+    final borderColor = pending ? const Color(0xFFCC8800) : pgInk;
+    final borderWidth = pending ? 2.0 : 1.5;
+    return Stack(
+      clipBehavior: Clip.none,
+      children: [
+        Container(
+          width: 22, height: 22,
+          decoration: BoxDecoration(
+            color: active ? pgInk : Colors.transparent,
+            border: Border.all(color: borderColor, width: borderWidth),
+            borderRadius: BorderRadius.circular(4),
+          ),
+          child: Icon(tab.icon, size: 13, color: active ? pgPaper : pgInk),
+        ),
+        if (pending)
+          Positioned(
+            top: -4, right: -4,
+            child: Container(
+              width: 12, height: 12, alignment: Alignment.center,
+              decoration: const BoxDecoration(
+                color: Color(0xFFCC8800),
+                shape: BoxShape.circle,
+              ),
+              child: const Text('?',
+                style: TextStyle(color: Colors.white, fontSize: 9, fontWeight: FontWeight.w700)),
+            ),
+          ),
+      ],
+    );
+  }
 }
 

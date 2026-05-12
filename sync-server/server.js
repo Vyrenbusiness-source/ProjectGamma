@@ -71,72 +71,14 @@ const NOW = () => Date.now();
 const uid = () => crypto.randomBytes(4).toString("hex");
 
 function defaultState() {
-  const t0 = NOW();
-  const defaultPath = resolveDefaultProjectPath(__dirname);
-  if (!defaultPath) {
-    console.warn("[store] kein default-projektpfad ermittelbar — projekt wird ohne pfad angelegt; cloud-code startet erst nach manuellem path-set");
-  }
+  // Fresh-install: keine projekte. UI zeigt einen Welcome-state mit
+  // "+ erstes projekt anlegen"-CTA. So bekommen normale user keinen
+  // demo-projektordner zugewiesen, den sie auf ihrem rechner nicht haben.
   return {
-    projects: [
-      {
-        id: "projectgamma",
-        name: "ProjectGamma",
-        description: "Flutter/Dart Projekt-Manager mit Cloud-Code-Integration. Mobile + Desktop-Sync.",
-        starred: true, tech: "flutter",
-        path: defaultPath || "",
-        lastSync: t0 - 2 * 60 * 1000,
-        goals: [
-          "mobile + desktop synchronisieren",
-          "cloud-code arbeitet autonom im projekt",
-          "ideen aus dem alltag erfassen",
-          "regeln werden bei jeder änderung respektiert",
-        ],
-        files: [
-          { id: uid(), name: "lib/", depth: 0 },
-          { id: uid(), name: "features/", depth: 1 },
-          { id: uid(), name: "auth/", depth: 2 },
-          { id: uid(), name: "sync/", depth: 2 },
-          { id: uid(), name: "ideas/", depth: 2 },
-          { id: uid(), name: "tasks/", depth: 2 },
-          { id: uid(), name: "shared/", depth: 1 },
-          { id: uid(), name: "test/", depth: 0 },
-          { id: uid(), name: "pubspec.yaml", depth: 0 },
-          { id: uid(), name: "README.md", depth: 0 },
-        ],
-        tasks: [
-          { id: uid(), title: "refactor auth-modul nach regel #3", done: false, group: "in_progress", meta: "hoch",
-            subtasks: [
-              { id: uid(), title: "tokens kapseln", done: true },
-              { id: uid(), title: "session-store extrahieren", done: true },
-              { id: uid(), title: "tests anpassen", done: false },
-            ] },
-          { id: uid(), title: "sync-konflikt mobile ↔ desktop lösen", done: false, group: "in_progress", meta: "hoch", subtasks: [] },
-          { id: uid(), title: "ideen-inbox: voice-transkription verbinden", done: false, group: "in_progress", meta: "mittel", subtasks: [] },
-          { id: uid(), title: "checkmark-history-view bauen", done: false, group: "next", meta: "cc-vorschlag", subtasks: [] },
-          { id: uid(), title: "keyboard-shortcuts dokumentieren", done: false, group: "next", meta: "", subtasks: [] },
-        ],
-        rules: [
-          { id: uid(), category: "code-stil", text: "kein unnötiger code", active: true },
-          { id: uid(), category: "code-stil", text: "snake_case für dateien", active: true },
-          { id: uid(), category: "code-stil", text: "max. 200 zeilen pro file", active: true },
-          { id: uid(), category: "code-stil", text: "öffentliche api dokumentiert", active: true },
-          { id: uid(), category: "architektur", text: "bestehende ordnerstruktur respektieren", active: true },
-          { id: uid(), category: "architektur", text: "feature-first organisation", active: true },
-          { id: uid(), category: "architektur", text: "domain ↔ infra trennung", active: true },
-          { id: uid(), category: "workflow", text: "keine änderung ohne checkmark", active: true },
-          { id: uid(), category: "workflow", text: "mobile + desktop sync beachten", active: true },
-        ],
-        ideas: [
-          { id: uid(), text: "füge ein belohnungssystem hinzu", status: "unprocessed", source: "mobile", createdAt: t0 - 2 * 60 * 1000 },
-          { id: uid(), text: "onboarding kürzer machen", status: "task_created", source: "mobile", createdAt: t0 - 4 * 3600 * 1000 },
-          { id: uid(), text: "haptic feedback bei checkmark", status: "processed", source: "mobile", createdAt: t0 - 26 * 3600 * 1000 },
-        ],
-        activity: [],
-      },
-    ],
+    projects: [],
     syncLog: [],
     lastFullSync: NOW(),
-    ccRunning: true,
+    ccRunning: false,
   };
 }
 
@@ -2389,6 +2331,48 @@ app.post("/api/cc/suggest", authMw, async (req, res) => {
   res.json({ ok: true });
 });
 
+// AI-Summarize: kürzt eine lange beschreibung auf max ~120 chars (eine zeile).
+// Idee: lange description bleibt im project (descriptionLong), kurze landet
+// im header — verhindert dass der text die buttons aus dem viewport drückt.
+app.post("/api/cc/summarize", authMw, async (req, res) => {
+  if (!claudeCliInfo.installed) {
+    return res.status(503).json({ error: "claude-cli nicht installiert (settings → auto-install)" });
+  }
+  const { projectId, text, maxChars } = req.body || {};
+  let project = null;
+  let raw = String(text || "").trim();
+  if (projectId) {
+    project = state.projects.find(p => p.id === projectId);
+    if (!project) return res.status(404).json({ error: "projekt nicht gefunden" });
+    if (!_requireProjectAccess(req, res, project, ROLES.MEMBER)) return;
+    if (!raw) raw = String(project.descriptionLong || project.description || "").trim();
+  }
+  if (!raw) return res.status(400).json({ error: "text fehlt" });
+  if (raw.length > 20000) return res.status(400).json({ error: "text zu lang (>20k)" });
+  const cap = Math.max(60, Math.min(200, Number(maxChars) || 120));
+  const prompt = [
+    `Kürze den folgenden text auf MAX ${cap} zeichen (eine zeile).`,
+    "- Behalte die essenz (was, für wen, warum)",
+    "- Keine markdown-syntax (kein **, kein #, keine listen)",
+    "- Deutsch",
+    "- Nur den kurzen text antworten, KEINE erklärung, KEINE quotes drumherum.",
+    "",
+    "TEXT:",
+    raw,
+  ].join("\n");
+  try {
+    const out = await _spawnClaudeOneShot(prompt);
+    let summary = String(out || "").trim();
+    // claude hängt manchmal text drumherum — nimm die erste sinnvolle zeile
+    summary = summary.replace(/^["'`]+|["'`]+$/g, "").split(/\r?\n/)[0].trim();
+    if (!summary) return res.status(502).json({ error: "leere antwort von claude" });
+    if (summary.length > cap + 40) summary = summary.slice(0, cap).trim() + "…";
+    res.json({ summary, originalLength: raw.length });
+  } catch (e) {
+    res.status(500).json({ error: "summarize fehlgeschlagen: " + (e && e.message) });
+  }
+});
+
 // ─── AI-Scaffold (neues projekt designen mit claude) ──────────
 // Zwei modi:
 //  · mode=improve    → claude verbessert/expandiert die rohbeschreibung
@@ -2655,19 +2639,26 @@ async function runBugHunt(project) {
   const out = await _spawnClaudeReadOnly(project, prompt);
   const m = out.match(/<<<BUGS\s*([\s\S]*?)\s*>>>/);
   let count = 0;
+  // IDs der NEUEN bugs sammeln. Verhindert race bei concurrent SET_BUG_STATUS
+  // calls von anderen sources — vorher wurde nachträglich via filter+slice gefiltert,
+  // was bei status-änderungen zwischendurch die falschen bugs picken konnte.
+  const newBugIds = [];
   if (m) {
     try {
       const list = JSON.parse(m[1].trim());
       if (Array.isArray(list)) {
         for (const b of list.slice(0, 8)) {
           if (!b || !b.description) continue;
+          const id = genId();
           applyMutation("ADD_BUG", { projectId, bug: {
+            id,
             severity: ["low","medium","high"].includes(b.severity) ? b.severity : "medium",
             location: String(b.location || "").slice(0, 200),
             description: String(b.description).slice(0, 400),
             fix: String(b.fix || "").slice(0, 400),
             source: "cloud-code",
           }});
+          newBugIds.push(id);
           count++;
         }
       }
@@ -2678,11 +2669,14 @@ async function runBugHunt(project) {
     text: `bug-hunt fertig · ${count} bugs gefunden`,
   }});
 
-  // Auto-Fix: wenn projekt.bugAutoFix ON → für jeden bug einen task anlegen + auto-pump nimmt sie auf
+  // Auto-Fix: für jede neu erzeugte bug-id (nicht für ältere pending) einen task anlegen.
   const proj = state.projects.find(p => p.id === projectId);
-  if (proj && proj.bugAutoFix) {
-    const newBugs = (proj.bugs || []).filter(b => b.status === "pending").slice(0, count);
-    for (const b of newBugs) {
+  if (proj && proj.bugAutoFix && newBugIds.length) {
+    const lookup = new Map((proj.bugs || []).map(b => [b.id, b]));
+    let opened = 0;
+    for (const id of newBugIds) {
+      const b = lookup.get(id);
+      if (!b || b.status !== "pending") continue; // schon manuell verworfen?
       applyMutation("ADD_TASK", { projectId, task: {
         title: `[bug-fix] ${b.description.slice(0, 120)}` + (b.location ? ` (${b.location})` : ""),
         done: false,
@@ -2693,11 +2687,12 @@ async function runBugHunt(project) {
         subtasks: [],
       }});
       applyMutation("SET_BUG_STATUS", { projectId, bugId: b.id, status: "fixing" });
+      opened++;
     }
-    if (newBugs.length) {
+    if (opened) {
       applyMutation("ADD_ACTIVITY", { projectId, event: {
         type: "info",
-        text: `auto-fix: ${newBugs.length} bug-tasks angelegt`,
+        text: `auto-fix: ${opened} bug-tasks angelegt`,
       }});
     }
   }

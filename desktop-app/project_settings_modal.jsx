@@ -70,17 +70,7 @@
           <div style={{ padding: 18, overflowY: "auto", display: "flex", flexDirection: "column", gap: 18, flex: 1, minHeight: 0 }}>
 
             {/* Beschreibung */}
-            <section>
-              <div className="eyebrow">// beschreibung</div>
-              <textarea className="input"
-                        style={{ width: "100%", marginTop: 6, minHeight: 70, fontFamily: "inherit", resize: "vertical" }}
-                        placeholder="kurzbeschreibung des projekts — was, für wen, warum"
-                        defaultValue={project.description || ""}
-                        onBlur={e => {
-                          const v = e.target.value;
-                          if (v !== (project.description || "")) patch({ description: v });
-                        }} />
-            </section>
+            <SectionDescription project={project} client={client} patch={patch} />
 
             {/* Tech + Pfad — zwei spalten */}
             <section style={{ display: "grid", gridTemplateColumns: "1fr 2fr", gap: 12 }}>
@@ -192,6 +182,88 @@
           </div>
         </div>
       </div>
+    );
+  }
+
+  // Description-section mit AI-summarize-button. Kurze description landet
+  // im Header (clamp), lange version wird in `descriptionLong` gehalten.
+  function SectionDescription({ project, client, patch }) {
+    const [text, setText] = useState(project.description || project.descriptionLong || "");
+    const [busy, setBusy] = useState(false);
+    const [err, setErr] = useState(null);
+    const [preview, setPreview] = useState(null); // { summary, originalLength }
+    const dirty = text !== (project.description || project.descriptionLong || "");
+
+    const commit = () => {
+      if (text === (project.description || project.descriptionLong || "")) return;
+      // Wenn user manuell editiert: descriptionLong nicht überschreiben falls schon gesetzt
+      patch({ description: text });
+    };
+    const summarize = async () => {
+      setErr(null); setPreview(null); setBusy(true);
+      try {
+        const r = await fetch(client.serverUrl + "/api/cc/summarize", {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: "Bearer " + client.token },
+          body: JSON.stringify({ projectId: project.id, text }),
+        });
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.error || "fehler");
+        setPreview(data);
+      } catch (e) { setErr(e.message); }
+      finally { setBusy(false); }
+    };
+    const applyPreview = () => {
+      if (!preview) return;
+      // Speichere die volle version als `descriptionLong`, summary als `description`.
+      patch({ description: preview.summary, descriptionLong: text });
+      setText(preview.summary);
+      setPreview(null);
+    };
+    const restoreLong = () => {
+      if (!project.descriptionLong) return;
+      patch({ description: project.descriptionLong, descriptionLong: null });
+      setText(project.descriptionLong);
+    };
+
+    return (
+      <section>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <span className="eyebrow">// beschreibung</span>
+          <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+            {project.descriptionLong && (
+              <button className="btn tiny" onClick={restoreLong} title="lange version wiederherstellen">
+                ↺ lange version
+              </button>
+            )}
+            <button className="btn tiny" onClick={summarize}
+                    disabled={busy || !text.trim() || text.length < 80}
+                    title={text.length < 80 ? "ai-kürzen erst ab ~80 zeichen sinnvoll" : "claude kürzt auf 1 zeile (max ~120 chars)"}>
+              {busy ? "kürze…" : "✨ ai-kürzen"}
+            </button>
+          </div>
+        </div>
+        <textarea className="input"
+                  style={{ width: "100%", marginTop: 6, minHeight: 70, fontFamily: "inherit", resize: "vertical" }}
+                  placeholder="kurzbeschreibung des projekts — was, für wen, warum"
+                  value={text}
+                  onChange={e => setText(e.target.value)}
+                  onBlur={commit} />
+        {err && <div style={{ color: "#c33", fontSize: 12, marginTop: 4 }}>⚠ {err}</div>}
+        {preview && (
+          <div style={{ marginTop: 8, padding: 10, border: "1.5px dashed var(--ink)", borderRadius: 6, background: "rgba(0,150,80,0.05)" }}>
+            <div className="eyebrow" style={{ marginBottom: 4 }}>// ai-kürzung · vorschau</div>
+            <div style={{ fontSize: 13, color: "var(--ink)", marginBottom: 6 }}>{preview.summary}</div>
+            <div style={{ fontSize: 11, color: "var(--ink-faint)", marginBottom: 8 }}>
+              {preview.originalLength} → {preview.summary.length} chars · lange version wird unter „↺ lange version" wiederherstellbar
+            </div>
+            <div style={{ display: "flex", gap: 6 }}>
+              <button className="btn primary tiny" onClick={applyPreview}>✓ übernehmen</button>
+              <button className="btn tiny" onClick={() => setPreview(null)}>✕ verwerfen</button>
+            </div>
+          </div>
+        )}
+      </section>
     );
   }
 

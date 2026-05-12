@@ -167,6 +167,12 @@ input, textarea { font-family: inherit; font-size: inherit; }
 }
 .head-top {
   display: flex; justify-content: space-between; align-items: flex-end;
+  gap: 12px;
+}
+.head-top .title-block {
+  /* flex:1 + min-width:0 = title-block hält sich an die parent-breite und kann ellipsis
+     erzwingen. Ohne min-width:0 wachsen flex-items unbegrenzt mit ihrem content. */
+  flex: 1; min-width: 0;
 }
 .head-top .title-block .eyebrow {
   font-family: "JetBrains Mono", monospace;
@@ -182,6 +188,14 @@ input, textarea { font-family: inherit; font-size: inherit; }
   color: var(--ink-soft); font-size: 12px; margin-top: 4px;
 }
 .head-top .actions { display: flex; gap: 6px; }
+
+/* Header-collapsed: versteckt subline + ziele-preview + pfad. Titel bleibt
+   klein, tabs + buttons bleiben sichtbar. Spart ~85px vertikalen platz. */
+.main-head.collapsed { padding-top: 8px; padding-bottom: 0; gap: 4px; }
+.main-head.collapsed .head-top .title-block .eyebrow { display: none; }
+.main-head.collapsed .head-top .title-block h1 { font-size: 22px; }
+.main-head.collapsed .head-top .title-block .sub { display: none; }
+.main-head.collapsed .head-top .title-block .goals-preview { display: none; }
 
 .tabs {
   display: flex; gap: 0;
@@ -514,6 +528,13 @@ hr.div {
 }
 .modal label.field .eyebrow { margin-bottom: 0; }
 .modal .footer { display: flex; justify-content: flex-end; gap: 8px; }
+
+/* Cloud-Code pending-question: atmender tab damit der user die frage sieht. */
+@keyframes pg-cc-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(204, 136, 0, 0.0); transform: translateY(0); }
+  50%      { box-shadow: 0 0 0 4px rgba(204, 136, 0, 0.18); transform: translateY(-1px); }
+}
+.tab.cc-pending { background: rgba(255, 220, 120, 0.18); }
 
 /* Rule editor */
 .rule-row {

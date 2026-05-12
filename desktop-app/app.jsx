@@ -124,11 +124,13 @@ function BootPairing({ onReady }) {
 
   const tryInit = useCallback(async () => {
     setStatus("connecting"); setError(null);
-    sync.serverUrl = serverUrl;
     try {
-      // Health-Check zuerst
+      // Health-Check zuerst — sync.serverUrl wird erst NACH erfolg gesetzt,
+      // damit der client nicht mit einer kaputten URL hängenbleibt wenn der
+      // user eine falsche eingibt + nachträglich korrigiert.
       const r = await fetch(serverUrl + "/health").then(r => r.json()).catch(() => null);
       if (!r || !r.ok) throw new Error("server nicht erreichbar unter " + serverUrl);
+      sync.serverUrl = serverUrl;
       await sync.selfInit();
       sync.connect();
       setStatus("ready");
@@ -139,7 +141,10 @@ function BootPairing({ onReady }) {
     }
   }, [serverUrl, onReady]);
 
-  useEffect(() => { tryInit(); }, []); // Auto-Versuch beim Mount
+  // Auto-Versuch beim Mount (nur). Bei manueller url-änderung klickt der user
+  // den "erneut versuchen"-button → onClick nutzt latest closure (kein stale).
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => { tryInit(); }, []);
 
   return (
     <div className="boot">
@@ -511,9 +516,22 @@ function MainHead({ project, activeTab, onTab, onAction, onDelete }) {
     rules: (project.rules || []).filter(r => r.active).length,
     ideas: (project.ideas || []).filter(i => i.status === "unprocessed").length,
   };
+  // Cloud-code hat eine offene Frage → tab visuell hervorheben (atmender ❓-dot)
+  // damit user sie nicht übersieht.
+  const ccPending = !!(project.pendingQuestion && (project.pendingQuestion.text || project.pendingQuestion.question));
+  // Einklapp-toggle: header schrumpft auf 1 zeile (titel + tabs + buttons).
+  // Persistent in localStorage damit es nicht bei jedem reload zurückspringt.
+  const [collapsed, setCollapsed] = useState(() => {
+    try { return localStorage.getItem("projectgamma.header.collapsed") === "1"; } catch (_) { return false; }
+  });
+  const toggleCollapsed = () => {
+    const next = !collapsed;
+    setCollapsed(next);
+    try { localStorage.setItem("projectgamma.header.collapsed", next ? "1" : "0"); } catch (_) {}
+  };
   const patch = (p) => sync.mutate("PATCH_PROJECT", { projectId: project.id, patch: p });
   return (
-    <div className="main-head">
+    <div className={"main-head" + (collapsed ? " collapsed" : "")}>
       <div className="head-top">
         <div className="title-block">
           <div className="eyebrow">// projekt</div>
@@ -527,66 +545,100 @@ function MainHead({ project, activeTab, onTab, onAction, onDelete }) {
                       onChange={v => patch({ name: v.trim() || project.name })}
                       placeholder="projektname" />
           </h1>
-          <div className="sub" style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-            <select className="tech-select" value={project.tech}
-                    onChange={e => patch({ tech: e.target.value })}>
-              {TECH_OPTIONS.map(t => <option key={t} value={t}>{t}</option>)}
-            </select>
-            <span style={{ color: "var(--ink-faint)" }}>·</span>
-            <span style={{ color: "var(--ink-soft)" }}>cloud-code aktiv</span>
-            <span style={{ color: "var(--ink-faint)" }}>·</span>
-            <Editable value={project.description || ""}
-                      onChange={v => patch({ description: v })}
-                      placeholder="kurzbeschreibung hinzufügen…"
-                      style={{ flex: 1, minWidth: 200 }} />
-          </div>
-          {/* Ziele-preview · dezent unter beschreibung. klick öffnet projekt-details. */}
-          {(() => {
-            const goals = project.goals || [];
-            if (goals.length === 0) return null;
-            const preview = goals.slice(0, 3).join("  ·  ");
-            const more = goals.length > 3 ? `  +${goals.length - 3}` : "";
-            return (
-              <div className="sub goals-preview"
-                   style={{ marginTop: 4, fontSize: 11.5, color: "var(--ink-soft)", cursor: "pointer", display: "flex", alignItems: "center", gap: 6 }}
-                   onClick={() => onAction("openProjectSettings")}
-                   title="projekt-details bearbeiten">
-                <span style={{ color: "var(--ink-faint)" }}>ziele:</span>
-                <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{preview}{more}</span>
-                <span style={{ color: "var(--ink-faint)" }}>✎</span>
+          {!collapsed && (
+            <>
+              <div className="sub" style={{ display: "flex", gap: 8, alignItems: "center", maxWidth: "100%", overflow: "hidden" }}>
+                <select className="tech-select" value={project.tech}
+                        onChange={e => patch({ tech: e.target.value })}>
+                  {TECH_OPTIONS.map(t => <option key={t} value={t}>{t}</option>)}
+                </select>
+                <span style={{ color: "var(--ink-faint)" }}>·</span>
+                <span style={{ color: "var(--ink-soft)", whiteSpace: "nowrap" }}>cloud-code aktiv</span>
+                <span style={{ color: "var(--ink-faint)" }}>·</span>
+                {/* Description: clamp auf 1 zeile + ellipsis. klick öffnet projekt-details modal
+                    (dort vollständig editierbar). Verhindert dass lange texte die buttons
+                    rechts aus dem header drücken. */}
+                <span onClick={() => onAction("openProjectSettings")}
+                      title={(project.description || "").length > 0
+                              ? "voll lesen + bearbeiten (projekt-details)"
+                              : "beschreibung hinzufügen (projekt-details)"}
+                      style={{
+                        flex: 1, minWidth: 0,
+                        overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                        cursor: "pointer", color: project.description ? "var(--ink-soft)" : "var(--ink-faint)",
+                        fontStyle: project.description ? "normal" : "italic",
+                      }}>
+                  {project.description || "+ kurzbeschreibung hinzufügen…"}
+                </span>
               </div>
-            );
-          })()}
-          <div className="sub" style={{ marginTop: 4, fontFamily: "JetBrains Mono, monospace", fontSize: 11, color: "var(--ink-faint)" }}>
-            <Editable value={project.path || ""}
-                      onChange={v => patch({ path: v.trim() })}
-                      placeholder="+ lokalen pfad hinzufügen (für IDE-launch)" />
-          </div>
+              {/* Ziele-preview · dezent unter beschreibung. klick öffnet projekt-details. */}
+              {(() => {
+                const goals = project.goals || [];
+                if (goals.length === 0) return null;
+                const preview = goals.slice(0, 3).join("  ·  ");
+                const more = goals.length > 3 ? `  +${goals.length - 3}` : "";
+                return (
+                  <div className="sub goals-preview"
+                       style={{ marginTop: 4, fontSize: 11.5, color: "var(--ink-soft)", cursor: "pointer", display: "flex", alignItems: "center", gap: 6 }}
+                       onClick={() => onAction("openProjectSettings")}
+                       title="projekt-details bearbeiten">
+                    <span style={{ color: "var(--ink-faint)" }}>ziele:</span>
+                    <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{preview}{more}</span>
+                    <span style={{ color: "var(--ink-faint)" }}>✎</span>
+                  </div>
+                );
+              })()}
+              <div className="sub" style={{ marginTop: 4, fontFamily: "JetBrains Mono, monospace", fontSize: 11, color: "var(--ink-faint)" }}>
+                <Editable value={project.path || ""}
+                          onChange={v => patch({ path: v.trim() })}
+                          placeholder="+ lokalen pfad hinzufügen (für IDE-launch)" />
+              </div>
+            </>
+          )}
         </div>
-        <div className="actions">
+        <div className="actions" style={{ flexShrink: 0 }}>
           {/* Primäre actions — täglich gebraucht */}
           <button className="btn tiny primary" onClick={() => onAction("pairMobile")} title="QR + 6-stelliger code für mobile-gerät">+ handy verbinden</button>
           <button className="btn tiny" onClick={() => onAction("openMembers")} title="mitglieder einladen / verwalten">👥 mitglieder</button>
-          <button className="btn tiny" onClick={() => onAction("openAuth")} title="account login / register">🔐 account</button>
+          <button className="btn tiny" onClick={() => onAction("openAuth")} title="login / registrieren / abmelden">🔐 login</button>
+          <button className="btn tiny" onClick={() => onAction("openSettings")} title="API-keys · claude CLI · globale settings">⚙ settings</button>
           {/* Sekundär — selten gebraucht, in dropdown */}
           {window.MoreMenu
             ? <window.MoreMenu onAction={onAction} onDelete={onDelete} hasPath={!!project.path} />
             : (
-              <button className="btn tiny" onClick={() => onAction("openSettings")} title="settings / weitere actions">⋯</button>
+              <button className="btn tiny" onClick={() => onAction("openSettings")} title="weitere actions">⋯</button>
             )}
+          {/* Header-einklapp toggle — versteckt beschreibung, ziele-preview, pfad
+              um vertikalen platz zu sparen wenn man viel scrollt. */}
+          <button className="btn tiny" onClick={toggleCollapsed}
+                  title={collapsed ? "header ausklappen" : "header einklappen (beschreibung+pfad verstecken)"}>
+            {collapsed ? "⌄" : "⌃"}
+          </button>
         </div>
       </div>
       <div className="tabs">
-        {TABS.map(t => (
-          <button key={t.id}
-                  className={"tab" + (activeTab === t.id ? " active" : "")}
-                  onClick={() => onTab(t.id)}>
-            {t.label}
-            {t.id === "tasks" && counts.tasks > 0 && <span className="count">{counts.tasks}</span>}
-            {t.id === "rules" && counts.rules > 0 && <span className="count">{counts.rules}</span>}
-            {t.id === "ideas" && counts.ideas > 0 && <span className="count">{counts.ideas}</span>}
-          </button>
-        ))}
+        {TABS.map(t => {
+          const isCcPending = t.id === "cloud" && ccPending && activeTab !== "cloud";
+          return (
+            <button key={t.id}
+                    className={"tab" + (activeTab === t.id ? " active" : "") + (isCcPending ? " cc-pending" : "")}
+                    onClick={() => onTab(t.id)}
+                    title={isCcPending ? "cloud-code hat eine frage — bitte beantworten" : undefined}
+                    style={isCcPending ? {
+                      // Sanftes "atmen" + ❓-prefix damit der user es nicht übersieht.
+                      animation: "pg-cc-pulse 1.6s ease-in-out infinite",
+                      borderColor: "#cc8800",
+                      color: "#cc8800",
+                      fontWeight: 600,
+                    } : undefined}>
+              {isCcPending && <span style={{ marginRight: 4 }}>❓</span>}
+              {t.label}
+              {t.id === "tasks" && counts.tasks > 0 && <span className="count">{counts.tasks}</span>}
+              {t.id === "rules" && counts.rules > 0 && <span className="count">{counts.rules}</span>}
+              {t.id === "ideas" && counts.ideas > 0 && <span className="count">{counts.ideas}</span>}
+            </button>
+          );
+        })}
       </div>
     </div>
   );
@@ -2153,6 +2205,29 @@ function App() {
                  onSelect={(id) => { client.setActiveProject(id); client.setActiveTab("overview"); }}
                  onNew={() => setShowNew(true)}
                  ccRunning={client.ccRunning} />
+        {!project && (
+          /* Welcome-state: keine projekte oder noch keins ausgewählt. Buttons
+             (handy/mitglieder/login/settings) sind hier nicht relevant — sie kommen
+             erst wenn ein projekt aktiv ist. Stattdessen ein freundlicher CTA. */
+          <div className="main" style={{ display: "flex", alignItems: "center", justifyContent: "center", padding: 40 }}>
+            <div style={{ maxWidth: 480, textAlign: "center" }}>
+              <div className="eyebrow" style={{ marginBottom: 8 }}>// willkommen</div>
+              <h1 className="h1" style={{ marginBottom: 12 }}>★ ProjectGamma</h1>
+              <p style={{ color: "var(--ink-soft)", lineHeight: 1.5, marginBottom: 24 }}>
+                Projekt-Manager mit Cloud-Code-Integration. Lege dein erstes Projekt an —
+                Aufgaben, Ideen + Regeln auf desktop und handy synchron.
+              </p>
+              <button className="btn primary" onClick={() => setShowNew(true)}
+                      style={{ fontSize: 14, padding: "10px 20px" }}>
+                + erstes projekt anlegen
+              </button>
+              <div style={{ marginTop: 24, display: "flex", gap: 10, justifyContent: "center", flexWrap: "wrap" }}>
+                <button className="btn tiny" onClick={() => setShowAuth(true)}>🔐 login / registrieren</button>
+                <button className="btn tiny" onClick={() => setShowSettings(true)}>⚙ settings (API-keys)</button>
+              </div>
+            </div>
+          </div>
+        )}
         {project && (
           <div className="main">
             <MainHead project={project}
