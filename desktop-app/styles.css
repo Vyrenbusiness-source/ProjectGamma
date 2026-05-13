@@ -502,7 +502,12 @@ textarea.input { resize: vertical; min-height: 60px; line-height: 1.4; }
   letter-spacing: 0;
 }
 html[data-theme="dim"] .chip { background: rgba(255,255,255,0.04); }
-.chip.solid { background: var(--ink); color: var(--paper); border-color: var(--ink); }
+.chip.solid {
+  background: rgba(93,208,122,0.15);
+  color: var(--ok);
+  border-color: rgba(93,208,122,0.4);
+  font-weight: 600;
+}
 
 /* Tasks */
 .task {
