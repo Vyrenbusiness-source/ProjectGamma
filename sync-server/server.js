@@ -2587,6 +2587,11 @@ function _startCcJob(project, taskId, prompt) {
     ccJobs.delete(projectId);
     cleanupResolvedConfig(mcpConfigPath);
     console.log("[cc] done", projectId, "exit", code);
+    // Wenn KEIN done=true tail folgt (z.b. done=false, crash, question),
+    // wird der release weiter unten nicht hinkommen. Daher hier proaktiv
+    // den autopump anstoßen — wenn ein tail folgt, locked _ccPostChecks
+    // den autopump weiter.
+    _triggerAutoPumpNow();
 
     // FIX #9: pending tool_use-events ohne result → "cancelled" markieren,
     // sonst bleiben sie für immer "running" in der UI.
@@ -2777,7 +2782,10 @@ function _startCcJob(project, taskId, prompt) {
             text: `build-gate <strong>FAIL</strong> (${gate.kind} · ${reason}, ${(gate.durationMs/1000).toFixed(1)}s)`,
           }});
           if (attempt < MAX_CC_RETRIES && !gate.commandMissing) {
-            // Retry: error-context speichern, gleichen task nochmal triggern
+            // Retry: error-context speichern, gleichen task nochmal triggern.
+            // _ccPostChecks bleibt LOCKED bis triggerCc seine ccJobs.set
+            // gemacht hat — so kann autopump in den 3s nicht einen
+            // konkurrierenden task auf demselben projekt starten.
             _ccRetryContext.set(taskId, {
               attempt, kind: gate.kind, exitCode: gate.exitCode,
               output: gate.output, projectId,
@@ -2787,16 +2795,18 @@ function _startCcJob(project, taskId, prompt) {
               text: `cc retry ${attempt}/${MAX_CC_RETRIES} startet in 3s mit fehler-context…`,
             }});
             broadcastState();
-            // FIX #4: vor retry prüfen ob cc noch aktiv ist (user kann
-            // währenddessen „pause" geklickt haben)
             setTimeout(() => {
               if (!state.ccRunning) {
                 console.log("[cc-retry] skip — cc inzwischen pausiert");
+                releasePostCheck();
                 return;
               }
-              triggerCc(projectId, taskId, null).catch((e) => {
-                console.log("[cc-retry] trigger fehler:", e.message);
-              });
+              triggerCc(projectId, taskId, null)
+                .then(() => { _ccPostChecks.delete(projectId); }) // ccJobs hat den lock jetzt
+                .catch((e) => {
+                  console.log("[cc-retry] trigger fehler:", e.message);
+                  releasePostCheck();
+                });
             }, 3000);
             return; // KEIN self-review, kein checkmark
           }
@@ -2810,6 +2820,7 @@ function _startCcJob(project, taskId, prompt) {
             text: `cc max-retries auf <i>${escapeHtml(taskNow.title)}</i>: build-gate ${attempt}× rot`,
           }});
           broadcastState();
+          releasePostCheck();
           return; // wieder kein self-review
         }
 
@@ -2847,15 +2858,18 @@ function _startCcJob(project, taskId, prompt) {
               text: `cc retry ${attempt}/${MAX_CC_RETRIES} startet in 3s (runtime-fail)…`,
             }});
             broadcastState();
-            // FIX #4: vor retry ccRunning-check
             setTimeout(() => {
               if (!state.ccRunning) {
                 console.log("[cc-runtime-retry] skip — cc inzwischen pausiert");
+                releasePostCheck();
                 return;
               }
-              triggerCc(projectId, taskId, null).catch((e) => {
-                console.log("[cc-runtime-retry] trigger fehler:", e.message);
-              });
+              triggerCc(projectId, taskId, null)
+                .then(() => { _ccPostChecks.delete(projectId); })
+                .catch((e) => {
+                  console.log("[cc-runtime-retry] trigger fehler:", e.message);
+                  releasePostCheck();
+                });
             }, 3000);
             return; // kein self-review, kein checkmark
           }
@@ -2869,6 +2883,7 @@ function _startCcJob(project, taskId, prompt) {
             text: `cc max-retries auf <i>${escapeHtml(taskNow.title)}</i>: runtime ${attempt}× rot`,
           }});
           broadcastState();
+          releasePostCheck();
           return;
         }
 
@@ -2979,6 +2994,7 @@ function _startCcJob(project, taskId, prompt) {
             }});
           }
           broadcastState();
+          releasePostCheck(); // erfolgs-pfad: tail komplett, autopump kann nächsten task starten
         }).catch(e => {
           console.log("[selfreview] error:", e.message);
           applyMutation("TOGGLE_TASK", { projectId, taskId });
@@ -2987,6 +3003,7 @@ function _startCcJob(project, taskId, prompt) {
             text: `cc auto-checkmark (review skipped: ${escapeHtml(e.message)})`,
           }});
           broadcastState();
+          releasePostCheck();
         });
       }).catch(e => {
         // build-gate selbst crashed → fall through zu self-review (fail-open)
@@ -2995,6 +3012,7 @@ function _startCcJob(project, taskId, prompt) {
           type: "warn", text: `build-gate crash, übersprungen: ${escapeHtml(e.message || "?")}`,
         }});
         broadcastState();
+        releasePostCheck();
       });
     }
 

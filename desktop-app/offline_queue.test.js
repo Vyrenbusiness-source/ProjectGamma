@@ -65,6 +65,14 @@ test("cap behält pending bevorzugt", () => {
   assert.ok(ids.includes("B") && ids.includes("C"));
 });
 
+test("cap hält strikt max ein wenn pending.length > max", () => {
+  // Regression: vorher slice(0, Math.max(max, pending.length)) → limit verletzt.
+  const q = createOfflineQueue({ max: 3 });
+  for (let i = 0; i < 7; i++) q.enqueue("T" + i, {});
+  assert.equal(q.list().length, 3);
+  assert.equal(q.pending().length, 3);
+});
+
 test("drainAndSend ruft sender für jedes pending und markiert sent bei true", async () => {
   const q = createOfflineQueue();
   q.enqueue("A", { v: 1 });
