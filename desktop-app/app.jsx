@@ -1095,7 +1095,9 @@ function StatChip({ label, value, icon, accent, onClick }) {
             }}>
       <div className="ico">{icon || "·"}</div>
       <div className="body">
-        <div className="label">{label.toUpperCase()}</div>
+        <div className="label-block">
+          <div className="label">{label}</div>
+        </div>
         <div className="value">{value}</div>
       </div>
     </button>
@@ -2136,38 +2138,46 @@ function ScreenCloud({ project, onCcRun, onCcStop, ccStatus, ccOutput, ccRunning
         </div>
       </div>
 
-      {/* Stats-cards: 4 chips mit icon-left layout (mockup-style) */}
+      {/* Stats-cards: 4 chips mit icon-left + label-block + value right */}
       <div className="statcard-grid cols-4">
         <div className={"statcard-row" + (metrics.checks > 0 ? " success" : "")}>
           <div className="ico">✓</div>
           <div className="body">
-            <div className="label">CHECKS</div>
+            <div className="label-block">
+              <div className="label">Checks</div>
+              <div className="sub">tasks abgehakt</div>
+            </div>
             <div className="value">{metrics.checks}</div>
-            <div className="sub">tasks abgehakt</div>
           </div>
         </div>
         <div className="statcard-row">
           <div className="ico">✎</div>
           <div className="body">
-            <div className="label">WRITES</div>
+            <div className="label-block">
+              <div className="label">Writes</div>
+              <div className="sub">files berührt</div>
+            </div>
             <div className="value">{metrics.writes}</div>
-            <div className="sub">files berührt</div>
           </div>
         </div>
         <div className={"statcard-row" + (metrics.warnings > 0 ? " warning" : "")}>
           <div className="ico">⚠</div>
           <div className="body">
-            <div className="label">WARNINGS</div>
+            <div className="label-block">
+              <div className="label">Warnings</div>
+              <div className="sub">{metrics.warnings > 0 ? "blocker offen" : "alles klar"}</div>
+            </div>
             <div className="value">{metrics.warnings}</div>
-            <div className="sub">{metrics.warnings > 0 ? "blocker offen" : "alles klar"}</div>
           </div>
         </div>
         <div className="statcard-row">
           <div className="ico">$</div>
           <div className="body">
-            <div className="label">KOSTEN · {recentBudget.jobs} RUNS</div>
+            <div className="label-block">
+              <div className="label">Kosten · {recentBudget.jobs} Runs</div>
+              <div className="sub">{(recentBudget.tokensIn/1000).toFixed(1)}k in · {(recentBudget.tokensOut/1000).toFixed(1)}k out</div>
+            </div>
             <div className="value">${recentBudget.costUsd.toFixed(3)}</div>
-            <div className="sub">{(recentBudget.tokensIn/1000).toFixed(1)}k in · {(recentBudget.tokensOut/1000).toFixed(1)}k out</div>
           </div>
         </div>
       </div>
