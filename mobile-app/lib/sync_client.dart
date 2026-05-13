@@ -4,7 +4,6 @@
 
 import 'dart:async';
 import 'dart:convert';
-import 'package:flutter/foundation.dart';
 import 'package:flutter/widgets.dart';
 import 'package:http/http.dart' as http;
 import 'package:web_socket_channel/web_socket_channel.dart';
@@ -32,6 +31,12 @@ class SyncClient extends ChangeNotifier {
   int _reconnectAttempt = 0;
   final NotificationsInbox notifications = NotificationsInbox(max: 50);
   final OfflineQueue offlineQueue = OfflineQueue(max: 100);
+
+  /// Task 3: live tool-events vom cc-run. Pro projektId eine ringqueue (max 50).
+  /// Jedes event hat: { id, tool, glyph, summary, state: 'running'|'ok'|'error', ts }.
+  final Map<String, List<Map<String, dynamic>>> ccToolEvents = {};
+  /// Letzter thinking-snippet pro projekt (max 200 char).
+  final Map<String, String> ccThinkingText = {};
 
   bool get hasSession => _token != null && _serverUrl != null;
   bool get connected => _connected;
@@ -309,6 +314,40 @@ class SyncClient extends ChangeNotifier {
           // Server hat dieses Gerät vom Desktop aus entfernt → lokal ausloggen
           lastError = 'verbindung vom desktop getrennt';
           logout();
+          break;
+        case 'CC_TOOL_EVENT':
+          {
+            final pid = msg['projectId']?.toString();
+            if (pid != null) {
+              final list = ccToolEvents.putIfAbsent(pid, () => []);
+              if (msg['phase'] == 'use') {
+                list.add({
+                  'id': msg['id'], 'tool': msg['tool'], 'glyph': msg['glyph'],
+                  'summary': msg['summary'] ?? '', 'state': 'running', 'ts': msg['ts'],
+                });
+                if (list.length > 50) list.removeAt(0);
+              } else if (msg['phase'] == 'result') {
+                final e = list.firstWhere(
+                  (x) => x['id'] == msg['id'],
+                  orElse: () => <String, dynamic>{},
+                );
+                if (e.isNotEmpty) {
+                  e['state'] = (msg['isError'] == true) ? 'error' : 'ok';
+                  e['brief'] = msg['brief'];
+                }
+              }
+              notifyListeners();
+            }
+          }
+          break;
+        case 'CC_THINKING_TEXT':
+          {
+            final pid = msg['projectId']?.toString();
+            if (pid != null) {
+              ccThinkingText[pid] = msg['text']?.toString() ?? '';
+              notifyListeners();
+            }
+          }
           break;
       }
     } catch (e) {

@@ -40,6 +40,8 @@ class SyncClient {
     this.listeners   = new Set();
     this.ccStatus    = {}; // projectId -> { state, ... }
     this.ccOutput    = {}; // projectId -> string (last cc output)
+    this.ccToolEvents = {}; // projectId -> array (last ~50 tool-uses für UI-history)
+    this.ccThinkingText = {}; // projectId -> letzte 200 char thinking snippet
     this._reconnectAttempt = 0;
     this._heartbeat  = null;
     this._reconnectTimer = null;
@@ -203,6 +205,25 @@ class SyncClient {
         break;
       case "CC_OUTPUT":
         this.ccOutput[msg.projectId] = (this.ccOutput[msg.projectId] || "") + (msg.chunk || "");
+        break;
+      case "CC_TOOL_EVENT": {
+        // Live-tool-events: pro projekt eine list of {id, tool, glyph, summary, state, ts}
+        const arr = this.ccToolEvents[msg.projectId] || (this.ccToolEvents[msg.projectId] = []);
+        if (msg.phase === "use") {
+          arr.push({ id: msg.id, tool: msg.tool, glyph: msg.glyph,
+                     summary: msg.summary || "", state: "running", ts: msg.ts });
+          if (arr.length > 50) arr.shift();
+        } else if (msg.phase === "result") {
+          const e = arr.find(x => x.id === msg.id);
+          if (e) { e.state = msg.isError ? "error" : "ok"; e.brief = msg.brief; }
+        }
+        this._emit();
+        return;
+      }
+      case "CC_THINKING_TEXT":
+        this.ccThinkingText[msg.projectId] = msg.text || "";
+        this._emit();
+        return;
         this._emit();
         break;
       case "ERROR":

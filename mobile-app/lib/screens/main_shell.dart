@@ -1,4 +1,6 @@
-// MainShell · BottomNav mit 5 Tabs: Projekt, Aufgaben, Regeln, Ideen, Cloud.
+// MainShell · BottomNav mit 4 Tabs: Projekt, Aufgaben, Ideen, Cloud.
+// (Regeln + Team sind ins Projekt-Tab als „mitglieder verwalten" + „regeln"-
+// row gewandert. 6 tabs waren zu eng auf 375px, touch-targets unter 48dp.)
 // Cloud-Tab vereint cc-control, devices, sync-verlauf, vorschläge, bugs in
 // collapsable sections.
 import 'dart:async';
@@ -11,10 +13,8 @@ import '../widgets/offline_queue_badge.dart';
 import '../features/auto_update/auto_update_panel.dart';
 import 'project_screen.dart';
 import 'tasks_screen.dart';
-import 'rules_screen.dart';
 import 'ideas_screen.dart';
 import 'cloud_screen.dart';
-import 'team_screen.dart';
 import 'project_picker.dart';
 import 'settings_screen.dart';
 
@@ -25,19 +25,19 @@ class MainShell extends StatefulWidget {
 }
 
 class _MainShellState extends State<MainShell> {
-  int _idx = 2; // Ideen ist häufigster mobile-task
+  int _idx = 2; // ideen (3. tab) ist häufigster mobile-task → default
 
   @override
   Widget build(BuildContext context) {
     final client = SyncClientScope.of(context);
     final p = client.activeProject;
+    // 4 tabs statt 6: regeln + team sind im projekt-tab erreichbar.
+    // cloud-icon ist jetzt cloud (Icons.cloud_outlined) statt bolt → klarer.
     final tabs = const [
-      _Tab('projekt',  Icons.folder_outlined,    ProjectScreen()),
-      _Tab('aufgaben', Icons.check_box_outlined, TasksScreen()),
-      _Tab('regeln',   Icons.gavel,              RulesScreen()),
-      _Tab('ideen',    Icons.lightbulb_outline,  IdeasScreen()),
-      _Tab('team',     Icons.groups_outlined,    TeamScreen()),
-      _Tab('cloud',    Icons.bolt,               CloudScreen()),
+      _Tab('projekt',  Icons.folder_outlined,     ProjectScreen()),
+      _Tab('aufgaben', Icons.check_box_outlined,  TasksScreen()),
+      _Tab('ideen',    Icons.lightbulb_outline,   IdeasScreen()),
+      _Tab('cloud',    Icons.cloud_outlined,      CloudScreen()),
     ];
 
     if (client.state == null) {
@@ -46,56 +46,81 @@ class _MainShellState extends State<MainShell> {
 
     return Scaffold(
       backgroundColor: pgPaper,
+      // Größerer header (88px statt 72) erlaubt 2-zeiligen titel ohne cutoff.
+      // Sekundäre actions (auto-update, settings) ins overflow-menu — damit
+      // bleibt rechts platz für status (offline-badge, bell, connection-dot)
+      // und der titel hat genug raum.
       appBar: PreferredSize(
-        preferredSize: const Size.fromHeight(72),
+        preferredSize: const Size.fromHeight(88),
         child: SafeArea(
           bottom: false,
           child: Container(
-            padding: const EdgeInsets.fromLTRB(20, 8, 12, 12),
+            padding: const EdgeInsets.fromLTRB(20, 8, 8, 12),
             decoration: const BoxDecoration(
               color: pgPaper,
               border: Border(bottom: BorderSide(color: pgInk, width: 2)),
             ),
             child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Expanded(
                   child: GestureDetector(
                     onTap: () => _pickProject(client),
+                    behavior: HitTestBehavior.opaque,
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       mainAxisSize: MainAxisSize.min,
                       children: [
-                        Row(children: const [PgEyebrow('projekt'), SizedBox(width: 4), Icon(Icons.expand_more, size: 14, color: pgInkSoft)]),
+                        Row(children: const [
+                          PgEyebrow('projekt'),
+                          SizedBox(width: 4),
+                          Icon(Icons.expand_more, size: 14, color: pgInkSoft)
+                        ]),
                         const SizedBox(height: 2),
                         Text(
                           (p?['starred'] == true ? '★ ' : '') + (p?['name'] ?? '—').toString(),
-                          style: const TextStyle(fontSize: 22, fontWeight: FontWeight.w700, height: 1.1),
+                          style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w700, height: 1.15),
+                          maxLines: 2,
                           overflow: TextOverflow.ellipsis,
                         ),
                       ],
                     ),
                   ),
                 ),
+                const SizedBox(width: 8),
                 const OfflineQueueBadge(),
-                IconButton(
-                  icon: const Icon(Icons.system_update, size: 20, color: pgInk),
-                  tooltip: 'auto-update',
-                  splashRadius: 18,
-                  onPressed: () => Navigator.of(context).push(
-                    MaterialPageRoute(builder: (_) => const AutoUpdatePanel()),
-                  ),
-                ),
-                IconButton(
-                  icon: const Icon(Icons.settings_outlined, size: 20, color: pgInk),
-                  tooltip: 'einstellungen',
-                  splashRadius: 18,
-                  onPressed: () => Navigator.of(context).push(
-                    MaterialPageRoute(builder: (_) => const SettingsScreen()),
-                  ),
-                ),
                 const NotificationsBell(),
-                const SizedBox(width: 4),
+                const SizedBox(width: 2),
                 ConnectionDot(connected: client.connected),
+                // Overflow-menu für sekundäre actions
+                PopupMenuButton<String>(
+                  icon: const Icon(Icons.more_vert, size: 22, color: pgInk),
+                  tooltip: 'mehr',
+                  color: pgPaper,
+                  shape: RoundedRectangleBorder(
+                    side: const BorderSide(color: pgInk, width: 1.5),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  onSelected: (v) {
+                    if (v == 'update') {
+                      Navigator.of(context).push(MaterialPageRoute(builder: (_) => const AutoUpdatePanel()));
+                    } else if (v == 'settings') {
+                      Navigator.of(context).push(MaterialPageRoute(builder: (_) => const SettingsScreen()));
+                    }
+                  },
+                  itemBuilder: (_) => [
+                    const PopupMenuItem(value: 'update', child: Row(children: [
+                      Icon(Icons.system_update, size: 18, color: pgInk),
+                      SizedBox(width: 10),
+                      Text('auto-update', style: TextStyle(color: pgInk)),
+                    ])),
+                    const PopupMenuItem(value: 'settings', child: Row(children: [
+                      Icon(Icons.settings_outlined, size: 18, color: pgInk),
+                      SizedBox(width: 10),
+                      Text('einstellungen', style: TextStyle(color: pgInk)),
+                    ])),
+                  ],
+                ),
               ],
             ),
           ),

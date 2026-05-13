@@ -1,5 +1,7 @@
 // Aufgaben: Liste mit Toggle, Sub-Tasks, Add via FAB.
+import 'dart:convert';
 import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
 import '../theme.dart';
 import '../sync_client.dart';
 import '../widgets/swipe_to_complete.dart';
@@ -340,6 +342,49 @@ class _TaskTile extends StatelessWidget {
             Padding(
               padding: const EdgeInsets.fromLTRB(34, 4, 0, 0),
               child: Wrap(spacing: 4, children: [PgChip(meta)]),
+            ),
+          // Zerlegen-button (Task 6) — nur für offene tasks ohne subtasks.
+          // 1× claude-call, ~0.20$ budget cap (server-seitig).
+          if (!done && !pending && subtasks.isEmpty)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(34, 6, 0, 0),
+              child: InkWell(
+                onTap: () async {
+                  final c = SyncClientScope.of(context, listen: false);
+                  try {
+                    final r = await http.post(
+                      Uri.parse('${c.serverUrl}/api/cc/decompose'),
+                      headers: {...c.authHeader, 'content-type': 'application/json'},
+                      body: jsonEncode({'projectId': projectId, 'taskId': task['id']}),
+                    ).timeout(const Duration(seconds: 5));
+                    if (!context.mounted) return;
+                    if (r.statusCode != 200) {
+                      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                        content: Text('zerlegen-fehler: ${r.statusCode}'),
+                      ));
+                    } else {
+                      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+                        content: Text('cc zerlegt task… subtasks erscheinen gleich'),
+                      ));
+                    }
+                  } catch (e) {
+                    if (!context.mounted) return;
+                    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                      content: Text('fehler: $e'),
+                    ));
+                  }
+                },
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                  decoration: BoxDecoration(
+                    color: pgPaper,
+                    border: Border.all(color: pgInk, width: 1.5),
+                    borderRadius: BorderRadius.circular(11),
+                  ),
+                  child: const Text('🪓 cc zerlegen',
+                      style: TextStyle(fontFamily: 'monospace', fontSize: 10.5, fontWeight: FontWeight.w600)),
+                ),
+              ),
             ),
           if (subtasks.isNotEmpty)
             Padding(

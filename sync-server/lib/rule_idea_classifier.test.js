@@ -32,6 +32,28 @@ test("sehr lange texte zählen als idea", () => {
   assert.equal(classify(long), "idea");
 });
 
+test("aufzählungslisten (1)..(5) zählen als idea (task-plan)", () => {
+  // Real example from user's screenshot
+  assert.equal(classify("multi-user-rollout schrittweise: (1) users-table, (2) project-membership-guard, (3) invite-flow"), "idea");
+  // numbered list
+  assert.equal(classify("1. erst tdd-tests 2. dann implementation 3. dann doku"), "idea");
+});
+
+test("technische task-marker (tabelle, workspace, broadcast) → idea", () => {
+  assert.equal(classify("workspace-setup für rust-crates konfigurieren"), "idea");
+  assert.equal(classify("presence-broadcast über ws-channel implementieren"), "idea");
+});
+
+test("multi-line text → idea", () => {
+  assert.equal(classify("erste zeile\nzweite zeile\ndritte zeile"), "idea");
+});
+
+test("strenger length-cap (>100 chars → idea, war früher 140)", () => {
+  // 101 chars
+  const x = "x".repeat(101);
+  assert.equal(classify(x), "idea");
+});
+
 test("leerer text → idea (sicherer default)", () => {
   assert.equal(classify(""), "idea");
   assert.equal(classify(null), "idea");

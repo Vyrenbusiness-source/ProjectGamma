@@ -486,18 +486,34 @@ function Sidebar({ projects, activeId, onSelect, onNew, ccRunning }) {
   return (
     <div className="side">
       <div className="eyebrow">// projekte</div>
-      {sorted.map(p => (
+      {sorted.map(p => {
+        // D4 · Live-counts pro projekt — auf den ersten blick sichtbar
+        const openTasks = (p.tasks || []).filter(t => !t.done).length;
+        const unprocIdeas = (p.ideas || []).filter(i => i.status === "unprocessed").length;
+        const openBugs = (p.bugs || []).filter(b => b.status === "pending").length;
+        const pendingDiffs = (p.ruleDiffs || []).filter(d => d.status === "pending").length;
+        const hasAttention = openBugs > 0 || pendingDiffs > 0;
+        return (
         <div key={p.id}
              className={"proj-item" + (p.id === activeId ? " active" : "")}
-             onClick={() => onSelect(p.id)}>
+             onClick={() => onSelect(p.id)}
+             title={`${openTasks} offene aufgaben · ${unprocIdeas} ideen${openBugs ? ` · ${openBugs} bugs` : ""}${pendingDiffs ? ` · ${pendingDiffs} regel-diffs` : ""}`}>
           <span className="star"
                 title={p.starred ? "stern entfernen" : "favorit setzen"}
                 onClick={e => { e.stopPropagation(); sync.mutate("TOGGLE_STAR", { projectId: p.id }); }}>
             {p.starred ? "★" : "☆"}
           </span>
-          <span className="name">{p.name}</span>
+          <div className="proj-info">
+            <span className="name">{p.name}</span>
+            <span className="proj-counts">
+              {openTasks > 0 && <span className="proj-count">✓{openTasks}</span>}
+              {unprocIdeas > 0 && <span className="proj-count">💡{unprocIdeas}</span>}
+              {hasAttention && <span className="proj-count attention" title="braucht aufmerksamkeit">!{openBugs + pendingDiffs}</span>}
+            </span>
+          </div>
         </div>
-      ))}
+        );
+      })}
       <button className="new-btn" onClick={onNew}>+ neues projekt</button>
 
       <div className="cc-ambient">
@@ -601,21 +617,22 @@ function MainHead({ project, activeTab, onTab, onAction, onDelete }) {
             </>
           )}
         </div>
-        <div className="actions" style={{ flexShrink: 0 }}>
-          {/* Primäre actions — täglich gebraucht */}
+        <div className="actions actions-bar" style={{ flexShrink: 0 }}>
+          {/* D2 · Klare hierarchie:
+              1× PRIMARY (handy verbinden — täglich, auffälligste action)
+              2× SECONDARY-ICON (mitglieder, account — situativ)
+              Rest in OVERFLOW-MENU (⋯) — settings, openIDE, export, sync, löschen, etc. */}
           <button className="btn tiny primary" onClick={() => onAction("pairMobile")} title="QR + 6-stelliger code für mobile-gerät">+ handy verbinden</button>
-          <button className="btn tiny" onClick={() => onAction("openMembers")} title="mitglieder einladen / verwalten">👥 mitglieder</button>
-          <button className="btn tiny" onClick={() => onAction("openAuth")} title="login / registrieren / abmelden">🔐 login</button>
-          <button className="btn tiny" onClick={() => onAction("openSettings")} title="API-keys · claude CLI · globale settings">⚙ settings</button>
-          {/* Sekundär — selten gebraucht, in dropdown */}
+          <button className="btn tiny icon-only" onClick={() => onAction("openMembers")} title="mitglieder einladen / verwalten">👥</button>
+          <button className="btn tiny icon-only" onClick={() => onAction("openAuth")} title="account · login / registrieren">🔐</button>
+          {/* Overflow-Menu — inkl. settings (war primary, ist eigentlich rare) */}
           {window.MoreMenu
             ? <window.MoreMenu onAction={onAction} onDelete={onDelete} hasPath={!!project.path} />
             : (
               <button className="btn tiny" onClick={() => onAction("openSettings")} title="weitere actions">⋯</button>
             )}
-          {/* Header-einklapp toggle — versteckt beschreibung, ziele-preview, pfad
-              um vertikalen platz zu sparen wenn man viel scrollt. */}
-          <button className="btn tiny" onClick={toggleCollapsed}
+          {/* Header-collapse-toggle bleibt sichtbar */}
+          <button className="btn tiny icon-only" onClick={toggleCollapsed}
                   title={collapsed ? "header ausklappen" : "header einklappen (beschreibung+pfad verstecken)"}>
             {collapsed ? "⌄" : "⌃"}
           </button>
@@ -789,23 +806,100 @@ function SuggestionsAndBugs({ project }) {
 }
 
 // ─── Screen: Übersicht ────────────────────────────────────────
-function OnboardStep({ n, title, body, cta, onClick }) {
+// D5 · OnboardingBlock: zeigt 3-schritte-card prominent solange noch nicht
+// alle erledigt sind. Sobald alle 3 mindestens 1× erledigt sind → auto-collapse
+// auf eine kompakte "✓ onboarding fertig"-zeile. User kann manuell ausklappen.
+function OnboardingBlock({ project, myEmail, onSetTab, onOpenMembers }) {
+  const dismissKey = "pg-onboarding-dismissed-" + project.id;
+  const [manualDismissed, setManualDismissed] = useState(() => {
+    try { return localStorage.getItem(dismissKey) === "1"; }
+    catch (_) { return false; }
+  });
+
+  // Echte completion-detection aus state
+  const hasIdeas = (project.ideas || []).length > 0;
+  const memberCount = (project.members || []).length;
+  const hasTeam = memberCount > 1; // owner zählt mit, > 1 = mindestens 1 eingeladen
+  const hasMessages = (project.activity || []).some(a => a.type === "chat" || a.type === "msg");
+
+  const allDone = hasIdeas && hasTeam && hasMessages;
+  const progress = [hasIdeas, hasTeam, hasMessages].filter(Boolean).length;
+  const collapsed = allDone || manualDismissed;
+
+  if (collapsed) {
+    return (
+      <div className="box" style={{
+        marginBottom: 14, padding: "8px 14px",
+        display: "flex", alignItems: "center", gap: 10,
+        fontSize: 12, color: "var(--ink-soft)",
+      }}>
+        <span style={{ fontSize: 14 }}>{allDone ? "✓" : "·"}</span>
+        <span style={{ flex: 1 }}>
+          {allDone ? "onboarding abgeschlossen · alle 3 schritte fertig" : "onboarding minimiert"}
+        </span>
+        <button className="btn tiny" onClick={() => {
+          try { localStorage.removeItem(dismissKey); } catch (_) {}
+          setManualDismissed(false);
+        }}>einblenden</button>
+      </div>
+    );
+  }
+
   return (
-    <div style={{ padding: 10, border: "1.5px solid var(--line)", borderRadius: 6, background: "var(--paper)" }}>
+    <div className="two-col">
+      <div className="box">
+        <div style={{ display: "flex", alignItems: "center", marginBottom: 4 }}>
+          <div className="eyebrow" style={{ flex: 1 }}>// los geht's · {progress}/3 schritte</div>
+          <button className="btn tiny" title="onboarding ausblenden" onClick={() => {
+            try { localStorage.setItem(dismissKey, "1"); } catch (_) {}
+            setManualDismissed(true);
+          }}>×</button>
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 10, marginTop: 4 }}>
+          <OnboardStep n="1" title="idee erfassen"
+            body="im ideen-tab tippst du was dir gerade einfällt. später machst du daraus aufgaben."
+            cta="→ ideen-tab" onClick={() => onSetTab && onSetTab("ideas")}
+            done={hasIdeas} />
+          <OnboardStep n="2" title="team einladen"
+            body={"oben „mitglieder verwalten“ → email eintippen. ihr seht dann beide dieselben aufgaben + chat."}
+            cta="👥 mitglieder" onClick={onOpenMembers}
+            done={hasTeam} />
+          <OnboardStep n="3" title="mit team chatten"
+            body="rechts im chat oder im team-tab: nachrichten, notizen + termine teilen — live synchronisiert."
+            cta="→ team-tab" onClick={() => onSetTab && onSetTab("team")}
+            done={hasMessages} />
+        </div>
+      </div>
+      <MiniChat project={project} myEmail={myEmail} />
+    </div>
+  );
+}
+
+function OnboardStep({ n, title, body, cta, onClick, done }) {
+  return (
+    <div style={{
+      padding: 10, border: "1.5px solid " + (done ? "#2a8a3a" : "var(--line)"),
+      borderRadius: 6,
+      background: done ? "rgba(42,138,58,0.06)" : "var(--paper)",
+      opacity: done ? 0.85 : 1,
+    }}>
       <div style={{ display: "flex", alignItems: "baseline", gap: 6, marginBottom: 4 }}>
         <span style={{
           display: "inline-block", width: 22, height: 22, lineHeight: "22px", textAlign: "center",
-          background: "var(--ink)", color: "var(--paper)", borderRadius: 11,
+          background: done ? "#2a8a3a" : "var(--ink)", color: "var(--paper)", borderRadius: 11,
           fontFamily: "monospace", fontSize: 12, fontWeight: 700,
-        }}>{n}</span>
-        <strong style={{ fontSize: 13.5 }}>{title}</strong>
+        }}>{done ? "✓" : n}</span>
+        <strong style={{ fontSize: 13.5, textDecoration: done ? "line-through" : "none" }}>{title}</strong>
       </div>
       <div style={{ fontSize: 11.5, color: "var(--ink-soft)", lineHeight: 1.5, marginBottom: 8 }}>
         {body}
       </div>
-      {cta && (
+      {cta && !done && (
         <button className="btn tiny" onClick={onClick}
           style={{ fontWeight: 600 }}>{cta}</button>
+      )}
+      {done && (
+        <span style={{ fontSize: 11, color: "#2a8a3a", fontWeight: 600 }}>✓ erledigt</span>
       )}
     </div>
   );
@@ -1089,24 +1183,12 @@ function ScreenOverview({ project, onOpenMembers, onOpenPair, onSetTab }) {
                                                  apiBase={sync.serverUrl}
                                                  token={sync.token} /> : null}
 
-      {/* Block 1 — Onboarding + Mini-Chat */}
-      <div className="two-col">
-        <div className="box">
-          <div className="eyebrow">// los geht's · 3 schritte</div>
-          <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 10, marginTop: 8 }}>
-            <OnboardStep n="1" title="idee erfassen"
-              body="im ideen-tab tippst du was dir gerade einfällt. später machst du daraus aufgaben."
-              cta="→ ideen-tab" onClick={() => onSetTab && onSetTab("ideas")} />
-            <OnboardStep n="2" title="team einladen"
-              body={"oben „mitglieder verwalten“ → email eintippen. ihr seht dann beide dieselben aufgaben + chat."}
-              cta="👥 mitglieder" onClick={onOpenMembers} />
-            <OnboardStep n="3" title="mit team chatten"
-              body="rechts im chat oder im team-tab: nachrichten, notizen + termine teilen — live synchronisiert."
-              cta="→ team-tab" onClick={() => onSetTab && onSetTab("team")} />
-          </div>
-        </div>
-        <MiniChat project={project} myEmail={myEmail} />
-      </div>
+      {/* Block 1 — Onboarding + Mini-Chat
+          D5 · Auto-collapse wenn alle 3 schritte mind. einmal erledigt sind:
+            (1) min. 1 idee erfasst, (2) team > 1 mitglied, (3) chat > 0 msgs
+          User kann manuell wieder ausklappen via dismiss-state in localStorage. */}
+      <OnboardingBlock project={project} myEmail={myEmail}
+                       onSetTab={onSetTab} onOpenMembers={onOpenMembers} />
 
       {/* Block 2 — Stat-chips */}
       <div style={{ display: "flex", gap: 12, marginTop: 14 }}>
@@ -1212,16 +1294,15 @@ function ScreenTasks({ project, onCcRun }) {
 
   return (
     <>
+      {/* D3 · Filter-chips zeigen DIREKT die zahlen (war doppelt: chips + counters rechts) */}
       <div className="filter-bar">
-        <span className={"fb-chip" + (filter === "all" ? " active" : "")} onClick={() => setFilter("all")}>alle</span>
-        <span className={"fb-chip" + (filter === "open" ? " active" : "")} onClick={() => setFilter("open")}>offen</span>
-        <span className={"fb-chip" + (filter === "done" ? " active" : "")} onClick={() => setFilter("done")}>erledigt</span>
+        <span className={"fb-chip" + (filter === "all" ? " active" : "")} onClick={() => setFilter("all")}>alle <strong style={{ marginLeft: 4, opacity: 0.7 }}>{tasks.length}</strong></span>
+        <span className={"fb-chip" + (filter === "open" ? " active" : "")} onClick={() => setFilter("open")}>offen <strong style={{ marginLeft: 4, opacity: 0.7 }}>{tasks.filter(t => !t.done).length}</strong></span>
+        <span className={"fb-chip" + (filter === "done" ? " active" : "")} onClick={() => setFilter("done")}>erledigt <strong style={{ marginLeft: 4, opacity: 0.7 }}>{tasks.filter(t => t.done).length}</strong></span>
         <span className="grow" />
         <input className="input" placeholder="suchen…" value={search}
                onChange={(e) => setSearch(e.target.value)}
                style={{ maxWidth: 200, fontSize: 12, padding: "4px 10px" }} />
-        <span className="chip solid">offen {tasks.filter(t => !t.done).length}</span>
-        <span className="chip">erledigt {tasks.filter(t => t.done).length}</span>
         <button className="btn primary tiny" onClick={() => setAdding(s => !s)}>+ aufgabe</button>
       </div>
       {isEmpty && !adding && (
@@ -1307,6 +1388,14 @@ function ScreenTasks({ project, onCcRun }) {
                         <div style={{ display: "flex", gap: 6, marginTop: 4 }}>
                           <button className="btn tiny ghost" onClick={() => setSubDraft({ taskId: t.id, title: "" })}>+ sub-task</button>
                           {!t.done && <button className="btn tiny ghost" onClick={() => onCcRun(t.id)}>⚡ an cloud-code</button>}
+                          {!t.done && (t.subtasks || []).length === 0 && (
+                            <button className="btn tiny ghost" title="cc zerlegt task in 3-8 subtasks (1× claude-call, ~0.20$)"
+                                    onClick={async () => {
+                                      try {
+                                        await sync._http("POST", "/api/cc/decompose", { projectId: project.id, taskId: t.id });
+                                      } catch (e) { alert("decompose: " + (e.message || "fehler")); }
+                                    }}>🪓 zerlegen</button>
+                          )}
                         </div>
                       )}
                     </div>
@@ -1705,24 +1794,65 @@ function ScreenCloud({ project, onCcRun, onCcStop, ccStatus, ccOutput, ccRunning
     sync.mutate("CLEAR_PENDING_QUESTION", { projectId: project.id });
   };
 
+  // Token-/cost-stats: kommt aus state.ccBudget (server-tracked). Für UI:
+  // letzte 20 jobs summieren statt all-time, damit zahlen aktuell wirken.
+  const recentBudget = useMemo(() => {
+    const jobs = ((client.state || {}).ccBudget || {}).jobs || [];
+    const recent = jobs.slice(0, 20).filter(j => j.projectId === project.id);
+    return recent.reduce((acc, j) => ({
+      tokensIn: acc.tokensIn + (j.inputTokens || 0),
+      tokensOut: acc.tokensOut + (j.outputTokens || 0),
+      costUsd: acc.costUsd + (j.costUsd || 0),
+      jobs: acc.jobs + 1,
+    }), { tokensIn: 0, tokensOut: 0, costUsd: 0, jobs: 0 });
+  }, [client.state, project.id]);
+
   return (
     <>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end", marginBottom: 12 }}>
+      {/* Cleaner header — klare hierarchie, controls rechts gebündelt */}
+      <div className="cc-header">
         <div>
-          <h2 className="h2">cloud-code aktivität</h2>
-          <div style={{ color: "var(--ink-soft)", fontSize: 12, marginTop: 4 }}>
+          <h2 className="cc-title">cloud-code</h2>
+          <div className="cc-subtitle">
             <span className={"cc-dot" + (ccRunning ? " live" : "")}>
-              {isRunning ? "läuft seit " + relTime(status.startedAt) : (ccRunning ? "verbunden · idle" : "pausiert")}
+              {isRunning ? "läuft seit " + relTime(status.startedAt)
+                : (ccRunning ? "verbunden · idle" : "pausiert")}
             </span>
             {" · "}{activity.length} events
-            {!project.path && <span style={{ color: "#c33", marginLeft: 12 }}>⚠ kein projekt-pfad — claude CLI startet im server-cwd</span>}
+            {!project.path && <span style={{ color: "var(--danger, #c33)", marginLeft: 10 }}>
+              ⚠ kein projekt-pfad
+            </span>}
           </div>
         </div>
-        <div style={{ display: "flex", gap: 6 }}>
+        <div className="cc-controls">
           {isRunning
             ? <button className="btn tiny danger" onClick={() => onCcStop()}>■ stop</button>
-            : <button className="btn tiny" onClick={() => setCcRunning(!ccRunning)}>{ccRunning ? "pause" : "fortsetzen"}</button>}
-          <button className="btn tiny danger" onClick={clearLog} disabled={!activity.length}>log leeren</button>
+            : <button className="btn tiny" onClick={() => setCcRunning(!ccRunning)}>{ccRunning ? "pause" : "▶ fortsetzen"}</button>}
+          <button className="btn tiny" onClick={clearLog} disabled={!activity.length}>log leeren</button>
+        </div>
+      </div>
+
+      {/* Stats-cards: 4 chips mit klaren zahlen */}
+      <div className="cc-stats">
+        <div className={"cc-stat-card" + (metrics.checks > 0 ? " accent" : "")}>
+          <div className="label">checks</div>
+          <div className="value">{metrics.checks}</div>
+          <div className="sub">tasks abgehakt</div>
+        </div>
+        <div className="cc-stat-card">
+          <div className="label">writes</div>
+          <div className="value">{metrics.writes}</div>
+          <div className="sub">files berührt</div>
+        </div>
+        <div className={"cc-stat-card" + (metrics.warnings > 0 ? " warning" : "")}>
+          <div className="label">warnings</div>
+          <div className="value">{metrics.warnings}</div>
+          <div className="sub">{metrics.warnings > 0 ? "blocker offen" : "alles klar"}</div>
+        </div>
+        <div className="cc-stat-card">
+          <div className="label">kosten · {recentBudget.jobs} runs</div>
+          <div className="value">${recentBudget.costUsd.toFixed(3)}</div>
+          <div className="sub">{(recentBudget.tokensIn/1000).toFixed(1)}k in · {(recentBudget.tokensOut/1000).toFixed(1)}k out</div>
         </div>
       </div>
 
@@ -1738,8 +1868,18 @@ function ScreenCloud({ project, onCcRun, onCcStop, ccStatus, ccOutput, ccRunning
         />
       )}
 
-      <div className="box" style={{ marginBottom: 12 }}>
-        <div className="eyebrow">// freier prompt {attachments.length > 0 && <span style={{ opacity: 0.5 }}>· {attachments.length} anhänge</span>}</div>
+      {/* Aktuelle aufgabe sichtbar wenn run läuft oder in_progress-task vorhanden */}
+      {(isRunning || inProgress.length > 0) && (
+        <div className="cc-current-task">
+          <div className="label">{isRunning ? "läuft gerade" : "nächste aufgabe"}</div>
+          <div className="title">{isRunning && status.taskId
+            ? ((project.tasks || []).find(t => t.id === status.taskId)?.title || "freier prompt")
+            : (inProgress[0]?.title || "—")}</div>
+        </div>
+      )}
+
+      <div className="box cc-section">
+        <div className="cc-section-title">// freier prompt {attachments.length > 0 && <span style={{ opacity: 0.5 }}>· {attachments.length} anhänge</span>}</div>
         {attachments.length > 0 && (
           <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 8 }}>
             {attachments.map((a, i) => (
@@ -1775,27 +1915,68 @@ function ScreenCloud({ project, onCcRun, onCcStop, ccStatus, ccOutput, ccRunning
         )}
       </div>
 
+      {/* Task 3 · Live tool-events: was claude gerade liest/schreibt/spawnt */}
+      {(client.ccToolEvents?.[project.id] || []).length > 0 && (
+        <div className="box cc-section">
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+            <div className="cc-section-title">// tools · was claude tut</div>
+            {client.ccThinkingText?.[project.id] && (
+              <span style={{ fontFamily: "JetBrains Mono, monospace", fontSize: 10, color: "var(--ink-faint)", fontStyle: "italic" }}>
+                💭 {client.ccThinkingText[project.id].slice(0, 80)}
+              </span>
+            )}
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 3, maxHeight: 180, overflowY: "auto" }}>
+            {(client.ccToolEvents[project.id] || []).slice(-10).map((te, i) => (
+              <div key={te.id || i} style={{
+                display: "flex", gap: 8, alignItems: "center",
+                padding: "3px 8px", fontSize: 11.5, lineHeight: 1.5,
+                fontFamily: "JetBrains Mono, monospace",
+                borderRadius: 4,
+                background: te.state === "error" ? "rgba(204,51,51,0.08)" : "transparent",
+                color: te.state === "error" ? "#c33" : "var(--ink)",
+                opacity: te.state === "running" ? 0.7 : 1,
+              }}>
+                <span style={{ width: 16, textAlign: "center" }}>{te.glyph}</span>
+                <span style={{ fontWeight: 600, minWidth: 60 }}>{te.tool}</span>
+                <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{te.summary}</span>
+                <span style={{ fontSize: 10, color: "var(--ink-faint)" }}>
+                  {te.state === "running" ? "…" : (te.state === "error" ? "✗" : "✓")}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       {output && (
-        <div className="box" style={{ marginBottom: 12 }}>
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-            <div className="eyebrow">// cloud-code output</div>
+        <div className="box cc-section">
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+            <div className="cc-section-title">// cloud-code antwort</div>
             {isRunning && <span className="cc-dot live">streamt…</span>}
           </div>
           <pre className="cc-output">{output.slice(-4000)}</pre>
         </div>
       )}
 
-      <div className="box" style={{ marginBottom: 12 }}>
-        <div className="eyebrow">// live-feed</div>
+      <div className="box cc-section">
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+          <div className="cc-section-title">// live-feed</div>
+          <span style={{ fontFamily: "JetBrains Mono, monospace", fontSize: 10, color: "var(--ink-faint)" }}>
+            {Math.min(activity.length, 60)} / {activity.length}
+          </span>
+        </div>
         {activity.length === 0
           ? <div className="empty"><div className="big">stille.</div><div>cloud code wartet auf input.</div></div>
-          : activity.slice(0, 40).map(e => (
-              <div className="feed-row" key={e.id}>
-                <span className="glyph">{ACT_GLYPHS[e.type] || "·"}</span>
-                <span dangerouslySetInnerHTML={{ __html: e.text }} />
-                <span className="ts">{relTime(e.ts)}</span>
-              </div>
-            ))
+          : <div className="cc-feed-wrap">
+              {activity.slice(0, 60).map(e => (
+                <div className="feed-row" key={e.id}>
+                  <span className="glyph">{ACT_GLYPHS[e.type] || "·"}</span>
+                  <span dangerouslySetInnerHTML={{ __html: e.text }} />
+                  <span className="ts">{relTime(e.ts)}</span>
+                </div>
+              ))}
+            </div>
         }
       </div>
 
@@ -2118,6 +2299,7 @@ function App() {
   const [, setTick] = useState(0);
   const [showNew, setShowNew] = useState(false);
   const [showPair, setShowPair] = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(false); // mobile hamburger
   const [showAuth, setShowAuth] = useState(false);
   const [showMembers, setShowMembers] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
@@ -2244,6 +2426,12 @@ function App() {
     <div className="app">
       <div className="titlebar">
         <span className="dot" /><span className="dot" /><span className="dot" />
+        {/* D1 · Hamburger-toggle sichtbar nur auf <768px (CSS class .mobile-only) */}
+        <button className="hamburger-toggle"
+                onClick={() => setSidebarOpen(o => !o)}
+                aria-label="menu" title="projekt-liste">
+          ☰
+        </button>
         <span className="crumb"><span className="brand-anim">ProjectGamma</span> · {project?.name || "—"} · {TABS.find(t => t.id === client.activeTab)?.label || ""}</span>
         <div className="right">
           <span className={"cc-dot" + (client.connected ? " live" : "")}>
@@ -2254,11 +2442,13 @@ function App() {
       </div>
 
       <div className="body">
-        <Sidebar projects={projects}
+        <div className={"side-wrapper" + (sidebarOpen ? " open-mobile" : "")}>
+          <Sidebar projects={projects}
                  activeId={client.activeProjectId}
-                 onSelect={(id) => { client.setActiveProject(id); client.setActiveTab("overview"); }}
-                 onNew={() => setShowNew(true)}
+                 onSelect={(id) => { client.setActiveProject(id); client.setActiveTab("overview"); setSidebarOpen(false); }}
+                 onNew={() => { setShowNew(true); setSidebarOpen(false); }}
                  ccRunning={client.ccRunning} />
+        </div>
         {!project && (
           /* Welcome-state: keine projekte oder noch keins ausgewählt. Buttons
              (handy/mitglieder/login/settings) sind hier nicht relevant — sie kommen

@@ -22,7 +22,6 @@ class _DevicePanelState extends State<DevicePanel> {
   List<Map<String, dynamic>> _devices = const [];
   String? _error;
   Timer? _tick;
-  String? _lastProjectId;
 
   @override
   void initState() {
@@ -43,7 +42,6 @@ class _DevicePanelState extends State<DevicePanel> {
     final p = c.activeProject;
     final url = c.serverUrl;
     if (p == null || url == null) return;
-    _lastProjectId = p['id'] as String?;
     try {
       final r = await http.get(
         Uri.parse('$url/api/projects/${p['id']}/devices'),

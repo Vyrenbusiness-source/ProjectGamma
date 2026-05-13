@@ -3,14 +3,23 @@ import '../../theme.dart';
 import 'cloud_glyphs.dart';
 import 'cloud_strip_html.dart';
 
-/// Activity-feed für cloud-screen — zeigt top-12 events.
-/// Trennt chat/msg-blöcke (multiline) vom operativen event-feed (inline).
-class CloudActivityFeed extends StatelessWidget {
+/// Activity-feed für cloud-screen — zeigt default die letzten 3 events.
+/// User kann „mehr"-toggle drücken um bis zu 30 zu sehen.
+/// Mobile-screens sind eng → standard ist absichtlich knapp.
+class CloudActivityFeed extends StatefulWidget {
   final List<Map<String, dynamic>> activity;
   const CloudActivityFeed({super.key, required this.activity});
+  @override
+  State<CloudActivityFeed> createState() => _CloudActivityFeedState();
+}
 
+class _CloudActivityFeedState extends State<CloudActivityFeed> {
+  bool _expanded = false;
   @override
   Widget build(BuildContext context) {
+    final activity = widget.activity;
+    final shown = _expanded ? activity.take(30).toList() : activity.take(3).toList();
+    final hasMore = activity.length > shown.length;
     return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
       Row(children: [
         const PgEyebrow('aktivität'),
@@ -28,11 +37,28 @@ class CloudActivityFeed extends StatelessWidget {
         )
       else
         Column(children: [
-          for (final e in activity.take(12))
+          for (final e in shown)
             if (e['type'] == 'chat' || e['type'] == 'msg')
               _ChatBlock(event: e)
             else
               _EventLine(event: e),
+          if (hasMore || _expanded) Padding(
+            padding: const EdgeInsets.only(top: 6),
+            child: InkWell(
+              onTap: () => setState(() => _expanded = !_expanded),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(vertical: 6),
+                child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+                  Icon(_expanded ? Icons.keyboard_arrow_up : Icons.keyboard_arrow_down,
+                      size: 16, color: pgInkSoft),
+                  const SizedBox(width: 4),
+                  Text(_expanded ? 'weniger' : 'mehr (${activity.length - shown.length})',
+                      style: const TextStyle(
+                        fontFamily: 'monospace', fontSize: 11, color: pgInkSoft)),
+                ]),
+              ),
+            ),
+          ),
         ]),
     ]);
   }

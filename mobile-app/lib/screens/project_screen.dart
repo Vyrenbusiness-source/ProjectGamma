@@ -6,6 +6,8 @@ import 'package:flutter/material.dart';
 import '../theme.dart';
 import '../sync_client.dart';
 import '../features/members/members_screen.dart';
+import 'rules_screen.dart';
+import 'team_screen.dart';
 import 'project_details_screen.dart';
 
 class ProjectScreen extends StatefulWidget {
@@ -17,6 +19,8 @@ class ProjectScreen extends StatefulWidget {
 class _ProjectScreenState extends State<ProjectScreen> {
   final _ideaCtrl = TextEditingController();
   bool _saving = false;
+  // D5 · onboarding dismiss-state (manuell)
+  bool _onboardDismissed = false;
 
   Future<void> _quickSaveIdea() async {
     final text = _ideaCtrl.text.trim();
@@ -58,25 +62,15 @@ class _ProjectScreenState extends State<ProjectScreen> {
     return ListView(
       padding: const EdgeInsets.fromLTRB(16, 12, 16, 32),
       children: [
-        // Onboarding-banner immer sichtbar — passt zum desktop-layout und mockup.
-        Container(
-          margin: const EdgeInsets.only(bottom: 14),
-          padding: const EdgeInsets.fromLTRB(14, 12, 14, 14),
-          decoration: BoxDecoration(
-            color: pgPaper,
-            border: Border.all(color: pgInk, width: 2, style: BorderStyle.solid),
-            borderRadius: BorderRadius.circular(8),
-          ),
-          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            const PgEyebrow('los geht\'s · 3 schritte'),
-            const SizedBox(height: 8),
-            _OnboardStep(n: '1', title: 'idee erfassen',
-              body: 'unten in „schnelle idee" tippen + speichern. ideen werden vom team gesehen.'),
-            _OnboardStep(n: '2', title: 'team einladen',
-              body: 'oben „mitglieder verwalten" → email eintippen. ihr seht dann beide dieselben aufgaben + chat.'),
-            _OnboardStep(n: '3', title: 'mit team chatten',
-              body: 'im team-tab unten könnt ihr nachrichten + notizen + termine teilen.'),
-          ]),
+        // D5 · Onboarding mit auto-collapse + per-step-done-status:
+        //   step 1: ≥1 idee erfasst
+        //   step 2: ≥1 mitglied außer owner (members > 1)
+        //   step 3: ≥1 chat-message in der activity
+        _OnboardingBanner(
+          project: p,
+          dismissed: _onboardDismissed,
+          onDismiss: () => setState(() => _onboardDismissed = true),
+          onExpand: () => setState(() => _onboardDismissed = false),
         ),
         // QUICK STATS — vier Kacheln auf einer Zeile
         Row(children: [
@@ -91,12 +85,31 @@ class _ProjectScreenState extends State<ProjectScreen> {
 
         const SizedBox(height: 18),
 
-        // MITGLIEDER · navigations-row (multi-user schicht 2)
+        // NAV-ROWS · regeln + mitglieder + team-chat wandern hier rein,
+        // damit die bottom-nav auf 4 statt 6 tabs schrumpfen kann (M3).
+        // Hint zeigt direkt den state-counter (z.B. "19/19 aktiv").
+        _NavRow(
+          icon: Icons.gavel,
+          label: 'regeln',
+          hint: rules.isEmpty ? 'noch keine regeln' : '$activeRules aktiv · ${rules.length} gesamt',
+          onTap: () => Navigator.of(context).push(
+            MaterialPageRoute(builder: (_) => const RulesScreen()),
+          ),
+        ),
+        const SizedBox(height: 8),
         _NavRow(
           icon: Icons.group_outlined,
           label: 'mitglieder verwalten',
           onTap: () => Navigator.of(context).push(
             MaterialPageRoute(builder: (_) => MembersScreen(projectId: p['id'] as String)),
+          ),
+        ),
+        const SizedBox(height: 8),
+        _NavRow(
+          icon: Icons.chat_bubble_outline,
+          label: 'team-chat & notizen',
+          onTap: () => Navigator.of(context).push(
+            MaterialPageRoute(builder: (_) => const TeamScreen()),
           ),
         ),
         const SizedBox(height: 8),
@@ -276,18 +289,30 @@ class _CcStat extends StatelessWidget {
   const _CcStat({required this.running});
   @override
   Widget build(BuildContext context) {
+    // Konsistent zu _Stat: gleiches layout (großer wert + kleines label).
+    // Hier ist der „wert" das status-symbol/wort.
     return Container(
       padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 6),
       decoration: BoxDecoration(
-        color: pgPaper,
+        color: running ? pgInk : pgPaper,
         border: Border.all(color: pgInk, width: 2),
         borderRadius: BorderRadius.circular(8),
       ),
       child: Column(children: [
-        Icon(Icons.bolt, size: 20, color: running ? pgInk : pgInkFaint),
+        Text(
+          running ? 'AN' : 'AUS',
+          style: TextStyle(
+            fontFamily: 'monospace', fontSize: 20, fontWeight: FontWeight.w700,
+            color: running ? pgPaper : pgInkSoft,
+          ),
+        ),
         const SizedBox(height: 2),
-        Text(running ? 'aktiv' : 'pause',
-          style: const TextStyle(fontSize: 9.5, color: pgInkSoft, fontFamily: 'monospace')),
+        Text('cloud-code',
+          style: TextStyle(
+            fontSize: 9.5,
+            color: running ? pgPaper : pgInkSoft,
+            fontFamily: 'monospace',
+          )),
       ]),
     );
   }
@@ -297,7 +322,8 @@ class _OnboardStep extends StatelessWidget {
   final String n;
   final String title;
   final String body;
-  const _OnboardStep({required this.n, required this.title, required this.body});
+  final bool done;
+  const _OnboardStep({required this.n, required this.title, required this.body, this.done = false});
   @override
   Widget build(BuildContext context) {
     return Padding(
@@ -305,18 +331,104 @@ class _OnboardStep extends StatelessWidget {
       child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
         Container(
           width: 22, height: 22, alignment: Alignment.center,
-          decoration: const BoxDecoration(color: pgInk, shape: BoxShape.circle),
-          child: Text(n, style: const TextStyle(
+          decoration: BoxDecoration(
+            color: done ? const Color(0xFF2A8A3A) : pgInk,
+            shape: BoxShape.circle),
+          child: Text(done ? '✓' : n, style: const TextStyle(
             color: pgPaper, fontFamily: 'monospace', fontSize: 11, fontWeight: FontWeight.w700)),
         ),
         const SizedBox(width: 10),
         Expanded(
           child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text(title, style: const TextStyle(fontSize: 13.5, fontWeight: FontWeight.w700)),
+            Text(title, style: TextStyle(
+              fontSize: 13.5, fontWeight: FontWeight.w700,
+              decoration: done ? TextDecoration.lineThrough : null,
+              color: done ? pgInkSoft : pgInk)),
             const SizedBox(height: 2),
             Text(body, style: const TextStyle(fontSize: 12, color: pgInkSoft, height: 1.4)),
           ]),
         ),
+      ]),
+    );
+  }
+}
+
+// D5 · Onboarding-banner mit auto-collapse-logik.
+class _OnboardingBanner extends StatelessWidget {
+  final Map<String, dynamic> project;
+  final bool dismissed;
+  final VoidCallback onDismiss;
+  final VoidCallback onExpand;
+  const _OnboardingBanner({
+    required this.project, required this.dismissed,
+    required this.onDismiss, required this.onExpand,
+  });
+  @override
+  Widget build(BuildContext context) {
+    final ideas = ((project['ideas'] as List?) ?? const []).length;
+    final members = ((project['members'] as List?) ?? const []).length;
+    final activity = ((project['activity'] as List?) ?? const []).cast<Map<String, dynamic>>();
+    final hasIdea = ideas > 0;
+    final hasTeam = members > 1;
+    final hasChat = activity.any((a) => a['type'] == 'chat' || a['type'] == 'msg');
+    final allDone = hasIdea && hasTeam && hasChat;
+    final progress = [hasIdea, hasTeam, hasChat].where((b) => b).length;
+    final collapsed = allDone || dismissed;
+
+    if (collapsed) {
+      return Container(
+        margin: const EdgeInsets.only(bottom: 12),
+        padding: const EdgeInsets.fromLTRB(12, 8, 8, 8),
+        decoration: BoxDecoration(
+          color: pgPaper,
+          border: Border.all(color: pgInkFaint, width: 1.5),
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Row(children: [
+          Text(allDone ? '✓' : '·', style: const TextStyle(fontSize: 14, color: pgInkSoft)),
+          const SizedBox(width: 8),
+          Expanded(child: Text(
+            allDone ? 'onboarding abgeschlossen' : 'onboarding minimiert',
+            style: const TextStyle(fontSize: 12, color: pgInkSoft),
+          )),
+          TextButton(
+            onPressed: onExpand,
+            style: TextButton.styleFrom(padding: const EdgeInsets.symmetric(horizontal: 10)),
+            child: const Text('einblenden', style: TextStyle(fontSize: 11, color: pgInk)),
+          ),
+        ]),
+      );
+    }
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 14),
+      padding: const EdgeInsets.fromLTRB(14, 12, 14, 14),
+      decoration: BoxDecoration(
+        color: pgPaper,
+        border: Border.all(color: pgInk, width: 2),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          Expanded(child: PgEyebrow('los geht\'s · $progress/3 schritte')),
+          GestureDetector(
+            onTap: onDismiss,
+            child: const Padding(
+              padding: EdgeInsets.all(4),
+              child: Icon(Icons.close, size: 16, color: pgInkFaint),
+            ),
+          ),
+        ]),
+        const SizedBox(height: 8),
+        _OnboardStep(n: '1', title: 'idee erfassen',
+          body: 'unten in „schnelle idee" tippen + speichern. ideen werden vom team gesehen.',
+          done: hasIdea),
+        _OnboardStep(n: '2', title: 'team einladen',
+          body: 'oben „mitglieder verwalten" → email eintippen. ihr seht dann beide dieselben aufgaben + chat.',
+          done: hasTeam),
+        _OnboardStep(n: '3', title: 'mit team chatten',
+          body: 'im team-tab könnt ihr nachrichten + notizen + termine teilen.',
+          done: hasChat),
       ]),
     );
   }

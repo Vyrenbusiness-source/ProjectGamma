@@ -250,6 +250,7 @@ class _IdeaTile extends StatelessWidget {
               child: Text('• synchronisiert sobald online',
                 style: TextStyle(fontSize: 10.5, color: pgInkFaint, fontStyle: FontStyle.italic)),
             ),
+          // M6 · Actions IMMER sichtbar (kein hidden-state). Pro status andere set.
           if (!pending && status == 'unprocessed')
             InlineSuggestRow(
               projectId: projectId,
@@ -270,13 +271,20 @@ class _IdeaTile extends StatelessWidget {
                   onTap: () => client.mutate('DISMISS_IDEA', {'projectId': projectId, 'ideaId': idea['id']}),
                 ),
               ],
+              if (status == 'task_created') ...[
+                _ActionChip(
+                  label: '↺ wieder als idee',
+                  onTap: () => client.mutate('REACTIVATE_IDEA',
+                      {'projectId': projectId, 'ideaId': idea['id']}),
+                ),
+              ],
               if (status == 'processed')
                 _ActionChip(
                   label: '↺ reaktivieren',
                   onTap: () => client.mutate('REACTIVATE_IDEA', {'projectId': projectId, 'ideaId': idea['id']}),
                 ),
               _ActionChip(
-                label: '×', danger: true,
+                label: '× löschen', danger: true,
                 onTap: () => client.mutate('REMOVE_IDEA', {'projectId': projectId, 'ideaId': idea['id']}),
               ),
             ],
@@ -291,13 +299,12 @@ class _IdeaTile extends StatelessWidget {
 class _ActionChip extends StatelessWidget {
   final String label;
   final VoidCallback onTap;
-  final bool primary;
   final bool danger;
-  const _ActionChip({required this.label, required this.onTap, this.primary = false, this.danger = false});
+  const _ActionChip({required this.label, required this.onTap, this.danger = false});
   @override
   Widget build(BuildContext context) {
-    final fg = primary ? pgPaper : (danger ? pgDanger : pgInk);
-    final bg = primary ? pgInk : pgPaper;
+    final fg = danger ? pgDanger : pgInk;
+    final bg = pgPaper;
     final border = danger ? pgDanger : pgInk;
     return InkWell(
       onTap: onTap,

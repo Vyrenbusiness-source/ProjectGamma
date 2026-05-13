@@ -10,6 +10,7 @@ import 'package:image_picker/image_picker.dart';
 import '../sync_client.dart';
 import '../theme.dart';
 import '../features/cloud/cloud_activity_feed.dart';
+import '../features/cloud/cloud_tool_events.dart';
 import '../features/cloud/cloud_limit_detector.dart';
 import '../features/cloud/cloud_prompt_box.dart';
 import '../features/cloud/cloud_sections_view.dart';
@@ -195,6 +196,7 @@ class _CloudScreenState extends State<CloudScreen> {
             ccRunning: ccRunning, budget: budget, inProgress: inProgress,
             limitHit: limit.hit, limitResetText: limit.resetText,
             onToggle: () => _onToggleCc(p, ccRunning),
+            activity: activity,
           ),
           const SizedBox(height: 14),
           if (p['pendingQuestion'] != null && (p['pendingQuestion'] as String).isNotEmpty)
@@ -226,6 +228,14 @@ class _CloudScreenState extends State<CloudScreen> {
             attachments: _attachments,
             onRemoveAttach: (i) => setState(() => _attachments.removeAt(i)),
           ),
+          // Task 3: live tool-events — was claude gerade liest/schreibt/spawnt
+          if ((client.ccToolEvents[pid] ?? const []).isNotEmpty) ...[
+            const SizedBox(height: 12),
+            CloudToolEvents(
+              events: client.ccToolEvents[pid] ?? const [],
+              thinkingText: client.ccThinkingText[pid],
+            ),
+          ],
           const SizedBox(height: 14),
           CloudActivityFeed(activity: activity),
           const SizedBox(height: 18),

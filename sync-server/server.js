@@ -32,6 +32,10 @@ const { hashPassword, verifyPassword } = require("./lib/password_hash");
 const { filterStateForSession, checkMutationAccess } = require("./lib/project_access");
 const { createOpLogStore } = require("./lib/op_log_store");
 const { buildOpAppendFrame, selectRecipients } = require("./lib/op_broadcast");
+const { runBuildGate } = require("./lib/build_gate");
+const { commitChanges: gitCommitChanges, isGitRepo: gitIsRepo, listCcCommits: gitListCcCommits, rollbackLastCommit: gitRollbackLast } = require("./lib/git_commit");
+const { createStreamJsonParser } = require("./lib/stream_json_parser");
+const { runRuntimeTest } = require("./lib/runtime_test");
 const { createUserSettingsStore, KNOWN_KEYS: SETTING_KEYS } = require("./lib/user_settings");
 const { createUpnpPortmap } = require("./lib/upnp_portmap");
 const { createPublicIpResolver } = require("./lib/public_ip");
@@ -311,6 +315,22 @@ setInterval(() => {
 const _autoPumpCooldowns = new Map(); // taskId -> ts
 const _autoPumpMissingPathWarned = new Set(); // projectId -> 1× warnen statt 25s-spam
 let _ccApiLimitedUntil = 0; // ts — wenn claude API limit reached, pause auto-pump bis dahin
+
+// Failure-loop state: pro task tracken wir wie oft cc retried hat + den
+// letzten fehler-output, damit der retry-prompt gezielt fixen kann statt
+// blind nochmal zu versuchen.
+const MAX_CC_RETRIES = 3;
+const _ccRetryContext = new Map(); // taskId -> { attempt, kind, exitCode, output, projectId }
+
+// Pure-helper: HTML-tags + entities aus activity-event-text rausschneiden,
+// damit cc im prompt sauberen text bekommt statt "<i>foo</i>".
+function stripHtml(s) {
+  return String(s || "")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+    .replace(/\s+/g, " ").trim();
+}
 async function autoPumpTick() {
   if (!state.ccRunning) return;
   if (NOW() < _ccApiLimitedUntil) return; // claude API limit reached — warten
@@ -356,9 +376,34 @@ async function autoPumpTick() {
 setInterval(autoPumpTick, 25 * 1000);
 
 // Auto-answer-ticker: wenn projekt.ccAutoAnswer=true UND eine pendingQuestion
-// länger als delaySec offen ist, schicken wir automatisch ein "autonom-weiter"
-// als prompt. Alle 3s prüfen für brauchbare granularität ohne CPU-belastung.
+// länger als delaySec offen ist, schicken wir automatisch eine konkrete antwort
+// (option-pick aus a/b/c oder rotation), DAMIT cc nicht im fragenkreis hängt.
 const _autoAnsweredAt = new Map(); // projectId -> last-answered-timestamp (verhindert burst)
+const _autoAnswerRotation = new Map(); // projectId -> letzte gewählte option (rotation)
+
+// Erkennt option-listen wie "(a) X (b) Y (c) Z" oder "1. X · 2. Y · 3. Z"
+// im fragetext. Liefert array von option-labels (max 8). Pure-helper.
+function _extractOptions(questionText) {
+  if (!questionText) return [];
+  const out = [];
+  // Pattern 1: (a) ..., (b) ..., (c) ... (mit klammern)
+  const reA = /\(([a-zA-Z])\)\s*([^()]+?)(?=\([a-zA-Z]\)|$|,\s*[bcd]\))/g;
+  let m;
+  while ((m = reA.exec(questionText)) !== null && out.length < 8) {
+    const label = m[2].trim().replace(/[.,;:]+$/, "");
+    if (label && label.length < 200) out.push(label);
+  }
+  if (out.length >= 2) return out;
+  // Pattern 2: "1. X 2. Y 3. Z" — nur wenn pattern 1 nichts fand
+  out.length = 0;
+  const reN = /\b(\d+)\.\s+([^\d][^.]*?)(?=\s+\d+\.|$)/g;
+  while ((m = reN.exec(questionText)) !== null && out.length < 8) {
+    const label = m[2].trim();
+    if (label && label.length < 200) out.push(label);
+  }
+  return out;
+}
+
 async function autoAnswerTick() {
   if (!state.ccRunning) return;
   if (NOW() < _ccApiLimitedUntil) return;
@@ -374,15 +419,49 @@ async function autoAnswerTick() {
     const lastAnswered = _autoAnsweredAt.get(project.id) || 0;
     if (NOW() - lastAnswered < 10_000) continue;
     _autoAnsweredAt.set(project.id, NOW());
-    console.log(`[auto-answer] ${project.name}: pq nach ${Math.round(since / 1000)}s autonom beantworten`);
-    const prompt = `Frage von dir war: ${pq}\nKeine antwort vom user (auto-answer-mode aktiv, ${Math.round(delay/1000)}s gewartet). Mach autonom weiter mit deiner besten annahme.`;
+
+    // Option-pick: wenn cc multiple-choice gestellt hat, wähle konkret eine
+    // (rotation, damit der user nicht 5x dieselbe option sieht falls cc
+    // dieselben fragen stellt). Sonst: explizite anweisung „entscheide selbst".
+    const opts = _extractOptions(pq);
+    let chosenIdx = 0;
+    let answerPrompt;
+    if (opts.length >= 2) {
+      const lastIdx = _autoAnswerRotation.get(project.id);
+      chosenIdx = typeof lastIdx === "number" ? (lastIdx + 1) % opts.length : 0;
+      _autoAnswerRotation.set(project.id, chosenIdx);
+      const letter = String.fromCharCode("a".charCodeAt(0) + chosenIdx);
+      answerPrompt =
+        `Frage von dir war:\n${pq}\n\n` +
+        `AUTO-ANSWER (option ${letter}): ${opts[chosenIdx]}\n\n` +
+        `Setze diese option JETZT um. Stelle KEINE weitere scope-frage; ` +
+        `wenn der scope zu groß ist, zerlege ihn SELBST und arbeite am ersten ` +
+        `konkreten teilschritt (max 1-2h arbeit). Liefere code + verifikation, ` +
+        `nicht nur planung. done=true wenn dieser teilschritt fertig ist.`;
+    } else {
+      answerPrompt =
+        `Frage von dir war:\n${pq}\n\n` +
+        `AUTO-ANSWER: keine option vorhanden → ENTSCHEIDE SELBST und arbeite ` +
+        `den ersten konkreten teilschritt ab (max 1-2h arbeit). Stelle KEINE ` +
+        `weiteren rückfragen für scope-aufteilung — wenn die aufgabe groß ist, ` +
+        `dann commit dich auf eine richtung und liefere code dafür. ` +
+        `done=true sobald der teilschritt verifizierbar fertig ist.`;
+    }
+
+    console.log(`[auto-answer] ${project.name}: pq nach ${Math.round(since / 1000)}s` +
+      (opts.length >= 2 ? ` → option ${String.fromCharCode(97+chosenIdx)}` : " → entscheide-selbst"));
+
+    // task-kontext bewahren: triggerCc mit der task-id, an der cc beim
+    // question-zeitpunkt arbeitete, NICHT mit null (was free-prompt-modus wäre)
+    const taskIdForRetry = project.pendingQuestionTaskId || null;
     applyMutation("CLEAR_PENDING_QUESTION", { projectId: project.id });
     applyMutation("ADD_ACTIVITY", { projectId: project.id, event: {
       type: "info",
-      text: `auto-answer: keine antwort nach ${Math.round(delay/1000)}s → cc macht autonom weiter`,
+      text: `auto-answer (${Math.round(delay/1000)}s gewartet): ` +
+        (opts.length >= 2 ? `option ${String.fromCharCode(97+chosenIdx)}` : `cc entscheidet selbst`),
     }});
     broadcastState();
-    triggerCc(project.id, null, prompt).catch(e => console.log("[auto-answer] error:", e.message));
+    triggerCc(project.id, taskIdForRetry, answerPrompt).catch(e => console.log("[auto-answer] error:", e.message));
   }
 }
 setInterval(autoAnswerTick, 3 * 1000);
@@ -649,15 +728,16 @@ const MUT = {
   CLEAR_ACTIVITY(s, { projectId }) {
     s.projects = s.projects.map(p => p.id !== projectId ? p : ({ ...p, activity: [] }));
   },
-  SET_PENDING_QUESTION(s, { projectId, question }) {
+  SET_PENDING_QUESTION(s, { projectId, question, taskId }) {
     s.projects = s.projects.map(p => p.id !== projectId ? p : ({
       ...p, pendingQuestion: String(question || "").slice(0, 1000),
       pendingQuestionAt: NOW(),
+      pendingQuestionTaskId: taskId || null, // damit auto-answer den task-kontext kennt
     }));
   },
   CLEAR_PENDING_QUESTION(s, { projectId }) {
     s.projects = s.projects.map(p => p.id !== projectId ? p : ({
-      ...p, pendingQuestion: null, pendingQuestionAt: null,
+      ...p, pendingQuestion: null, pendingQuestionAt: null, pendingQuestionTaskId: null,
     }));
   },
   // Auto-answer-mode: wenn an, beantwortet der server pendingQuestions
@@ -711,9 +791,17 @@ const MUT = {
     bug.id = bug.id || genId();
     bug.ts = bug.ts || NOW();
     bug.status = bug.status || "pending";
-    s.projects = s.projects.map(p => p.id !== projectId ? p : ({
-      ...p, bugs: [bug, ...(p.bugs || [])].slice(0, 100),
-    }));
+    s.projects = s.projects.map(p => {
+      if (p.id !== projectId) return p;
+      // Dedup: gleiche description oder gleiche location → keinen duplikat anlegen.
+      const existing = (p.bugs || []).find(b =>
+        b.status !== "resolved" && (
+          (b.description && bug.description && b.description.trim().toLowerCase() === bug.description.trim().toLowerCase()) ||
+          (b.location && bug.location && b.location.trim() === bug.location.trim() && b.description?.slice(0,40) === bug.description?.slice(0,40))
+        ));
+      if (existing) return p; // skip duplicate
+      return { ...p, bugs: [bug, ...(p.bugs || [])].slice(0, 100) };
+    });
   },
   SET_BUG_STATUS(s, { projectId, bugId, status }) {
     s.projects = s.projects.map(p => p.id !== projectId ? p : ({
@@ -1564,6 +1652,47 @@ app.get("/api/projects/:id/ops", authMw, (req, res) => {
   res.json({ projectId: project.id, since, ops, head });
 });
 
+// ─── Git-History + Rollback (Task 7) ──────────────────────────
+// Listet die letzten cc-commits aus git log. Read-only, session-scoped.
+app.get("/api/projects/:id/git/commits", authMw, async (req, res) => {
+  const project = state.projects.find(p => p.id === req.params.id);
+  if (!project) return res.status(404).json({ error: "projekt nicht gefunden" });
+  if (req.session?.userId && memberships &&
+      !memberships.hasRole(project.id, req.session.userId, ROLES.VIEWER)) {
+    return res.status(403).json({ error: "keine berechtigung" });
+  }
+  if (!project.path || !gitIsRepo(project.path)) {
+    return res.json({ projectId: project.id, isGitRepo: false, commits: [] });
+  }
+  const limit = Math.min(Math.max(Number(req.query.limit) || 20, 1), 100);
+  const commits = await gitListCcCommits(project.path, limit);
+  res.json({ projectId: project.id, isGitRepo: true, commits });
+});
+
+// Rollback letzter cc-commit. Nur owner. Hard-reset HEAD~1. Lokal, kein push.
+app.post("/api/projects/:id/git/rollback", authMw, async (req, res) => {
+  const project = state.projects.find(p => p.id === req.params.id);
+  if (!project) return res.status(404).json({ error: "projekt nicht gefunden" });
+  if (req.session?.userId && memberships &&
+      !memberships.hasRole(project.id, req.session.userId, ROLES.OWNER)) {
+    return res.status(403).json({ error: "nur owner darf rollback" });
+  }
+  if (!project.path || !gitIsRepo(project.path)) {
+    return res.status(400).json({ error: "kein git-repo" });
+  }
+  const r = await gitRollbackLast(project.path);
+  if (!r.ok) return res.status(500).json({ error: r.error || "rollback fehlgeschlagen" });
+  applyMutation("ADD_ACTIVITY", { projectId: project.id, event: {
+    type: "warn", text: "git rollback (HEAD~1)",
+  }});
+  applyMutation("ADD_SYNC_LOG", { entry: {
+    source: "system", projectId: project.id,
+    text: "git rollback durch user · HEAD~1 hard-reset",
+  }});
+  broadcastState();
+  res.json({ ok: true });
+});
+
 // ─── Attachments (bilder + files für chat) ────────────────────
 // User uploaded base64 → server speichert in <project.path>/.pg-uploads/
 // und liefert eine signed-relative-url für ADD_MESSAGE-attachment.
@@ -1924,6 +2053,29 @@ function _startCcJob(project, taskId, prompt) {
   // unbedacht dieselben texte als RULE_SUGGESTIONS wieder vorschlägt.
   const removedRules = (project.removedRules || []).slice(0, 10).map(r => "- " + r.text);
   const goals = project.goals || [];
+
+  // PROJEKT-MEMORY: damit cc nicht nach jedem task den faden verliert,
+  // streamen wir 3 kontext-blöcke in den prompt:
+  //   1) letzte 5 wesentliche activity-events (write/check/warn, was passierte)
+  //   2) top 3 offene bugs (pending) — falls cc fixes priorisieren soll
+  //   3) letzte cc-summary (kurzer "wo standen wir" einzeiler)
+  const recentActivity = (project.activity || [])
+    .filter(a => ["check","write","warn","edit","rule"].includes(a.type))
+    .slice(0, 5)
+    .map(a => "- " + stripHtml(a.text || ""));
+  const openBugs = (project.bugs || [])
+    .filter(b => b.status === "pending")
+    .slice(0, 3)
+    .map(b => "- [" + (b.severity || "?") + "] " + (b.description || "").slice(0, 120));
+  const lastCcCheck = (project.activity || [])
+    .find(a => a.type === "check" && /cc auto-checkmark/.test(a.text || ""));
+  const lastCcSummary = lastCcCheck ? stripHtml(lastCcCheck.text) : null;
+
+  // Failure-context: wenn dieser run ein retry ist (vorheriger build/test
+  // fehlgeschlagen), fügen wir die fehlerausgabe in den prompt ein, damit
+  // cc gezielt den fehler fixt statt blind nochmal zu versuchen.
+  const retryContext = _ccRetryContext.get(taskId || "");
+
   const fullPrompt = [
     "Arbeite am Projekt: " + project.name + " (" + project.tech + ").",
     "",
@@ -1931,14 +2083,63 @@ function _startCcJob(project, taskId, prompt) {
     activeRules.length ? "AKTIVE REGELN (immer einhalten):\n" + activeRules.join("\n") : "",
     inactiveRules.length ? "INAKTIVE REGELN (zur info):\n" + inactiveRules.join("\n") : "",
     removedRules.length ? "KÜRZLICH ENTFERNTE REGELN (NICHT erneut vorschlagen):\n" + removedRules.join("\n") : "",
+    recentActivity.length ? "LETZTE PROJEKT-AKTIVITÄT (kontext, was kürzlich passierte):\n" + recentActivity.join("\n") : "",
+    openBugs.length ? "OFFENE BUGS (höhere prio falls passt):\n" + openBugs.join("\n") : "",
+    lastCcSummary ? "LETZTER CC-CHECKMARK: " + lastCcSummary : "",
     "",
     "AUFGABE:",
     task ? task.title : (prompt || "Was wäre als nächstes sinnvoll? Gib einen kurzen Plan in 3-5 Punkten."),
     task && prompt ? "\nZUSATZ: " + prompt : "",
+    retryContext ? "\n⚠️ DIES IST EIN RETRY (versuch " + retryContext.attempt + "/" + MAX_CC_RETRIES + "). VORHERIGER VERSUCH FEHLGESCHLAGEN:\n" +
+      "Gate: " + retryContext.kind + " (exit " + (retryContext.exitCode ?? "?") + ")\n" +
+      "Fehlerausgabe (letzte zeilen):\n```\n" + retryContext.output.split(/\r?\n/).slice(-30).join("\n") + "\n```\n" +
+      "FIX den konkreten fehler, mach den task NICHT von vorne. " +
+      "ABSOLUT VERBOTEN als 'fix': --no-verify, --skip-tests, eslint-disable, " +
+      "@ts-ignore, test-xfail/skip, regeln deaktivieren, `as any`/`dynamic`. " +
+      (retryContext.attempt >= 2
+        ? "ZWEITER+ retry: wenn du den fehler nicht klar verstanden hast, lies " +
+          "die relevanten files NEU (auch tests), und erkläre im summary WAS der " +
+          "root cause war, bevor du fixt. Symptom-fix akzeptieren wir nicht."
+        : "")
+      : "",
     "",
-    "WICHTIG: Halte deine Antwort kurz (max. 250 Wörter). Du DARFST und SOLLST",
-    "Dateien lesen und schreiben (bypassPermissions ist aktiv) um die Aufgabe",
-    "zu erledigen. Halte alle aktiven Regeln strikt ein.",
+    "Du DARFST und SOLLST Dateien lesen und schreiben (bypassPermissions ist aktiv)",
+    "um die Aufgabe zu erledigen. Halte alle aktiven Regeln strikt ein.",
+    "Es gibt KEIN wort-limit — schreibe so viel wie nötig, aber bleib auf der",
+    "aufgabe fokussiert (kein meta-talk).",
+    "",
+    "BLOCKER-RESOLUTION (wichtig wenn du auf hindernisse stößt):",
+    "  - Build/test/lint fehler → fixe die URSACHE im code, NICHT umgehen.",
+    "    NIEMALS: `--no-verify`, `// eslint-disable`, test-skip/xfail ohne",
+    "    bug-ticket, `@ts-ignore` ohne kommentar warum, regeln deaktivieren.",
+    "  - Fehlende dependency → installieren (npm/pub/cargo add), commit mit pkg.",
+    "  - Type-error → echten typ fixen, kein `as any` / `dynamic` ohne grund.",
+    "  - Test failt → erst test lesen + verstehen WAS er prüft, dann production",
+    "    code anpassen. Test ÄNDERN nur wenn du erklären kannst warum die",
+    "    erwartung falsch war (summary muss das nennen).",
+    "  - Konflikt mit einer aktiven REGEL → halte die regel ein, finde anderen",
+    "    weg. NIEMALS regel deaktivieren um deinen weg zu rechtfertigen.",
+    "  - Hard-block (z.b. fehlende API, externe service down) → done=false mit",
+    "    KLARER fehler-beschreibung im summary. NICHT vorgaukeln.",
+    "",
+    "SELBST-VERIFIKATION (du SOLLST nach jeder änderung verifizieren):",
+    "  - code-änderung → Bash-tool: passenden test/lint/build laufen lassen",
+    "    (npm test, flutter analyze, cargo check, pytest, etc.)",
+    "  - server-/backend-änderung → Bash: server kurz starten + curl /health",
+    "  - UI-/frontend-änderung → puppeteer-MCP: page öffnen + screenshot/dom-check",
+    "  - script-/CLI-änderung → code-runner-MCP oder Bash: echtes execution-result",
+    "  - dependencies → Bash: install + import-check",
+    "Ohne verifikation darfst du NICHT done=true melden. Wenn die verifikation",
+    "fehlschlägt, fixe den fehler im selben turn und verifiziere nochmal — keine",
+    "done=true mit 'sollte gehen'.",
+    "Server fährt automatisch build-gate (analyze/test) UND runtime-test",
+    "(server-spawn + /health) NACH deinem done=true. Wenn dein code DAS nicht",
+    "übersteht, kommt der retry mit fehler-context zurück.",
+    "",
+    "VERFÜGBARE MCP-tools (zusätzlich zu Read/Edit/Write/Bash/Glob/Grep):",
+    "  filesystem, sequential-thinking, context7 (lib-docs), puppeteer (browser),",
+    "  code-runner (run snippets), fetch (HTTP), github (issues/PRs falls token),",
+    "  memory (knowledge-graph cross-session).",
     "",
     "Gib AM ANFANG deiner Antwort einen Plan aus (3-6 konkrete Schritte),",
     "AM ENDE den Status. Format (keine Markdown-Fencing):",
@@ -1967,15 +2168,23 @@ function _startCcJob(project, taskId, prompt) {
     "",
     'done=true: aufgabe ist fertig. done=false: blockiert/teilweise. Falls keine Regel-Vorschläge: {"add":[]}.',
     "",
-    "4) WENN du eine wichtige rückfrage zum projekt hast (z.B. unklare anforderung,",
-    "   technologie-entscheidung, naming-konflikt), darfst du EINE frage stellen:",
+    "4) RÜCKFRAGEN sind STARK eingeschränkt. NIEMALS fragen für:",
+    "   - „aufgabe zu groß, wo soll ich anfangen?\" → ZERLEGE SELBST: wähle",
+    "     den kleinsten konkreten teilschritt (max 1-2h arbeit), arbeite daran,",
+    "     markiere im summary welchen teilschritt du gerade gemacht hast.",
+    "   - tech-stack / naming / file-struktur → nimm die offensichtliche option",
+    "     (das was schon im projekt ist, sonst flutter/dart-defaults), commit",
+    "     dich + mach.",
+    "   - „soll ich a, b oder c machen?\" → wähle a, mach a, fertig.",
+    "",
+    "   Du DARFST eine QUESTION stellen NUR wenn du eine EXTERNE entscheidung",
+    "   brauchst, die der user wirklich beantworten muss (z.B. API-key, design-",
+    "   richtung, business-logik die nicht aus rules/goals ableitbar ist):",
     "<<<QUESTION",
     "Deine konkrete frage in 1-3 sätzen.",
     ">>>",
-    "Stelle KEINE rückfragen für triviale entscheidungen — wenn du das selbst",
-    "entscheiden kannst, mach es. Frage NUR wenn die wahl signifikant ist und",
-    "der user wahrscheinlich eine meinung hat. Falls du fragst: kennzeichne",
-    "TASK_STATUS done=false und beschreibe was du noch nicht entschieden hast.",
+    "   Wenn du fragst: done=false UND beschreibe im summary WAS du bis dahin",
+    "   schon erledigt hast (kein leerer commit!).",
   ].filter(Boolean).join("\n");
 
   // Versuche claude CLI zu starten. Auf Windows den vollen Pfad zur npm-globalen
@@ -2005,8 +2214,14 @@ function _startCcJob(project, taskId, prompt) {
   // ref-tools ohne REF_API_KEY) werden gefiltert, sonst hängt claude beim
   // tool-call.
   const mcpConfigPath = resolveMcpConfig({ baseDir: __dirname });
+  // Task 3: stream-json + verbose → wir bekommen strukturierte events
+  // (tool_use, tool_result, result mit echten tokens) statt nur rohtext.
+  // Selbe model-tokens wie vorher (claude generiert dasselbe), nur das CLI
+  // emittiert es jsonl statt plaintext.
   const args = [
     "--print",
+    "--output-format", "stream-json",
+    "--verbose",
     "--permission-mode", "bypassPermissions",
     "--dangerously-skip-permissions",
     "--tools", "default",
@@ -2039,7 +2254,17 @@ function _startCcJob(project, taskId, prompt) {
     throw err;
   }
 
-  const job = { proc, startedAt: NOW(), taskId, prompt: fullPrompt, lines: [], cwd };
+  // Task 3: parser für stream-json. Hält line-buffer, liefert events.
+  const streamParser = createStreamJsonParser();
+  const job = {
+    proc, startedAt: NOW(), taskId, prompt: fullPrompt, lines: [], cwd,
+    // Stream-json gefiltert: nur assistant text-content → für regex-parser
+    // (TASK_PLAN/TASK_STATUS/RULE_SUGGESTIONS/QUESTION) am ende.
+    assistantText: "",
+    // Tool-use-events für UI-history (begrenzt auf 200, älteste fliegen).
+    toolEvents: [],
+    realUsage: null, // wird aus result-event gefüllt
+  };
   ccJobs.set(projectId, job);
   console.log("[cc] start", projectId, "in", cwd, "task:", task?.title || prompt);
 
@@ -2065,57 +2290,15 @@ function _startCcJob(project, taskId, prompt) {
   }, 1500);
   job._thinkingTimer = thinkingTimer;
 
+  // Task 3: stream-json stdout-handler. Pro event entscheiden wir was zu tun
+  // ist; alles strukturiert, kein regex-fishing mehr im rohstream.
   proc.stdout.on("data", (chunk) => {
-    const text = chunk.toString();
-    job.lines.push(text);
-    // Bugfix (UI): protocol-marker (<<<TASK_PLAN, <<<TASK_STATUS,
-    // <<<RULE_SUGGESTIONS, <<<QUESTION) NICHT als rohtext ins UI streamen.
-    job.inProtocolBlock = job.inProtocolBlock || false;
-    const cleanLines = [];
-    for (const raw of text.split(/\r?\n/)) {
-      if (/^<<<(TASK_PLAN|TASK_STATUS|RULE_SUGGESTIONS|QUESTION)/.test(raw)) {
-        job.inProtocolBlock = true; continue;
-      }
-      if (job.inProtocolBlock) {
-        if (raw.trim() === ">>>") job.inProtocolBlock = false;
-        continue;
-      }
-      if (raw.trim() === ">>>") continue; // safety
-      cleanLines.push(raw);
+    job.lines.push(chunk.toString()); // raw fallback für debug
+    const events = streamParser.feed(chunk.toString());
+    for (const ev of events) {
+      _handleCcStreamEvent(job, ev);
     }
-    const cleanText = cleanLines.join("\n");
-    broadcastForProject({ type: "CC_OUTPUT", projectId, chunk: cleanText }, projectId);
-    cleanLines.filter(Boolean).slice(0, 3).forEach(line => {
-      applyMutation("ADD_ACTIVITY", { projectId, event: {
-        type: "write",
-        text: "cc: " + escapeHtml(line.slice(0, 200)),
-      }});
-    });
-
-    // TASK_PLAN parsen sobald sichtbar (einmalig pro Job): zeigt Sub-Tasks
-    // schon während claude noch arbeitet. Wir merken planParsed=true im Job.
-    if (!job.planParsed && taskId) {
-      const fullSoFar = job.lines.join("");
-      const planM = fullSoFar.match(/<<<TASK_PLAN\s*([\s\S]*?)\s*>>>/);
-      if (planM) {
-        job.planParsed = true;
-        try {
-          const plan = JSON.parse(planM[1].trim());
-          if (Array.isArray(plan.steps)) {
-            const cleanSteps = plan.steps.map(s => String(s).replace(/^\s*\d+[.)]\s*/, "").trim()).filter(Boolean).slice(0, 8);
-            cleanSteps.forEach(stepText => {
-              applyMutation("ADD_SUBTASK", { projectId, taskId, subtask: { title: stepText, done: false } });
-            });
-            applyMutation("ADD_ACTIVITY", { projectId, event: {
-              type: "info",
-              text: `cc plan: ${cleanSteps.length} schritte`,
-            }});
-          }
-        } catch (e) { console.log("[cc] task_plan parse failed:", e.message); }
-      }
-    }
-
-    broadcastState();
+    if (events.length > 0) broadcastState();
   });
 
   proc.stderr.on("data", (chunk) => {
@@ -2130,11 +2313,16 @@ function _startCcJob(project, taskId, prompt) {
     cleanupResolvedConfig(mcpConfigPath);
     console.log("[cc] done", projectId, "exit", code);
 
-    const fullOutput = job.lines.join("");
+    // Flush parser (letzte zeile ohne newline)
+    for (const ev of streamParser.flush()) _handleCcStreamEvent(job, ev);
+
+    // Für die regex-parser unten: assistant-text aus stream-json
+    // (statt rohstdout — der ist jetzt jsonl, regex würde fehlschlagen)
+    const fullOutput = job.assistantText || job.lines.join("");
 
     // Claude-API-Limit erkennen → Auto-Pump für 10 Minuten pausieren
-    // damit nicht endlos fehlgeschlagene Calls gefeuert werden.
-    if (/hit your limit|rate limit|usage limit/i.test(fullOutput)) {
+    if (/hit your limit|rate limit|usage limit/i.test(fullOutput) ||
+        /hit your limit|rate limit|usage limit/i.test(job.lines.join(""))) {
       _ccApiLimitedUntil = NOW() + 10 * 60 * 1000;
       console.log("[autopump] claude API limited — pausiere bis", new Date(_ccApiLimitedUntil).toLocaleTimeString());
       applyMutation("ADD_ACTIVITY", { projectId, event: {
@@ -2143,13 +2331,22 @@ function _startCcJob(project, taskId, prompt) {
       }});
     }
 
-    // Token-Schätzung (claude --output-format text → wir parsen nicht direkt
-    // sondern schätzen 1 token ≈ 4 chars). Cost: Sonnet-4 Pricing als Default.
-    const inputTokens = Math.round(fullPrompt.length / 4);
-    const outputTokens = Math.round(fullOutput.length / 4);
-    const PRICE_IN = 3.0 / 1_000_000;   // $3/MTok input  (Sonnet 4.x)
-    const PRICE_OUT = 15.0 / 1_000_000; // $15/MTok output
-    const estCostUsd = inputTokens * PRICE_IN + outputTokens * PRICE_OUT;
+    // Task 3: ECHTE token-zahlen aus result-event statt char/4-schätzung.
+    // Fallback: alte schätzung wenn result fehlte (z.b. crash vor result).
+    let inputTokens, outputTokens, estCostUsd, cacheCreated, cacheRead;
+    if (job.realUsage) {
+      inputTokens = job.realUsage.tokensIn;
+      outputTokens = job.realUsage.tokensOut;
+      cacheCreated = job.realUsage.cacheCreated;
+      cacheRead = job.realUsage.cacheRead;
+      estCostUsd = typeof job.realUsage.costUsd === "number" ? job.realUsage.costUsd : 0;
+    } else {
+      inputTokens = Math.round(fullPrompt.length / 4);
+      outputTokens = Math.round(fullOutput.length / 4);
+      cacheCreated = 0; cacheRead = 0;
+      const PRICE_IN = 3.0 / 1_000_000, PRICE_OUT = 15.0 / 1_000_000;
+      estCostUsd = inputTokens * PRICE_IN + outputTokens * PRICE_OUT;
+    }
     const durationMs = NOW() - job.startedAt;
 
     // Globaler Tracker
@@ -2158,13 +2355,18 @@ function _startCcJob(project, taskId, prompt) {
     state.ccBudget.totalTokensOut += outputTokens;
     state.ccBudget.totalCostUsd += estCostUsd;
     state.ccBudget.jobs = [
-      { projectId, taskId, ts: NOW(), inputTokens, outputTokens, costUsd: estCostUsd, durationMs, ok: code === 0 },
+      { projectId, taskId, ts: NOW(), inputTokens, outputTokens,
+        cacheCreated, cacheRead, costUsd: estCostUsd, durationMs,
+        ok: code === 0, real: !!job.realUsage },
       ...(state.ccBudget.jobs || []),
     ].slice(0, 100);
 
+    const cacheTxt = cacheCreated || cacheRead
+      ? ` · cache: ${(cacheCreated/1000).toFixed(1)}k created · ${(cacheRead/1000).toFixed(1)}k read`
+      : "";
     applyMutation("ADD_ACTIVITY", { projectId, event: {
       type: "info",
-      text: `tokens: ${inputTokens.toLocaleString("de")} in · ${outputTokens.toLocaleString("de")} out · ~$${estCostUsd.toFixed(4)} · ${(durationMs/1000).toFixed(1)}s`,
+      text: `tokens: ${inputTokens.toLocaleString("de")} in · ${outputTokens.toLocaleString("de")} out · $${estCostUsd.toFixed(4)}${job.realUsage ? "" : " (geschätzt)"} · ${(durationMs/1000).toFixed(1)}s${cacheTxt}`,
     }});
 
     // QUESTION-Block: claude hat rückfrage → in project.pendingQuestion speichern,
@@ -2172,7 +2374,7 @@ function _startCcJob(project, taskId, prompt) {
     const qm = fullOutput.match(/<<<QUESTION\s*([\s\S]*?)\s*>>>/);
     if (qm && qm[1].trim()) {
       const qText = qm[1].trim().slice(0, 1000);
-      applyMutation("SET_PENDING_QUESTION", { projectId, question: qText });
+      applyMutation("SET_PENDING_QUESTION", { projectId, question: qText, taskId });
       applyMutation("ADD_ACTIVITY", { projectId, event: {
         type: "info", text: "claude fragt zurück: <i>" + escapeHtml(qText.slice(0, 120)) + "</i>",
       }});
@@ -2196,41 +2398,218 @@ function _startCcJob(project, taskId, prompt) {
     }
 
     if (parsedStatus && parsedStatus.done === true && taskId) {
-      // Self-Review starten (async, blockiert nicht)
-      runSelfReview(project, taskId, parsedStatus, fullOutput).then(review => {
-        const taskNow = state.projects.find(p=>p.id===projectId)?.tasks.find(t=>t.id===taskId);
+      // ─── BUILD-GATE + FAILURE-LOOP ─────────────────────────
+      // Erst echten build-/test-check fahren (flutter analyze, npm test, ...).
+      // Wenn der gate rot ist: KEIN checkmark, sondern retry mit fehler-context.
+      // Wenn skipped (keine bekannte tech): direkt zu self-review.
+      // Wenn grün: self-review wie bisher.
+      applyMutation("ADD_ACTIVITY", { projectId, event: {
+        type: "info",
+        text: `build-gate läuft (${project.tech || "?"}) …`,
+      }});
+      broadcastState();
+
+      runBuildGate({ projectPath: project.path }).then(async (gate) => {
+        const projNow = state.projects.find(p => p.id === projectId);
+        const taskNow = projNow && projNow.tasks.find(t => t.id === taskId);
         if (!taskNow) return;
-        if (review.ok) {
-          // Alle offenen Sub-Tasks abhaken (vom TASK_PLAN erstellt)
-          (taskNow.subtasks || []).filter(s => !s.done).forEach(s => {
-            applyMutation("TOGGLE_SUBTASK", { projectId, taskId, subtaskId: s.id });
-          });
-          applyMutation("TOGGLE_TASK", { projectId, taskId });
+
+        if (gate.skipped) {
+          applyMutation("ADD_ACTIVITY", { projectId, event: {
+            type: "info",
+            text: "build-gate übersprungen (keine bekannte project-tech)",
+          }});
+        } else if (gate.ok) {
+          // Gate grün → retry-state clearen, self-review startet
+          _ccRetryContext.delete(taskId);
           applyMutation("ADD_ACTIVITY", { projectId, event: {
             type: "check",
-            text: `cc auto-checkmark: <i>${escapeHtml(taskNow.title)}</i>` +
-                  (parsedStatus.summary ? ` · ${escapeHtml(parsedStatus.summary)}` : "") +
-                  ` · review ok (${Math.round(review.confidence * 100)}%)`,
+            text: `build-gate ok (${gate.kind}, ${(gate.durationMs/1000).toFixed(1)}s)`,
           }});
         } else {
+          // Gate rot → failure-loop
+          const prev = _ccRetryContext.get(taskId);
+          const attempt = (prev?.attempt || 0) + 1;
+          const reason = gate.timedOut ? "timeout"
+                       : gate.commandMissing ? "tool fehlt (" + gate.kind + ")"
+                       : "exit " + gate.exitCode;
           applyMutation("ADD_ACTIVITY", { projectId, event: {
             type: "warn",
-            text: `cc self-review fand issues bei <i>${escapeHtml(taskNow.title)}</i>: ` +
-                  review.issues.slice(0, 3).map(escapeHtml).join(" · "),
+            text: `build-gate <strong>FAIL</strong> (${gate.kind} · ${reason}, ${(gate.durationMs/1000).toFixed(1)}s)`,
+          }});
+          if (attempt < MAX_CC_RETRIES && !gate.commandMissing) {
+            // Retry: error-context speichern, gleichen task nochmal triggern
+            _ccRetryContext.set(taskId, {
+              attempt, kind: gate.kind, exitCode: gate.exitCode,
+              output: gate.output, projectId,
+            });
+            applyMutation("ADD_ACTIVITY", { projectId, event: {
+              type: "info",
+              text: `cc retry ${attempt}/${MAX_CC_RETRIES} startet in 3s mit fehler-context…`,
+            }});
+            broadcastState();
+            setTimeout(() => {
+              triggerCc(projectId, taskId, null).catch((e) => {
+                console.log("[cc-retry] trigger fehler:", e.message);
+              });
+            }, 3000);
+            return; // KEIN self-review, kein checkmark
+          }
+          // Max retries (oder tool fehlt) → task bleibt offen, in_progress, mit warnung
+          _ccRetryContext.delete(taskId);
+          applyMutation("EDIT_TASK", { projectId, taskId, patch: {
+            meta: (taskNow.meta ? taskNow.meta + " · " : "") + `blockiert (build-gate fail ${attempt}×)`,
           }});
           applyMutation("ADD_SYNC_LOG", { entry: {
             source: "cloud", projectId,
-            text: `cc self-review BLOCKIERT auto-checkmark (${review.issues.length} issue(s))`,
+            text: `cc max-retries auf <i>${escapeHtml(taskNow.title)}</i>: build-gate ${attempt}× rot`,
           }});
+          broadcastState();
+          return; // wieder kein self-review
         }
-        broadcastState();
+
+        // ─── RUNTIME-TEST (Task 4) ────────────────────────────
+        // Programmatisch: dev-server starten, /health probe, kill. Kein LLM.
+        // Smart-trigger: nur wenn runtime-relevante files (server.js, *.jsx, etc.)
+        // geändert wurden. Bei fail: failure-loop (selbe retry-mechanik wie build-gate).
+        const rtResult = await runRuntimeTest({
+          projectPath: project.path,
+          filesChanged: parsedStatus.filesChanged || [],
+        }).catch(e => ({ ok: true, skipped: true, kind: "error", output: e && e.message }));
+
+        if (rtResult.skipped) {
+          // skip → kein log-eintrag (würde nur spammen)
+        } else if (rtResult.ok) {
+          applyMutation("ADD_ACTIVITY", { projectId, event: {
+            type: "check",
+            text: `runtime ok (${rtResult.kind}, ${(rtResult.durationMs/1000).toFixed(1)}s)`,
+          }});
+        } else {
+          // runtime fail → identische failure-loop wie build-gate
+          const prev = _ccRetryContext.get(taskId);
+          const attempt = (prev?.attempt || 0) + 1;
+          applyMutation("ADD_ACTIVITY", { projectId, event: {
+            type: "warn",
+            text: `runtime <strong>FAIL</strong> (${rtResult.kind}, ${(rtResult.durationMs/1000).toFixed(1)}s)`,
+          }});
+          if (attempt < MAX_CC_RETRIES) {
+            _ccRetryContext.set(taskId, {
+              attempt, kind: "runtime-" + rtResult.kind, exitCode: null,
+              output: rtResult.output, projectId,
+            });
+            applyMutation("ADD_ACTIVITY", { projectId, event: {
+              type: "info",
+              text: `cc retry ${attempt}/${MAX_CC_RETRIES} startet in 3s (runtime-fail)…`,
+            }});
+            broadcastState();
+            setTimeout(() => {
+              triggerCc(projectId, taskId, null).catch((e) => {
+                console.log("[cc-runtime-retry] trigger fehler:", e.message);
+              });
+            }, 3000);
+            return; // kein self-review, kein checkmark
+          }
+          _ccRetryContext.delete(taskId);
+          applyMutation("EDIT_TASK", { projectId, taskId, patch: {
+            meta: (tn.meta ? tn.meta + " · " : "") + `blockiert (runtime fail ${attempt}×)`,
+          }});
+          broadcastState();
+          return;
+        }
+
+        // ─── SELF-REVIEW (gate grün, runtime grün) ────────────
+        runSelfReview(project, taskId, parsedStatus, fullOutput).then(review => {
+          const tn = state.projects.find(p=>p.id===projectId)?.tasks.find(t=>t.id===taskId);
+          if (!tn) return;
+          if (review.ok) {
+            (tn.subtasks || []).filter(s => !s.done).forEach(s => {
+              applyMutation("TOGGLE_SUBTASK", { projectId, taskId, subtaskId: s.id });
+            });
+            applyMutation("TOGGLE_TASK", { projectId, taskId });
+            applyMutation("ADD_ACTIVITY", { projectId, event: {
+              type: "check",
+              text: `cc auto-checkmark: <i>${escapeHtml(tn.title)}</i>` +
+                    (parsedStatus.summary ? ` · ${escapeHtml(parsedStatus.summary)}` : "") +
+                    ` · review ok (${Math.round(review.confidence * 100)}%)`,
+            }});
+            // Per-task git-commit (Task 7) — rollback-fähig, audit-trail.
+            // Async, blockiert nicht; ergebnis als activity-event.
+            if (gitIsRepo(project.path)) {
+              gitCommitChanges({
+                projectPath: project.path,
+                message: "[cc] " + tn.title +
+                  (parsedStatus.summary ? " · " + parsedStatus.summary.slice(0, 80) : ""),
+                authorName: "cloud-code",
+                authorEmail: "cc@projectgamma.local",
+              }).then((g) => {
+                if (g.committed) {
+                  applyMutation("ADD_ACTIVITY", { projectId, event: {
+                    type: "info",
+                    text: `git commit <code>${escapeHtml(g.sha)}</code>`,
+                  }});
+                  broadcastState();
+                } else if (g.error) {
+                  applyMutation("ADD_ACTIVITY", { projectId, event: {
+                    type: "warn", text: `git-commit fehler: ${escapeHtml(g.error.slice(0, 200))}`,
+                  }});
+                  broadcastState();
+                }
+                // g.skipped: silent — kein commit, kein log-spam
+              }).catch((e) => { console.log("[git] commit-error:", e && e.message); });
+            }
+            // Bug-auto-resolve: wenn cc files berührt hat, die auf eine pending-bug-location passen,
+            // markiere die bugs als "potentially-fixed". User kann via UI bestätigen oder reopen.
+            // 0 LLM-tokens — reine heuristik auf filesChanged ∩ bug.location.
+            if (Array.isArray(parsedStatus.filesChanged) && parsedStatus.filesChanged.length) {
+              const proj = state.projects.find(p => p.id === projectId);
+              const pendingBugs = (proj?.bugs || []).filter(b => b.status === "pending");
+              const changedNorm = parsedStatus.filesChanged.map(f =>
+                String(f).replace(/\\/g, "/").toLowerCase());
+              let resolved = 0;
+              for (const b of pendingBugs) {
+                if (!b.location) continue;
+                const loc = b.location.replace(/\\/g, "/").toLowerCase();
+                // Match: bug.location ist substring eines geänderten files
+                const hit = changedNorm.some(f => f.includes(loc.split(":")[0]) || loc.includes(f));
+                if (hit) {
+                  applyMutation("SET_BUG_STATUS", { projectId, bugId: b.id, status: "potentially-fixed" });
+                  resolved++;
+                }
+              }
+              if (resolved > 0) {
+                applyMutation("ADD_ACTIVITY", { projectId, event: {
+                  type: "check",
+                  text: `${resolved} bug(s) als potentiell-fixed markiert (datei-overlap mit cc-änderung)`,
+                }});
+                broadcastState();
+              }
+            }
+          } else {
+            applyMutation("ADD_ACTIVITY", { projectId, event: {
+              type: "warn",
+              text: `cc self-review fand issues bei <i>${escapeHtml(tn.title)}</i>: ` +
+                    review.issues.slice(0, 3).map(escapeHtml).join(" · "),
+            }});
+            applyMutation("ADD_SYNC_LOG", { entry: {
+              source: "cloud", projectId,
+              text: `cc self-review BLOCKIERT auto-checkmark (${review.issues.length} issue(s))`,
+            }});
+          }
+          broadcastState();
+        }).catch(e => {
+          console.log("[selfreview] error:", e.message);
+          applyMutation("TOGGLE_TASK", { projectId, taskId });
+          applyMutation("ADD_ACTIVITY", { projectId, event: {
+            type: "check",
+            text: `cc auto-checkmark (review skipped: ${escapeHtml(e.message)})`,
+          }});
+          broadcastState();
+        });
       }).catch(e => {
-        console.log("[selfreview] error:", e.message);
-        // Bei Fehler: Task trotzdem mark done (fallback auf altes Verhalten)
-        applyMutation("TOGGLE_TASK", { projectId, taskId });
+        // build-gate selbst crashed → fall through zu self-review (fail-open)
+        console.log("[build-gate] error, fall-through:", e && e.message);
         applyMutation("ADD_ACTIVITY", { projectId, event: {
-          type: "check",
-          text: `cc auto-checkmark (review skipped: ${escapeHtml(e.message)})`,
+          type: "warn", text: `build-gate crash, übersprungen: ${escapeHtml(e.message || "?")}`,
         }});
         broadcastState();
       });
@@ -2336,6 +2715,106 @@ function _startCcJob(project, taskId, prompt) {
   return { ok: true, projectId, startedAt: job.startedAt };
 }
 
+// Task 3 · Pro stream-json-event: state-update + broadcast.
+// Keine LLM-tokens — alles deterministisch aus dem cli-output abgeleitet.
+function _handleCcStreamEvent(job, ev) {
+  const projectId = (state.projects.find(p =>
+    Array.from(ccJobs.entries()).some(([pid, j]) => j === job && pid === p.id)) || {}).id;
+  if (!projectId) return;
+  if (ev.kind === "init") {
+    applyMutation("ADD_ACTIVITY", { projectId, event: {
+      type: "info",
+      text: `claude-session start · ${(ev.mcpServers || []).filter(m => m.status === "connected").map(m => m.name).join(", ") || "(keine MCPs)"}`,
+    }});
+    return;
+  }
+  if (ev.kind === "text") {
+    job.assistantText += ev.text;
+    // Stream nur clean-text (ohne protocol-blöcke) an UI
+    const clean = ev.text
+      .replace(/<<<(TASK_PLAN|TASK_STATUS|RULE_SUGGESTIONS|QUESTION)[\s\S]*?>>>/g, "");
+    if (clean.trim()) {
+      broadcastForProject({ type: "CC_OUTPUT", projectId, chunk: clean }, projectId);
+    }
+    // TASK_PLAN sobald komplett: subtasks anlegen (war im alten flow auch so).
+    if (!job.planParsed && job.taskId) {
+      const planM = job.assistantText.match(/<<<TASK_PLAN\s*([\s\S]*?)\s*>>>/);
+      if (planM) {
+        job.planParsed = true;
+        try {
+          const plan = JSON.parse(planM[1].trim());
+          if (Array.isArray(plan.steps)) {
+            const steps = plan.steps.map(s => String(s).replace(/^\s*\d+[.)]\s*/, "").trim())
+              .filter(Boolean).slice(0, 8);
+            steps.forEach(stepText => {
+              applyMutation("ADD_SUBTASK", { projectId, taskId: job.taskId,
+                subtask: { title: stepText, done: false } });
+            });
+            applyMutation("ADD_ACTIVITY", { projectId, event: {
+              type: "info", text: `cc plan: ${steps.length} schritte`,
+            }});
+          }
+        } catch (e) { /* swallow */ }
+      }
+    }
+    return;
+  }
+  if (ev.kind === "tool_use") {
+    // Live-tool-event: broadcast für UI + activity (für persistente history)
+    job.toolEvents.push({
+      id: ev.id, tool: ev.tool, glyph: ev.glyph,
+      summary: ev.summary, ts: NOW(), state: "running",
+    });
+    if (job.toolEvents.length > 200) job.toolEvents.shift();
+    broadcastForProject({
+      type: "CC_TOOL_EVENT", projectId,
+      phase: "use", id: ev.id, tool: ev.tool, glyph: ev.glyph, summary: ev.summary, ts: NOW(),
+    }, projectId);
+    // Activity-event nur für „interessante" tools (sonst log-spam):
+    // Read/Glob/Grep sind read-only, machen 80% der events aus → nur „write" events ins log.
+    if (["Edit", "Write", "MultiEdit", "Bash", "PowerShell"].includes(ev.tool)) {
+      applyMutation("ADD_ACTIVITY", { projectId, event: {
+        type: ev.tool === "Bash" || ev.tool === "PowerShell" ? "info" : "write",
+        text: `${ev.glyph} <code>${escapeHtml(ev.tool)}</code> ${escapeHtml(ev.summary || "")}`.slice(0, 200),
+      }});
+    }
+    return;
+  }
+  if (ev.kind === "tool_result") {
+    const te = job.toolEvents.find(t => t.id === ev.id);
+    if (te) { te.state = ev.isError ? "error" : "ok"; te.brief = ev.brief; }
+    broadcastForProject({
+      type: "CC_TOOL_EVENT", projectId,
+      phase: "result", id: ev.id, tool: ev.tool, isError: ev.isError, brief: ev.brief, ts: NOW(),
+    }, projectId);
+    if (ev.isError) {
+      applyMutation("ADD_ACTIVITY", { projectId, event: {
+        type: "warn",
+        text: `⚠ ${escapeHtml(ev.tool)} fehler: ${escapeHtml((ev.brief || "").slice(0, 120))}`,
+      }});
+    }
+    return;
+  }
+  if (ev.kind === "thinking") {
+    // Optional sichtbar machen — kompakt
+    broadcastForProject({
+      type: "CC_THINKING_TEXT", projectId, text: ev.text.slice(0, 200),
+    }, projectId);
+    return;
+  }
+  if (ev.kind === "result") {
+    job.realUsage = {
+      tokensIn: ev.tokensIn || 0,
+      tokensOut: ev.tokensOut || 0,
+      cacheCreated: ev.cacheCreated || 0,
+      cacheRead: ev.cacheRead || 0,
+      costUsd: ev.costUsd,
+      durationMs: ev.durationMs,
+    };
+    return;
+  }
+}
+
 app.post("/api/cc/stop", authMw, (req, res) => {
   const { projectId } = req.body || {};
   const project = state.projects.find(p => p.id === projectId);
@@ -2372,6 +2851,89 @@ app.post("/api/cc/suggest", authMw, async (req, res) => {
   if (!_requireProjectAccess(req, res, project, ROLES.MEMBER)) return;
   runSuggestionAnalysis(project).catch(e => console.log("[suggest] error:", e.message));
   res.json({ ok: true });
+});
+
+// Task 6 · Task-Dekomposition: cc zerlegt einen großen task vorab in 3-8
+// subtasks. User-getriggert (button-klick), nicht auto. Cap budget 0.20$.
+app.post("/api/cc/decompose", authMw, async (req, res) => {
+  const { projectId, taskId } = req.body || {};
+  const project = state.projects.find(p => p.id === projectId);
+  if (!project) return res.status(404).json({ error: "projekt nicht gefunden" });
+  if (!_requireProjectAccess(req, res, project, ROLES.MEMBER)) return;
+  const task = (project.tasks || []).find(t => t.id === taskId);
+  if (!task) return res.status(404).json({ error: "task nicht gefunden" });
+  res.json({ ok: true });
+  runTaskDecompose(project, task).catch(e => console.log("[decompose] error:", e.message));
+});
+
+// M2 · Cleanup: existing cc-vorgeschlagene regeln + pending rule_diffs,
+// die nach dem strengeren classifier eigentlich Ideen sind, rückwirkend
+// umrouten. 0 LLM-tokens — reine classifier-anwendung.
+//
+// Drei stufen:
+//   1) inactive cc-rules → ideas (waren nie vom user approved)
+//   2) pending rule_diffs für ideen-artige rules → rejected + idea
+//   3) optional `aggressive`: auch active cc-rules → ideas (war approve war
+//      irrtum; user bestätigt via dialog vorher)
+app.post("/api/projects/:id/rules/cleanup", authMw, (req, res) => {
+  const project = state.projects.find(p => p.id === req.params.id);
+  if (!project) return res.status(404).json({ error: "projekt nicht gefunden" });
+  if (!_requireProjectAccess(req, res, project, ROLES.OWNER)) return;
+  const aggressive = !!(req.body && req.body.aggressive);
+  const before = (project.rules || []).length;
+  const beforeDiffs = ((project.ruleDiffs || []).filter(d => d.status === "pending")).length;
+
+  const movedToIdea = [];
+  const kept = [];
+  for (const r of (project.rules || [])) {
+    const kind = classifyRuleOrIdea(r.text || "");
+    const isCc = r.suggestedBy === "cloud-code";
+    const move = kind === "idea" && isCc && (r.active === false || aggressive);
+    if (move) movedToIdea.push(r);
+    else kept.push(r);
+  }
+
+  // Pending rule_diffs: bei ideen-artigen referenz-rules → reject + zu idea
+  const diffsKept = [];
+  let rejectedDiffs = 0;
+  for (const d of (project.ruleDiffs || [])) {
+    if (d.status !== "pending") { diffsKept.push(d); continue; }
+    const kind = classifyRuleOrIdea(d.text || "");
+    if (kind === "idea") {
+      diffsKept.push({ ...d, status: "rejected" });
+      // Auch zu idea machen
+      movedToIdea.push({ text: d.text, suggestedBy: "cloud-code" });
+      rejectedDiffs++;
+    } else {
+      diffsKept.push(d);
+    }
+  }
+
+  // State mutieren: ideen anhängen (dedup), rules ersetzen, rule_diffs ersetzen
+  const ideaTexts = new Set((project.ideas || []).map(i => (i.text || "").trim().toLowerCase()));
+  let addedIdeas = 0;
+  for (const r of movedToIdea) {
+    const txt = (r.text || "").trim();
+    if (!txt || ideaTexts.has(txt.toLowerCase())) continue;
+    ideaTexts.add(txt.toLowerCase());
+    applyMutation("ADD_IDEA", { projectId: project.id, idea: {
+      text: txt, status: "unprocessed", source: "cloud-code", createdAt: NOW(),
+    }});
+    addedIdeas++;
+  }
+  applyMutation("PATCH_PROJECT", { projectId: project.id,
+    patch: { rules: kept, ruleDiffs: diffsKept } });
+  applyMutation("ADD_ACTIVITY", { projectId: project.id, event: {
+    type: "rule",
+    text: `regel-cleanup: ${movedToIdea.length - rejectedDiffs} task-artige cc-regeln + ${rejectedDiffs} pending-diffs → ideen (${addedIdeas} neu)`,
+  }});
+  broadcastState();
+  res.json({
+    ok: true, projectId: project.id,
+    rulesBefore: before, rulesAfter: kept.length,
+    diffsBefore: beforeDiffs, diffsRejected: rejectedDiffs,
+    movedToIdea: movedToIdea.length, addedAsNewIdea: addedIdeas,
+  });
 });
 
 // AI-Summarize: kürzt eine lange beschreibung auf max ~120 chars (eine zeile).
@@ -2570,7 +3132,7 @@ function publicState(session) {
 }
 
 // ─── Vorschläge + Bug-Hunt (claude-Analyse-Pässe) ──────────
-function _spawnClaudeReadOnly(project, prompt) {
+function _spawnClaudeReadOnly(project, prompt, opts) {
   const cwd = project.path && fs.existsSync(project.path) ? project.path : process.cwd();
   const claudeBin = (function () {
     if (process.platform !== "win32") return "claude";
@@ -2578,13 +3140,15 @@ function _spawnClaudeReadOnly(project, prompt) {
     return fs.existsSync(p) ? p : "claude.cmd";
   })();
   const mcpConfigPath = resolveMcpConfig({ baseDir: __dirname });
+  // Token-spar: caller darf budget runtersetzen (z.B. decompose nur 0.20$).
+  const budget = (opts && typeof opts.maxBudgetUsd === "number") ? String(opts.maxBudgetUsd) : "1.0";
   const args = [
     "--print",
     "--permission-mode", "bypassPermissions",
     "--dangerously-skip-permissions",
     "--tools", "default",
     "--add-dir", cwd,
-    "--max-budget-usd", "1.0",
+    "--max-budget-usd", budget,
   ];
   if (mcpConfigPath) args.push("--mcp-config", mcpConfigPath);
 
@@ -2605,6 +3169,61 @@ function _spawnClaudeReadOnly(project, prompt) {
     proc.stdin.write(prompt);
     proc.stdin.end();
   });
+}
+
+// Task 6 · Dekomposition: ein epic-task → 3-8 subtasks vorab anlegen.
+// Token-spar-design: ein einziger readonly-call, kurzer prompt, output cap.
+// User-getriggert (decompose-button), läuft nicht automatisch.
+async function runTaskDecompose(project, task) {
+  const projectId = project.id;
+  if ((task.subtasks || []).length >= 3) {
+    applyMutation("ADD_ACTIVITY", { projectId, event: {
+      type: "info", text: `dekompose übersprungen — task hat schon ${task.subtasks.length} subtasks`,
+    }});
+    broadcastState();
+    return;
+  }
+  applyMutation("ADD_ACTIVITY", { projectId, event: {
+    type: "info", text: `dekompose startet: <i>${escapeHtml(task.title)}</i>`,
+  }});
+  broadcastState();
+
+  const activeRules = (project.rules || []).filter(r => r.active).slice(0, 8).map(r => "- " + r.text);
+  const prompt = [
+    "Zerlege diese aufgabe in 3-8 konkrete, umsetzbare unterschritte.",
+    "Projekt: " + project.name + " (" + project.tech + ").",
+    "Aktive regeln (auswahl):\n" + activeRules.join("\n"),
+    "",
+    "AUFGABE: " + task.title + (task.meta ? "\nMeta: " + task.meta : ""),
+    "",
+    "Antworte NUR mit dem JSON-block (keine erklärung davor/danach):",
+    "<<<SUBTASKS",
+    '["1. Konkreter schritt", "2. Nächster schritt", "..."]',
+    ">>>",
+  ].join("\n");
+
+  const out = await _spawnClaudeReadOnly(project, prompt, { maxBudgetUsd: 0.2 });
+  const m = out.match(/<<<SUBTASKS\s*([\s\S]*?)\s*>>>/);
+  let count = 0;
+  if (m) {
+    try {
+      const list = JSON.parse(m[1].trim());
+      if (Array.isArray(list)) {
+        for (const raw of list.slice(0, 8)) {
+          const clean = String(raw).replace(/^\s*\d+[.)]\s*/, "").trim();
+          if (!clean) continue;
+          applyMutation("ADD_SUBTASK", { projectId, taskId: task.id,
+            subtask: { title: clean.slice(0, 200), done: false } });
+          count++;
+        }
+      }
+    } catch (e) { console.log("[decompose] parse fail:", e.message); }
+  }
+  applyMutation("ADD_ACTIVITY", { projectId, event: {
+    type: count > 0 ? "check" : "warn",
+    text: `dekompose fertig · ${count} subtasks erzeugt`,
+  }});
+  broadcastState();
 }
 
 async function runSuggestionAnalysis(project) {
