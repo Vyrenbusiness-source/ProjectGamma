@@ -2424,6 +2424,8 @@ function App() {
 
   return (
     <div className="app">
+      {/* Setup-check banner: zeigt fehlende deps für first-user — verschwindet automatisch wenn alle critical-deps da */}
+      {window.SetupBanner && <window.SetupBanner serverUrl={client.serverUrl} />}
       <div className="titlebar">
         <span className="dot" /><span className="dot" /><span className="dot" />
         {/* D1 · Hamburger-toggle sichtbar nur auf <768px (CSS class .mobile-only) */}

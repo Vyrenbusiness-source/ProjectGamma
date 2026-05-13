@@ -36,6 +36,7 @@ const { runBuildGate } = require("./lib/build_gate");
 const { commitChanges: gitCommitChanges, isGitRepo: gitIsRepo, listCcCommits: gitListCcCommits, rollbackLastCommit: gitRollbackLast } = require("./lib/git_commit");
 const { createStreamJsonParser } = require("./lib/stream_json_parser");
 const { runRuntimeTest } = require("./lib/runtime_test");
+const { runSetupCheck } = require("./lib/setup_check");
 const { createUserSettingsStore, KNOWN_KEYS: SETTING_KEYS } = require("./lib/user_settings");
 const { createUpnpPortmap } = require("./lib/upnp_portmap");
 const { createPublicIpResolver } = require("./lib/public_ip");
@@ -1106,6 +1107,28 @@ function _rankLanIp(ip) {
   if (/^172\.(1[6-9]|2[0-9]|3[01])\./.test(ip)) return 20; // 172.16-31
   return 10;
 }
+// Setup-check: erste user merken sofort wenn deps fehlen. Public-endpoint
+// (kein auth) damit UI vor pairing pingen kann. Resultat wird 30s gecached
+// damit der UI-poll nicht jede prüfung erneut spawned (~1s pro check).
+let _setupCache = null;
+let _setupCacheTs = 0;
+const SETUP_CACHE_MS = 30 * 1000;
+app.get("/api/setup-check", async (req, res) => {
+  const force = req.query.force === "1";
+  const now = NOW();
+  if (!force && _setupCache && (now - _setupCacheTs) < SETUP_CACHE_MS) {
+    return res.json({ ...{}, ..._setupCache, cached: true });
+  }
+  try {
+    const result = await runSetupCheck({ baseDir: path.resolve(__dirname, "..") });
+    _setupCache = result;
+    _setupCacheTs = now;
+    res.json({ ...result, cached: false });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 app.get("/api/network-info", (req, res) => {
   const ifaces = require("os").networkInterfaces();
   const lanIps = [];
