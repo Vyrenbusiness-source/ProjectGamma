@@ -1700,6 +1700,73 @@ app.post("/api/auth/login", async (req, res) => {
 // Admin-reset-password — localhost-only. Owner kann am desktop einen
 // vergessenen account-password zurücksetzen (eigenen oder eingeladenen).
 // Schutz: nur von 127.0.0.1 + localhost-hostname (isLocalRequest).
+// Claim-invite: einfacher flow für eingeladene user — sie geben ihre
+// email ein, server prüft pending_invites, erstellt user automatisch
+// mit zufalls-passwort + session, klappt direkt. kein register-modal
+// nötig.
+// Nutzbar von tunnel (kein localhost-gate) weil sicherheit via
+// pending_invite gewährleistet ist (owner hat email vorher whitelisted).
+app.post("/api/auth/claim-invite", async (req, res) => {
+  if (!usersStore || !memberships) return res.status(503).json({ error: "multi-user nicht aktiv" });
+  const { email } = req.body || {};
+  if (!_emailValid(email)) return res.status(400).json({ error: "email ungültig" });
+  const normalized = String(email).trim().toLowerCase();
+
+  // Hat die email eine pending einladung?
+  let hasPending = false;
+  try {
+    for (const p of state.projects) {
+      const pending = memberships.listPendingForProject ? memberships.listPendingForProject(p.id) : [];
+      if (pending.some(i => i.email === normalized)) { hasPending = true; break; }
+    }
+  } catch (_) {}
+
+  // Existiert die email schon als user?
+  const existing = usersStore.findUserByEmail(normalized);
+  if (existing) {
+    // user existiert + hat pending invites → wir können sie nicht autologin
+    // (kein passwort gegeben). antwort: "du bist bereits registriert, log dich ein".
+    if (hasPending) {
+      // claim pending in case noch nicht passiert
+      try { memberships.claimPendingForEmail(normalized, existing.id); } catch (_) {}
+    }
+    return res.status(409).json({
+      error: "diese email ist bereits registriert. bitte normal einloggen mit deinem passwort.",
+      needsPassword: true,
+    });
+  }
+
+  if (!hasPending) {
+    return res.status(404).json({
+      error: "keine einladung für diese email gefunden. frag den team-owner, dich erst einzuladen.",
+    });
+  }
+
+  // user erstellen mit zufalls-passwort (wird vom user nicht gebraucht;
+  // er kann später per admin-reset-password setzen). dann claim + session.
+  const randomPw = crypto.randomBytes(24).toString("base64url");
+  let hash;
+  try { hash = hashPassword(randomPw); }
+  catch (e) { return res.status(500).json({ error: e.message }); }
+  let user;
+  try { user = usersStore.registerUser({ email: normalized, passwordHash: hash }); }
+  catch (e) { return res.status(400).json({ error: e.message }); }
+
+  try {
+    const claimed = memberships.claimPendingForEmail(user.email, user.id);
+    console.log("[auth] claim-invite:", user.email, "claimed", claimed.length, "invite(s)");
+  } catch (e) { console.log("[auth] claim-pending failed:", e.message); }
+
+  const sess = usersStore.createSession({ userId: user.id, ttlMs: USER_SESSION_TTL_MS });
+  broadcastState();
+  res.status(201).json({
+    token: sess.token,
+    user: { id: user.id, email: user.email, createdAt: user.createdAt },
+    expiresAt: sess.expiresAt,
+    viaInvite: true,
+  });
+});
+
 app.post("/api/auth/admin-reset-password", async (req, res) => {
   if (!usersStore) return res.status(503).json({ error: "multi-user nicht aktiv" });
   if (!isLocalRequest(req)) {

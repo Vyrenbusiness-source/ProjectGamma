@@ -194,6 +194,7 @@ function BootPairing({ onReady }) {
   const [mode, setMode] = useState("self");
   const [serverUrl, setServerUrl] = useState(sync.serverUrl);
   const [teamUrl, setTeamUrl] = useState("");
+  const [inviteEmail, setInviteEmail] = useState("");
   const [status, setStatus] = useState("connecting");
   const [error, setError] = useState(null);
   const [showAccountForTeam, setShowAccountForTeam] = useState(false);
@@ -247,6 +248,43 @@ function BootPairing({ onReady }) {
       setError(e.message || String(e));
     }
   }, [teamUrl]);
+
+  // Simpler invite-claim-flow: nur email, kein passwort.
+  // Server prüft pending_invites — wenn email eingeladen, wird user
+  // automatisch erstellt + session zurückgegeben.
+  const tryClaimInvite = useCallback(async () => {
+    setStatus("connecting"); setError(null);
+    try {
+      const url = teamUrl.trim().replace(/\/+$/, "");
+      const email = inviteEmail.trim();
+      if (!url.startsWith("http")) throw new Error("URL muss mit http(s):// beginnen");
+      if (!email || !/@/.test(email)) throw new Error("gültige email eingeben");
+      // 1) /health check
+      const h = await fetch(url + "/health").then(r => r.json()).catch(() => null);
+      if (!h || !h.ok) throw new Error("server nicht erreichbar unter " + url);
+      // 2) claim-invite
+      const r = await fetch(url + "/api/auth/claim-invite", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ email }),
+      });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(data.error || ("fehler " + r.status));
+      // 3) token adoptieren wie bei register
+      sync.serverUrl = url;
+      sync.token = data.token;
+      sync.deviceName = data.user?.email || email;
+      localStorage.setItem("projectgamma.sync.url", url);
+      localStorage.setItem("projectgamma.sync.token", data.token);
+      localStorage.setItem("projectgamma.sync.deviceName", sync.deviceName);
+      setStatus("ready");
+      sync.connect();
+      setTimeout(() => onReady(), 400);
+    } catch (e) {
+      setStatus("error");
+      setError(e.message || String(e));
+    }
+  }, [teamUrl, inviteEmail, onReady]);
 
   // Auto-Versuch beim Mount NUR in mode=self. Bei team braucht der user erst die URL.
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -308,25 +346,36 @@ function BootPairing({ onReady }) {
           <>
             <div style={{ color: "var(--ink-soft)", fontSize: 13, marginBottom: 12 }}>
               du tritt einem team bei, das auf einem ANDEREN server läuft.<br />
-              dein kollege hat dir eine team-url geschickt (z.B. cloudflared tunnel
-              oder LAN-IP). du registrierst dich dort + er muss dich noch als
-              mitglied einladen.
+              dein kollege hat dir die team-url geschickt — gib deine email ein,
+              dann bist du drin (vorausgesetzt der owner hat dich eingeladen).
             </div>
             <label className="field">
               <span className="eyebrow">team-server-url</span>
               <input className="input big" value={teamUrl}
                      placeholder="https://abc.trycloudflare.com  oder  http://192.168.1.42:7892"
                      onChange={e => setTeamUrl(e.target.value)}
-                     onKeyDown={e => { if (e.key === "Enter") tryJoinTeam(); }} />
+                     onKeyDown={e => { if (e.key === "Enter") tryClaimInvite(); }} />
+            </label>
+            <label className="field" style={{ marginTop: 10 }}>
+              <span className="eyebrow">deine email (die du eingeladen wurdest)</span>
+              <input className="input big" type="email" value={inviteEmail}
+                     placeholder="du@example.com"
+                     onChange={e => setInviteEmail(e.target.value)}
+                     onKeyDown={e => { if (e.key === "Enter") tryClaimInvite(); }} />
             </label>
             <div className="boot-status">
-              {status === "connecting" && <span className="cc-dot live">prüfe server…</span>}
+              {status === "connecting" && <span className="cc-dot live">prüfe einladung…</span>}
               {status === "error"      && <span style={{ color: "#c33" }}>⚠ {error}</span>}
+              {status === "ready"      && <span className="cc-dot live">✓ einladung gefunden, du bist drin</span>}
             </div>
-            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 14 }}>
-              <button className="btn primary" onClick={tryJoinTeam}
-                      disabled={status === "connecting" || !teamUrl.trim()}>
-                weiter zum login →
+            <div style={{ display: "flex", gap: 8, justifyContent: "space-between", alignItems: "center", marginTop: 14 }}>
+              <button className="btn tiny" onClick={() => { setShowAccountForTeam(true); }}
+                      disabled={!teamUrl.trim()} title="account + passwort statt nur email">
+                stattdessen mit passwort einloggen
+              </button>
+              <button className="btn primary" onClick={tryClaimInvite}
+                      disabled={status === "connecting" || !teamUrl.trim() || !inviteEmail.trim()}>
+                ✓ einloggen →
               </button>
             </div>
           </>
