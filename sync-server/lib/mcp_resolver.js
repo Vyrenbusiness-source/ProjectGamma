@@ -93,7 +93,14 @@ function resolveMcpConfig({ baseDir, env = process.env, tmpDir, tier = "full", p
       if (pkgIdx >= 0) {
         // Behalte alles bis inklusive package-name, ersetze rest mit projectCwd.
         resolvedArgs = args.slice(0, pkgIdx + 1).concat([projectCwd]);
+        console.log("[mcp] filesystem-args patched → " + projectCwd);
+      } else {
+        console.warn("[mcp] WARN: filesystem args ohne package-name? args=" + JSON.stringify(def.args));
       }
+    }
+    if (name === "filesystem" && !projectCwd) {
+      console.warn("[mcp] WARN: filesystem-MCP ohne projectCwd-patch! cwd-arg bleibt hardcoded auf " +
+        (Array.isArray(def.args) ? def.args[def.args.length - 1] : "?"));
     }
     const cleaned = { command: def.command, args: resolvedArgs };
     if (Object.keys(envOut).length) cleaned.env = envOut;
