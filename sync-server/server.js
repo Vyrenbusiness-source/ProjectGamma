@@ -421,6 +421,9 @@ function stripHtml(s) {
 async function autoPumpTick() {
   if (!state.ccRunning) return;
   if (NOW() < _ccApiLimitedUntil) return; // claude API limit reached — warten
+  // OPTIMIERUNG: über ALLE idle projekte parallel pumpen — vorher 'break'
+  // nach dem ersten match → 1 task pro 10s-tick total. jetzt: pro projekt
+  // 1 task parallel. für multi-projekt-users massiver durchsatz-win.
   for (const project of state.projects) {
     if (_isProjectBusy(project.id)) continue;
     if (!project.path || !fs.existsSync(project.path)) {
@@ -457,7 +460,7 @@ async function autoPumpTick() {
     triggerCc(project.id, candidate.id, null).catch(e => {
       console.log("[autopump] error:", e.message);
     });
-    break;
+    // KEIN break — nächstes projekt direkt mit-pumpen.
   }
 }
 setInterval(autoPumpTick, AUTOPUMP_TICK_MS);
@@ -472,6 +475,24 @@ setInterval(() => {
       console.warn("[cc-watchdog] runaway-kill projektId=" + pid + " task=" + job.taskId + " runtime=" + Math.round((now - job.startedAt)/1000) + "s");
       try { job.proc.kill("SIGKILL"); } catch (_) {}
       // ccJobs.delete passiert über on-close handler bei normalem kill
+    }
+  }
+}, 60_000);
+
+// Stale-lock cleanup: _ccPostChecks-locks die >15min alt sind werden
+// auto-released. schützt gegen hängende build-gates / runtime-tests deren
+// promise nie resolved (z.b. flutter pub get hängt, npm test deadlock).
+// Sonst bleibt autopump für diesen projekt-id für immer blockiert.
+const _ccPostCheckStartedAt = new Map(); // projectId -> startTs, parallel zu _ccPostChecks
+const STALE_LOCK_MS = 15 * 60 * 1000;
+setInterval(() => {
+  const now = NOW();
+  for (const [pid, startTs] of _ccPostCheckStartedAt) {
+    if (now - startTs > STALE_LOCK_MS) {
+      console.warn("[cc-postcheck-watchdog] stale lock release pid=" + pid + " age=" + Math.round((now - startTs)/1000) + "s");
+      _ccPostChecks.delete(pid);
+      _ccPostCheckStartedAt.delete(pid);
+      _triggerAutoPumpNow();
     }
   }
 }, 60_000);
@@ -2708,8 +2729,10 @@ function _startCcJob(project, taskId, prompt) {
       // "läuft bereits"). _ccPostChecks.delete passiert in der release-
       // funktion am ende aller pfade (success, retry, max-retry).
       _ccPostChecks.add(projectId);
+      _ccPostCheckStartedAt.set(projectId, NOW());
       const releasePostCheck = () => {
         _ccPostChecks.delete(projectId);
+        _ccPostCheckStartedAt.delete(projectId);
         // sofort den nächsten task starten — kein 25s-warten mehr
         _triggerAutoPumpNow();
       };
@@ -2753,10 +2776,27 @@ function _startCcJob(project, taskId, prompt) {
       }});
       broadcastState();
 
-      runBuildGate({ projectPath: project.path }).then(async (gate) => {
+      // OPTIMIERUNG: build-gate + runtime-test parallel laufen (statt
+      // sequentiell). build-gate prüft lint/typecheck, runtime-test prüft
+      // ob der server hochkommt — unabhängige checks. Wenn beide fehlen
+      // schlagen, wird der retry-counter nur EINMAL inkrementiert (build
+      // hat priorität als fehler-context, weil aussagekräftiger).
+      Promise.all([
+        runBuildGate({ projectPath: project.path }),
+        runRuntimeTest({
+          projectPath: project.path,
+          filesChanged: parsedStatus.filesChanged || [],
+        }).catch(e => ({ ok: true, skipped: true, kind: "error", output: e && e.message })),
+      ]).then(async ([gate, rtResult]) => {
         const projNow = state.projects.find(p => p.id === projectId);
         const taskNow = projNow && projNow.tasks.find(t => t.id === taskId);
-        if (!taskNow) return;
+        if (!taskNow) {
+          // BUG-FIX: vorher kein release → autopump für immer skip auf das
+          // projekt. jetzt: release + log warum.
+          console.log("[cc-tail] task verschwunden — release lock", projectId, taskId);
+          releasePostCheck();
+          return;
+        }
 
         if (gate.skipped) {
           applyMutation("ADD_ACTIVITY", { projectId, event: {
@@ -2825,14 +2865,8 @@ function _startCcJob(project, taskId, prompt) {
         }
 
         // ─── RUNTIME-TEST (Task 4) ────────────────────────────
-        // Programmatisch: dev-server starten, /health probe, kill. Kein LLM.
-        // Smart-trigger: nur wenn runtime-relevante files (server.js, *.jsx, etc.)
-        // geändert wurden. Bei fail: failure-loop (selbe retry-mechanik wie build-gate).
-        const rtResult = await runRuntimeTest({
-          projectPath: project.path,
-          filesChanged: parsedStatus.filesChanged || [],
-        }).catch(e => ({ ok: true, skipped: true, kind: "error", output: e && e.message }));
-
+        // ist bereits via Promise.all parallel zum build-gate gelaufen (siehe oben),
+        // rtResult ist im destructuring schon enthalten. Hier nur noch auswerten.
         if (rtResult.skipped) {
           // skip → kein log-eintrag (würde nur spammen)
         } else if (rtResult.ok) {
