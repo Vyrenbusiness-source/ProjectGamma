@@ -2113,7 +2113,23 @@ app.post("/api/cc/run", authMw, async (req, res) => {
 function _startCcJob(project, taskId, prompt) {
   const projectId = project.id;
 
-  const cwd = project.path && fs.existsSync(project.path) ? project.path : process.cwd();
+  // Bug-fix: vorher fiel cwd silent auf process.cwd() (= sync-server/) zurück,
+  // wenn project.path fehlte/nicht existierte. cc lief dann im server-folder
+  // und sah nur sync-server-files — symptom: "cc liest/grept, schreibt aber
+  // nichts". Jetzt: klarer fehler mit activity-log statt fake-run.
+  if (!project.path || !fs.existsSync(project.path)) {
+    applyMutation("ADD_ACTIVITY", { projectId, event: {
+      type: "warn",
+      text: "cloud-code blockiert: projekt-pfad fehlt oder existiert nicht — bitte in den projekt-einstellungen setzen " +
+            "(<code>" + escapeHtml(project.path || "(leer)") + "</code>)",
+    }});
+    broadcastState();
+    const e = new Error("projekt-pfad fehlt oder existiert nicht auf diesem rechner: " +
+      JSON.stringify(project.path || "") + " — setze ihn in den projekt-einstellungen");
+    e.status = 412;
+    throw e;
+  }
+  const cwd = project.path;
   const task = taskId ? project.tasks.find(t => t.id === taskId) : null;
 
   // Prompt zusammenstellen aus Projekt-Kontext (Regeln, Ziele, Aufgabe).
@@ -2150,6 +2166,10 @@ function _startCcJob(project, taskId, prompt) {
 
   const fullPrompt = [
     "Arbeite am Projekt: " + project.name + " (" + project.tech + ").",
+    "PROJEKT-PFAD: " + cwd,
+    "WICHTIG: alle datei-operationen (Read/Edit/Write/Glob/Grep/Bash) müssen",
+    "in diesem pfad oder darunter stattfinden. Das ist KEIN sync-server-projekt,",
+    "es ist das echte ziel-projekt — schreibe wirklich code, nicht nur lesen.",
     "",
     goals.length ? "PROJEKTZIELE:\n" + goals.map(g => "- " + g).join("\n") : "",
     activeRules.length ? "AKTIVE REGELN (immer einhalten):\n" + activeRules.join("\n") : "",
@@ -3275,14 +3295,43 @@ app.post("/api/cc/bughunt", authMw, async (req, res) => {
 // publicState: pair-sessions sehen alles (legacy); user-sessions nur projekte,
 // in denen sie member sind. `session` undefined = full state (z.b. internes
 // logging, autopump). Verwendet pure-helper aus lib/project_access.
+// Cache für path-existenz-checks: fs.existsSync auf jedem broadcast wäre
+// teuer (lots of syscalls). 10s TTL ist genug — pfad-änderungen sind selten.
+const _pathValidCache = new Map(); // projectId -> { valid, checkedAt }
+function projectPathValid(project) {
+  if (!project || !project.path) return false;
+  const cached = _pathValidCache.get(project.id);
+  const now = NOW();
+  if (cached && now - cached.checkedAt < 10_000) return cached.valid;
+  let valid = false;
+  try { valid = fs.existsSync(project.path); } catch (_) { valid = false; }
+  _pathValidCache.set(project.id, { valid, checkedAt: now });
+  return valid;
+}
+
 function publicState(session) {
-  if (!session || !memberships) return state;
-  return filterStateForSession(state, session, memberships);
+  const base = (!session || !memberships)
+    ? state
+    : filterStateForSession(state, session, memberships);
+  // Annotate jedes projekt mit pathValid — desktop+mobile UI können warnen
+  // wenn der pfad fehlt oder auf diesem rechner nicht existiert (cross-network
+  // collab-szenario).
+  return {
+    ...base,
+    projects: (base.projects || []).map(p => ({ ...p, pathValid: projectPathValid(p) })),
+  };
 }
 
 // ─── Vorschläge + Bug-Hunt (claude-Analyse-Pässe) ──────────
 function _spawnClaudeReadOnly(project, prompt, opts) {
-  const cwd = project.path && fs.existsSync(project.path) ? project.path : process.cwd();
+  // Bug-fix: kein silent fallback auf process.cwd() (sync-server/) — sonst
+  // analysiert cc den server statt das echte projekt. Wenn pfad fehlt:
+  // leer zurück (caller behandelt "" als no-result), kein fake-run.
+  if (!project.path || !fs.existsSync(project.path)) {
+    console.log("[cc-readonly] skip: project.path fehlt/invalid für " + project.name + " (" + JSON.stringify(project.path) + ")");
+    return Promise.resolve("");
+  }
+  const cwd = project.path;
   const claudeBin = resolveClaudeBinary();
   const mcpConfigPath = resolveMcpConfig({ baseDir: __dirname });
   // Token-spar: caller darf budget runtersetzen (z.B. decompose nur 0.20$).
@@ -3514,7 +3563,13 @@ async function runSelfReview(project, taskId, taskStatus, originalOutput) {
   const task = project.tasks.find(t => t.id === taskId);
   if (!task) return { ok: true, issues: [], confidence: 0.5 };
 
-  const cwd = project.path && fs.existsSync(project.path) ? project.path : process.cwd();
+  // Bug-fix: kein silent fallback auf sync-server/. Wenn der projekt-pfad
+  // weg ist, ist review eh sinnlos (keine files zum nachlesen) → fail-open.
+  if (!project.path || !fs.existsSync(project.path)) {
+    console.log("[review] skip: project.path fehlt/invalid für " + project.name);
+    return { ok: true, issues: [], confidence: 0.5 };
+  }
+  const cwd = project.path;
   const claudeBin = resolveClaudeBinary();
 
   const filesChanged = (taskStatus.filesChanged || []).slice(0, 10);
@@ -3763,6 +3818,13 @@ wss.on("connection", (ws, req) => {
   ws.on("message", (raw) => {
     try {
       const msg = JSON.parse(raw.toString());
+      // Bug-fix: jede WS-nachricht muss lastSeen der pair-session bumpen,
+      // sonst zeigt das device-panel "offline" obwohl die WS-verbindung
+      // lebendig pingt. Pair-sessions liegen in der sessions-map und werden
+      // sonst nur durch HTTP-requests aktualisiert (nicht durch WS).
+      if (ws._token && sessions.has(ws._token)) {
+        sessions.get(ws._token).lastSeen = NOW();
+      }
       if (msg.type === "PING") {
         ws.send(JSON.stringify({ type: "PONG", ts: NOW() }));
         return;

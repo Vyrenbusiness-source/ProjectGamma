@@ -1909,6 +1909,12 @@ function ScreenCloud({ project, onCcRun, onCcStop, ccStatus, ccOutput, ccRunning
             {!project.path && <span style={{ color: "var(--danger, #c33)", marginLeft: 10 }}>
               ⚠ kein projekt-pfad
             </span>}
+            {project.path && project.pathValid === false && (
+              <span style={{ color: "var(--danger, #c33)", marginLeft: 10 }}
+                    title={"pfad nicht gefunden: " + project.path}>
+                ⚠ pfad nicht auf diesem rechner: <code>{project.path}</code>
+              </span>
+            )}
           </div>
         </div>
         <div className="cc-controls">
