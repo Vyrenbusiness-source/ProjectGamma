@@ -5,7 +5,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node --test test/auth_guards.test.js lib/safe_path.test.js lib/spawn_guard.test.js lib/ws_session_guard.test.js lib/default_project_path.test.js lib/claim_rate_limit.test.js lib/rule_diff_queue.test.js lib/sqlite_store.test.js"
+    "test": "node --test test/auth_guards.test.js lib/safe_path.test.js lib/spawn_guard.test.js lib/ws_session_guard.test.js lib/default_project_path.test.js lib/claim_rate_limit.test.js lib/rule_diff_queue.test.js lib/sqlite_store.test.js lib/context_retrieval.test.js"
   },
   "dependencies": {
     "cors": "^2.8.5",

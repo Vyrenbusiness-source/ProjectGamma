@@ -26,6 +26,7 @@ const apkRelease = require("./lib/apk_release");
 const { lintBeforeRun: lintCcRules, formatReport: formatCcLint } = require("./lib/rule_linter");
 const { classify: classifyRuleOrIdea } = require("./lib/rule_idea_classifier");
 const { resolveMcpConfig, cleanupResolvedConfig } = require("./lib/mcp_resolver");
+const { pickTopK: _pickContextTopK } = require("./lib/context_retrieval");
 const { createUsersStore } = require("./lib/users_store");
 const { createProjectMembershipStore, ROLES } = require("./lib/project_membership");
 const { killTreeSync, killTreeGraceful } = require("./lib/process_kill");
@@ -2384,33 +2385,61 @@ function _startCcJob(project, taskId, prompt) {
   // Prompt zusammenstellen aus Projekt-Kontext (Regeln, Ziele, Aufgabe).
   // Bitte claude am Ende einen JSON-Block mit Regel-Vorschlägen auszugeben,
   // den der Server parsed und als „cc-vorschlag"-Regeln erstellt (inaktiv).
-  const activeRules = project.rules.filter(r => r.active).map(r => "- " + r.text);
-  // inactiveRules sind oft "cc-vorschlag"-regeln die der user nicht akzeptiert
-  // hat. Wir trimmen aggressiv: nur 5 stück, je 100 zeichen — sonst werden
-  // alte ablehnungen sehr token-teuer in projekten mit vielen vorschlägen.
-  const inactiveRules = project.rules.filter(r => !r.active)
-    .slice(0, 5)
-    .map(r => "- " + String(r.text || "").slice(0, 100));
-  // Tombstones: regeln, die der user kürzlich entfernt hat. Damit cc nicht
-  // unbedacht dieselben texte als RULE_SUGGESTIONS wieder vorschlägt.
-  // TOKEN-OPTIMIERUNG: nur top 5 + jeder text auf 80 zeichen kappen.
-  const removedRules = (project.removedRules || []).slice(0, 5)
-    .map(r => "- " + String(r.text || "").slice(0, 80));
+  // ─── SMART CONTEXT (BM25 retrieval) ─────────────────────────
+  // Statt alle rules/activity/bugs in den prompt zu dumpen, picken wir die
+  // task-relevantesten via BM25-keyword-überlappung. Query = task.title +
+  // optionaler prompt-text. Spart 50-80% prompt-tokens bei projekten mit
+  // vielen rules ohne kontext-verlust für den aktuellen task.
+  // (master-spec items: smart context loading, semantic retrieval,
+  // multi-memory — domains: rules=semantic, activity=long-term, bugs=project)
+  const _query = ((task && task.title) || prompt || "").slice(0, 500);
+
+  // Active rules: IMMER alle einhalten (kein retrieval), aber wenn projekt
+  // viele hat → nur top-N relevante prominent zeigen + rest als "+N weitere".
+  const _activeAll = project.rules.filter(r => r.active);
+  let activeRules;
+  if (_activeAll.length <= 8) {
+    activeRules = _activeAll.map(r => "- " + r.text);
+  } else {
+    const topActive = _pickContextTopK({
+      query: _query, corpus: _activeAll, k: 6, idKey: "id", textKey: "text",
+    });
+    activeRules = [
+      ...topActive.map(r => "- " + r.text),
+      `- (+ ${_activeAll.length - topActive.length} weitere aktive regeln — wenn relevant, im projekt-state schauen)`,
+    ];
+  }
+
+  // Inactive rules + removed rules: nur die task-relevantesten (BM25, k=3).
+  const inactiveRules = _pickContextTopK({
+    query: _query,
+    corpus: project.rules.filter(r => !r.active),
+    k: 3, idKey: "id", textKey: "text",
+  }).map(r => "- " + String(r.text || "").slice(0, 100));
+  const removedRules = _pickContextTopK({
+    query: _query,
+    corpus: project.removedRules || [],
+    k: 3, idKey: "id", textKey: "text",
+  }).map(r => "- " + String(r.text || "").slice(0, 80));
   const goals = project.goals || [];
 
-  // PROJEKT-MEMORY: kompakte kontext-blöcke. token-sparend:
-  //   - 3 letzte activity-events statt 5, je 100 zeichen kapping
-  //   - 3 top bugs (gleich), je 80 zeichen kapping
-  //   - letzte cc-summary auf 200 zeichen
-  // gesamt-trim: ~70% reduktion gegenüber vorher.
-  const recentActivity = (project.activity || [])
-    .filter(a => ["check","write","warn","edit","rule"].includes(a.type))
-    .slice(0, 3)
-    .map(a => "- " + stripHtml(a.text || "").slice(0, 100));
-  const openBugs = (project.bugs || [])
-    .filter(b => b.status === "pending")
-    .slice(0, 3)
-    .map(b => "- [" + (b.severity || "?") + "] " + (b.description || "").slice(0, 80));
+  // Activity: BM25 über letzte 30 events (long-term memory), top-3 relevante.
+  // Bugs: BM25 über alle pending bugs (project memory), top-3 relevante.
+  const recentActivity = _pickContextTopK({
+    query: _query,
+    corpus: (project.activity || [])
+      .filter(a => ["check","write","warn","edit","rule"].includes(a.type))
+      .slice(0, 30)
+      .map((a, i) => ({ id: a.id || "_a" + i, text: stripHtml(a.text || "") })),
+    k: 3, idKey: "id", textKey: "text",
+  }).map(a => "- " + String(a.text).slice(0, 100));
+  const openBugs = _pickContextTopK({
+    query: _query,
+    corpus: (project.bugs || [])
+      .filter(b => b.status === "pending")
+      .map(b => ({ id: b.id, text: b.description || "", severity: b.severity })),
+    k: 3, idKey: "id", textKey: "text",
+  }).map(b => "- [" + (b.severity || "?") + "] " + String(b.text).slice(0, 80));
   const lastCcCheck = (project.activity || [])
     .find(a => a.type === "check" && /cc auto-checkmark/.test(a.text || ""));
   const lastCcSummary = lastCcCheck ? stripHtml(lastCcCheck.text).slice(0, 200) : null;
@@ -2621,6 +2650,7 @@ function _startCcJob(project, taskId, prompt) {
     // FIX #3: projectId direkt am job-objekt — _handleCcStreamEvent braucht
     // ihn ohne ccJobs-iteration. Auch bug-resistant gegen flush nach delete.
     projectId, proc, startedAt: NOW(), taskId, prompt: fullPrompt, lines: [], cwd,
+    model: selectedModel, // für metrics + activity-log
     // Stream-json gefiltert: nur assistant text-content → für regex-parser
     // (TASK_PLAN/TASK_STATUS/RULE_SUGGESTIONS/QUESTION) am ende.
     assistantText: "",
@@ -2758,7 +2788,7 @@ function _startCcJob(project, taskId, prompt) {
     state.ccBudget.jobs = [
       { projectId, taskId, ts: NOW(), inputTokens, outputTokens,
         cacheCreated, cacheRead, costUsd: estCostUsd, durationMs,
-        ok: code === 0, real: !!job.realUsage },
+        ok: code === 0, real: !!job.realUsage, model: job.model || null },
       ...(state.ccBudget.jobs || []),
     ].slice(0, 100);
 
@@ -3391,6 +3421,63 @@ app.post("/api/cc/decompose", authMw, async (req, res) => {
   runTaskDecompose(project, task).catch(e => console.log("[decompose] error:", e.message));
 });
 
+// Goal-Based Planning: nimmt project.goals → cc generiert milestones + tasks.
+// Async (fire-and-forget); UI sieht tasks erscheinen via state-broadcast.
+app.post("/api/projects/:id/plan-from-goals", authMw, async (req, res) => {
+  const project = state.projects.find(p => p.id === req.params.id);
+  if (!project) return res.status(404).json({ error: "projekt nicht gefunden" });
+  if (!_requireProjectAccess(req, res, project, ROLES.MEMBER)) return;
+  res.json({ ok: true, goalsCount: (project.goals || []).length });
+  runAutoPlanFromGoals(project).catch(e => console.log("[auto-plan] error:", e.message));
+});
+
+// CC-Metrics: aggregierte stats über die letzten N jobs (token-/cost-/zeit-
+// durchschnitte, model-routing-hit-rate). Read-only — UI kann sie nutzen
+// für "live self-optimization"-dashboard. Master-spec item 1, ohne
+// automatische rule-mutation (das wäre risikoreich + braucht user-approval).
+app.get("/api/cc/metrics", authMw, (req, res) => {
+  const jobs = (state.ccBudget && state.ccBudget.jobs) || [];
+  if (jobs.length === 0) {
+    return res.json({
+      total: 0, last24h: 0,
+      avgDurationMs: 0, avgInputTokens: 0, avgOutputTokens: 0, avgCostUsd: 0,
+      modelMix: {}, successRate: 0,
+      slowestJobs: [], expensiveJobs: [],
+    });
+  }
+  const now = NOW();
+  const last24h = jobs.filter(j => now - j.ts < 24 * 60 * 60 * 1000);
+  const recent = last24h.length > 0 ? last24h : jobs;
+  const sum = (arr, f) => arr.reduce((a, j) => a + (f(j) || 0), 0);
+  const avg = (arr, f) => arr.length ? sum(arr, f) / arr.length : 0;
+  const modelMix = {};
+  for (const j of recent) {
+    const m = j.model || "unknown";
+    modelMix[m] = (modelMix[m] || 0) + 1;
+  }
+  const successRate = recent.length ? recent.filter(j => j.ok).length / recent.length : 0;
+  const slowest = [...recent].sort((a, b) => (b.durationMs || 0) - (a.durationMs || 0)).slice(0, 5);
+  const expensive = [...recent].sort((a, b) => (b.costUsd || 0) - (a.costUsd || 0)).slice(0, 5);
+  res.json({
+    total: jobs.length,
+    last24h: last24h.length,
+    avgDurationMs: Math.round(avg(recent, j => j.durationMs)),
+    avgInputTokens: Math.round(avg(recent, j => j.inputTokens)),
+    avgOutputTokens: Math.round(avg(recent, j => j.outputTokens)),
+    avgCostUsd: avg(recent, j => j.costUsd),
+    modelMix,
+    successRate,
+    slowestJobs: slowest.map(j => ({
+      taskId: j.taskId, ts: j.ts, durationMs: j.durationMs,
+      model: j.model, ok: j.ok,
+    })),
+    expensiveJobs: expensive.map(j => ({
+      taskId: j.taskId, ts: j.ts, costUsd: j.costUsd,
+      model: j.model, outputTokens: j.outputTokens,
+    })),
+  });
+});
+
 // M2 · Cleanup: existing cc-vorgeschlagene regeln + pending rule_diffs,
 // die nach dem strengeren classifier eigentlich Ideen sind, rückwirkend
 // umrouten. 0 LLM-tokens — reine classifier-anwendung.
@@ -3849,6 +3936,96 @@ async function runSuggestionAnalysis(project) {
     text: `vorschläge-analyse fertig · ${count} vorschläge`,
   }});
   broadcastState();
+}
+
+// Goal-based planning: nimmt project.goals → fragt cc nach einer roadmap
+// (3-5 milestones × je 3-5 tasks). Tasks landen als group="next" mit
+// "milestone:<name>" im meta-feld. Spart dem user manuelles task-brainstorm.
+//
+// (master-spec item: "Goal-Based Planning · idea → roadmap → milestones →
+// tasks vollautomatisch")
+async function runAutoPlanFromGoals(project) {
+  const projectId = project.id;
+  if (!project.goals || project.goals.length === 0) {
+    applyMutation("ADD_ACTIVITY", { projectId, event: {
+      type: "warn",
+      text: "auto-plan abgebrochen: keine projektziele gesetzt — bitte erst ziele in den projekt-einstellungen pflegen",
+    }});
+    broadcastState();
+    return { ok: false, error: "keine ziele" };
+  }
+  applyMutation("ADD_ACTIVITY", { projectId, event: {
+    type: "info", text: `auto-plan gestartet (${project.goals.length} ziele) …`,
+  }});
+  broadcastState();
+
+  const existingTitles = new Set((project.tasks || []).map(t => (t.title || "").toLowerCase().trim()));
+
+  const prompt = [
+    "PROJEKT-ROADMAP-PLANUNG für: " + project.name + " (" + project.tech + ").",
+    "",
+    "PROJEKTZIELE:",
+    ...project.goals.map((g, i) => `${i+1}. ${g}`),
+    "",
+    "Zerlege diese ziele in eine umsetzbare roadmap mit 3-5 milestones,",
+    "jedes milestone mit 3-5 konkreten tasks (max 15 tasks gesamt).",
+    "",
+    "Regeln:",
+    "- tasks sind konkret + umsetzbar in 1-4 stunden (kein 'projekt fertig bauen').",
+    "- keine doppelten oder bereits vorhandenen tasks (titel-überlapping).",
+    "- priorität 5=must-have, 3=should, 1=nice. Default 3.",
+    "- meta: kurz erklären warum dieser task wichtig ist (max 80 zeichen).",
+    "",
+    "Antworte NUR mit dem JSON-Block (keine erklärung davor/danach):",
+    "<<<PLAN",
+    '{"milestones":[{"name":"M1 …","tasks":[{"title":"...","meta":"...","priority":3}]}]}',
+    ">>>",
+  ].join("\n");
+
+  const out = await _spawnClaudeReadOnly(project, prompt, { maxBudgetUsd: 0.5 });
+  const m = out.match(/<<<PLAN\s*([\s\S]*?)\s*>>>/);
+  if (!m) {
+    applyMutation("ADD_ACTIVITY", { projectId, event: {
+      type: "warn", text: "auto-plan: claude hat kein gültiges JSON geliefert",
+    }});
+    broadcastState();
+    return { ok: false, error: "no JSON" };
+  }
+  let plan;
+  try { plan = JSON.parse(m[1].trim()); }
+  catch (e) {
+    applyMutation("ADD_ACTIVITY", { projectId, event: {
+      type: "warn", text: "auto-plan: JSON parse fehler: " + e.message,
+    }});
+    broadcastState();
+    return { ok: false, error: e.message };
+  }
+  const milestones = Array.isArray(plan.milestones) ? plan.milestones : [];
+  let created = 0;
+  let skipped = 0;
+  for (const ms of milestones) {
+    if (!ms || !Array.isArray(ms.tasks)) continue;
+    const msName = String(ms.name || "milestone").slice(0, 60);
+    for (const t of ms.tasks) {
+      if (!t || !t.title) continue;
+      const title = String(t.title).slice(0, 200).trim();
+      const key = title.toLowerCase().trim();
+      if (existingTitles.has(key)) { skipped++; continue; }
+      existingTitles.add(key);
+      const priority = Math.max(1, Math.min(5, Number(t.priority) || 3));
+      const meta = (t.meta ? String(t.meta).slice(0, 80) + " · " : "") + msName;
+      applyMutation("ADD_TASK", { projectId, task: {
+        title, meta, priority, group: "next", done: false, subtasks: [],
+      }});
+      created++;
+    }
+  }
+  applyMutation("ADD_ACTIVITY", { projectId, event: {
+    type: created > 0 ? "check" : "warn",
+    text: `auto-plan fertig · ${created} tasks erzeugt` + (skipped ? ` · ${skipped} duplikate übersprungen` : ""),
+  }});
+  broadcastState();
+  return { ok: true, created, skipped, milestones: milestones.length };
 }
 
 async function runBugHunt(project) {
