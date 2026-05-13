@@ -398,6 +398,35 @@ function _isProjectBusy(projectId) {
   return ccJobs.has(projectId) || _ccPostChecks.has(projectId);
 }
 
+// Model-routing nach Project-Gamma master-prompt:
+// - sonnet-4-6 (small/fast/billig) für kleine tasks, defaultmäßig
+// - opus-4-7 (groß/komplex/teuer) für architektur, refactors, große scope
+// heuristik basiert auf signalen die wir LOKAL kennen (kein extra LLM-call).
+// regeln: jede "big"-signatur reicht → opus. sonst → sonnet.
+const BIG_KEYWORDS = /\b(refactor|rewrite|migrate|migration|architecture|architektur|umstrukturieren|umbauen|umstellen|redesign|gross|großer|großes|großen|epic|epoch|monorepo|infrastructure|infrastruktur|orchestrat|consolidate|integration|cross-cutting|breaking change|major)\b/i;
+function selectModelForTask({ task, retryAttempt, prompt }) {
+  // Force opus on retries — wenn sonnet 1-2× gescheitert ist, brauchen wir
+  // mehr reasoning-power statt blind nochmal das gleiche zu probieren.
+  if (retryAttempt && retryAttempt >= 2) return "claude-opus-4-7";
+  if (!task) {
+    // Manual cc-run via prompt → schätzung über prompt-länge.
+    if (prompt && prompt.length > 600) return "claude-opus-4-7";
+    return "claude-sonnet-4-6";
+  }
+  // Hohe priority (5+) → opus.
+  if ((task.priority || 3) >= 5) return "claude-opus-4-7";
+  // Lange titel = vermutlich epic. >120 chars heuristik.
+  if ((task.title || "").length > 120) return "claude-opus-4-7";
+  // Keywords erkennen.
+  const haystack = (task.title || "") + " " + (task.meta || "");
+  if (BIG_KEYWORDS.test(haystack)) return "claude-opus-4-7";
+  // Decomposed parent task (hat subtasks → planning): opus für die zerlegung
+  // selbst wäre teuer; tatsächlich rufen wir decompose separat. Hier: wenn
+  // dieser task SCHON subtasks hat, ist es ein parent → wir bearbeiten nur
+  // einen subtask, nicht den parent → sonnet ok.
+  return "claude-sonnet-4-6";
+}
+
 // Sofort autopump triggern (kein 25s-warten), z.b. wenn ein task gerade
 // fertig wurde. Async via setTimeout(0) damit der aktuelle handler
 // erstmal sauber zuende läuft.
@@ -2530,6 +2559,14 @@ function _startCcJob(project, taskId, prompt) {
   // (tool_use, tool_result, result mit echten tokens) statt nur rohtext.
   // Selbe model-tokens wie vorher (claude generiert dasselbe), nur das CLI
   // emittiert es jsonl statt plaintext.
+  // Model-routing: sonnet-4-6 default (schnell+billig), opus-4-7 nur wenn
+  // big-signatur (architektur, refactor, retry, hohe priority). spart bei
+  // 80%+ der tasks token-cost-ratio von ~3× (opus zu sonnet).
+  const selectedModel = selectModelForTask({
+    task,
+    retryAttempt: retryContext?.attempt || 0,
+    prompt: fullPrompt,
+  });
   const args = [
     "--print",
     "--output-format", "stream-json",
@@ -2537,6 +2574,7 @@ function _startCcJob(project, taskId, prompt) {
     "--permission-mode", "bypassPermissions",
     "--dangerously-skip-permissions",
     "--tools", "default",
+    "--model", selectedModel,
     "--add-dir", cwd,
     // Hard-Budget pro Task (Sicherung gegen Runaway)
     "--max-budget-usd", String(state.ccBudget?.perTaskUsd ?? 2.0),
@@ -2585,7 +2623,8 @@ function _startCcJob(project, taskId, prompt) {
   // Activity-Eintrag „Cloud-Code gestartet"
   applyMutation("ADD_ACTIVITY", { projectId, event: {
     type: "info",
-    text: "cloud-code gestartet" + (task ? ": <i>" + escapeHtml(task.title) + "</i>" : ""),
+    text: "cloud-code gestartet" + (task ? ": <i>" + escapeHtml(task.title) + "</i>" : "") +
+          " · model: <code>" + (selectedModel === "claude-opus-4-7" ? "opus-4.7" : "sonnet-4.6") + "</code>",
   }});
   applyMutation("ADD_SYNC_LOG", { entry: {
     source: "cloud", projectId,
