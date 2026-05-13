@@ -1527,10 +1527,33 @@ function ScreenTasks({ project, onCcRun }) {
   const [subDraft, setSubDraft] = useState({ taskId: null, title: "" });
   const [specBusy, setSpecBusy] = useState(false);
   const [specMsg, setSpecMsg] = useState(null);
+  const [bugBusy, setBugBusy] = useState(false);
+  const [bugsExpanded, setBugsExpanded] = useState(false);
   const inputRef = useRef(null);
   const specInputRef = useRef(null);
 
   useEffect(() => { if (adding) inputRef.current?.focus(); }, [adding]);
+
+  // Bug-scan trigger: claude analysiert das projekt readonly und findet bugs.
+  // Resultate landen in project.bugs — angezeigt als section oben in tasks.
+  const triggerBugScan = async () => {
+    setBugBusy(true);
+    try { await sync.ccBughunt(project.id); }
+    catch (e) { alert("bug-scan fehler: " + (e.message || "?")); }
+    setTimeout(() => setBugBusy(false), 60000); // nach 60s wieder enable (cc kann währenddessen liefern)
+  };
+  const acceptBug = (b) => {
+    sync.mutate("ADD_TASK", { projectId: project.id, task: {
+      title: `[bug] ${b.description}` + (b.location ? ` (${b.location})` : ""),
+      done: false, group: "next",
+      meta: "bug · " + b.severity,
+      priority: b.severity === "high" ? 5 : b.severity === "medium" ? 4 : 3,
+      subtasks: b.fix ? [{ title: "fix-hint: " + b.fix.slice(0, 100), done: false }] : [],
+    }});
+    sync.mutate("SET_BUG_STATUS", { projectId: project.id, bugId: b.id, status: "fixing" });
+  };
+  const dismissBug = (id) => sync.mutate("SET_BUG_STATUS", { projectId: project.id, bugId: id, status: "dismissed" });
+  const removeBug = (id) => sync.mutate("REMOVE_BUG", { projectId: project.id, bugId: id });
 
   // Spec-upload: user wählt .md (oder andere text-datei), inhalt geht als
   // expliziter prompt an /api/cc/run mit instruktion "implementiere ALLES".
@@ -1655,6 +1678,11 @@ function ScreenTasks({ project, onCcRun }) {
                style={{ maxWidth: 200, fontSize: 12, padding: "4px 10px" }} />
         <input ref={specInputRef} type="file" accept=".md,.txt,.markdown,text/markdown,text/plain"
                style={{ display: "none" }} onChange={onSpecFileChange} />
+        <button className="btn tiny" disabled={bugBusy}
+                onClick={triggerBugScan}
+                title="cc analysiert den code readonly und sucht bugs (~30-60s, ~$0.10)">
+          {bugBusy ? "scannt…" : "🐞 bug-scan"}
+        </button>
         <button className="btn tiny" disabled={specBusy}
                 onClick={() => specInputRef.current?.click()}
                 title="lädt eine .md-spec hoch, cc bekommt sie als prompt und versucht alles umzusetzen">
@@ -1667,6 +1695,49 @@ function ScreenTasks({ project, onCcRun }) {
           {specMsg}
         </div>
       )}
+      {(() => {
+        // Bugs-section: nur sichtbar wenn pending-bugs existieren.
+        // Klick auf header öffnet/schließt die liste.
+        const pendingBugs = (project.bugs || []).filter(b => b.status === "pending");
+        if (pendingBugs.length === 0) return null;
+        return (
+          <div className="box" style={{ marginBottom: 10, borderColor: "#c33" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}
+                 onClick={() => setBugsExpanded(x => !x)}>
+              <span className="eyebrow" style={{ color: "#c33" }}>// bugs</span>
+              <span className="chip" style={{ color: "#c33", borderColor: "#c33" }}>{pendingBugs.length}</span>
+              <span className="grow" />
+              <span style={{ fontSize: 11, color: "var(--ink-faint)" }}>{bugsExpanded ? "▲ einklappen" : "▼ details"}</span>
+            </div>
+            {bugsExpanded && (
+              <div style={{ marginTop: 10, display: "flex", flexDirection: "column", gap: 8 }}>
+                {pendingBugs.slice(0, 8).map(b => (
+                  <div key={b.id} style={{ padding: 8, border: "1px solid var(--line)", borderRadius: 4, background: "rgba(204,51,51,0.04)" }}>
+                    <div style={{ display: "flex", gap: 6, alignItems: "center", marginBottom: 4 }}>
+                      <span className="chip" style={{ color: b.severity === "high" ? "#c33" : b.severity === "medium" ? "#cc8800" : "var(--ink-soft)" }}>
+                        {b.severity || "low"}
+                      </span>
+                      {b.location && <code style={{ fontSize: 10, color: "var(--ink-faint)" }}>{b.location}</code>}
+                    </div>
+                    <div style={{ fontSize: 13, marginBottom: 4 }}>{b.description}</div>
+                    {b.fix && <div style={{ fontSize: 11, color: "var(--ink-soft)", marginBottom: 6 }}>💡 {b.fix.slice(0, 200)}</div>}
+                    <div style={{ display: "flex", gap: 6 }}>
+                      <button className="btn tiny primary" onClick={() => acceptBug(b)}>→ als task</button>
+                      <button className="btn tiny" onClick={() => dismissBug(b.id)}>dismiss</button>
+                      <button className="btn tiny ghost" onClick={() => removeBug(b.id)}>× entfernen</button>
+                    </div>
+                  </div>
+                ))}
+                {pendingBugs.length > 8 && (
+                  <div style={{ fontSize: 11, color: "var(--ink-faint)", textAlign: "center" }}>
+                    + {pendingBugs.length - 8} weitere
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        );
+      })()}
       {isEmpty && !adding && (
         <div className="box" style={{ textAlign: "center", padding: 32, color: "var(--ink-soft)" }}>
           {search.trim()
