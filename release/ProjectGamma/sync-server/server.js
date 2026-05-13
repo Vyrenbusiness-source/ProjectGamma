@@ -779,6 +779,19 @@ const MUT = {
       }),
     }));
   },
+  // Idempotenter set-done — cc-pipeline benutzt das statt TOGGLE_TASK um
+  // race-condition zu vermeiden: wenn user task manuell schon abgehakt
+  // hatte während cc lief, würde TOGGLE_TASK ihn zurück auf 'offen' setzen.
+  SET_TASK_DONE(s, { projectId, taskId, done }) {
+    const target = !!done;
+    s.projects = s.projects.map(p => p.id !== projectId ? p : ({
+      ...p, tasks: p.tasks.map(t => {
+        if (t.id !== taskId) return t;
+        if (t.done === target) return t; // no-op
+        return { ...t, done: target, group: target ? "done" : (t.group === "done" ? "next" : t.group) };
+      }),
+    }));
+  },
   REMOVE_TASK(s, { projectId, taskId }) {
     s.projects = s.projects.map(p => p.id !== projectId ? p : ({ ...p, tasks: p.tasks.filter(t => t.id !== taskId) }));
   },
@@ -2496,6 +2509,12 @@ app.delete("/api/sessions/:token", authMw, (req, res) => {
 // ─── Claude-Code-Integration (echte CLI) ────────────────────
 // Status: idle | running. Pro Projekt höchstens 1 laufender Job.
 const ccJobs = new Map(); // projectId -> { proc, startedAt, taskId, prompt, lines }
+// cwds, für die in dieser server-laufzeit schon mindestens eine cc-session
+// gelaufen ist. nur dann ist --continue safe — sonst bricht claude CLI mit
+// "no conversations found in this directory" ab und cc hängt 'in der luft'.
+// Reset on restart ist ok: erster run pro session zahlt halt einen
+// cache-miss, danach wieder hits.
+const ccProjectsWithSession = new Set();
 
 function ccStatus(projectId) {
   const j = ccJobs.get(projectId);
@@ -2829,7 +2848,10 @@ function _startCcJob(project, taskId, prompt) {
   // skip wenn retry (frischer context für retry, sonst trägt cc den alten
   // fehler durch) oder wenn manual /api/cc/run mit eigenem prompt.
   const isRetry = !!(retryContext && retryContext.attempt > 0);
-  if (!isRetry && task && !prompt) {
+  // --continue NUR wenn wir schon mal ne session im selben cwd hatten.
+  // sonst: claude CLI "no conversations found" → cc bricht stumm ab und
+  // der task hängt für immer in 'running'.
+  if (!isRetry && task && !prompt && ccProjectsWithSession.has(cwd)) {
     args.push("--continue");
   }
   if (mcpConfigPath) {
@@ -2926,6 +2948,12 @@ function _startCcJob(project, taskId, prompt) {
 
     ccJobs.delete(projectId);
     cleanupResolvedConfig(mcpConfigPath);
+    // Session-marker: wenn cc tatsächlich gestartet ist (realUsage da ODER
+    // wir text gesehen haben), gibt es jetzt eine resumable conversation
+    // im cwd → ab jetzt darf --continue benutzt werden.
+    if (job.realUsage || (job.assistantText && job.assistantText.length > 0)) {
+      ccProjectsWithSession.add(cwd);
+    }
     console.log("[cc] done", projectId, "exit", code);
     // Wenn KEIN done=true tail folgt (z.b. done=false, crash, question),
     // wird der release weiter unten nicht hinkommen. Daher hier proaktiv
@@ -3075,7 +3103,7 @@ function _startCcJob(project, taskId, prompt) {
           (tn.subtasks || []).filter(s => !s.done).forEach(s => {
             applyMutation("TOGGLE_SUBTASK", { projectId, taskId, subtaskId: s.id });
           });
-          applyMutation("TOGGLE_TASK", { projectId, taskId });
+          applyMutation("SET_TASK_DONE", { projectId, taskId, done: true });
           applyMutation("ADD_ACTIVITY", { projectId, event: {
             type: "check",
             text: `cc auto-checkmark: <i>${escapeHtml(tn.title)}</i>` +
@@ -3262,7 +3290,7 @@ function _startCcJob(project, taskId, prompt) {
             (tn.subtasks || []).filter(s => !s.done).forEach(s => {
               applyMutation("TOGGLE_SUBTASK", { projectId, taskId, subtaskId: s.id });
             });
-            applyMutation("TOGGLE_TASK", { projectId, taskId });
+            applyMutation("SET_TASK_DONE", { projectId, taskId, done: true });
             applyMutation("ADD_ACTIVITY", { projectId, event: {
               type: "check",
               text: `cc auto-checkmark: <i>${escapeHtml(tn.title)}</i>` +
@@ -3350,7 +3378,7 @@ function _startCcJob(project, taskId, prompt) {
           releasePostCheck(); // erfolgs-pfad: tail komplett, autopump kann nächsten task starten
         }).catch(e => {
           console.log("[selfreview] error:", e.message);
-          applyMutation("TOGGLE_TASK", { projectId, taskId });
+          applyMutation("SET_TASK_DONE", { projectId, taskId, done: true });
           applyMutation("ADD_ACTIVITY", { projectId, event: {
             type: "check",
             text: `cc auto-checkmark (review skipped: ${escapeHtml(e.message)})`,
@@ -3454,7 +3482,12 @@ function _startCcJob(project, taskId, prompt) {
   });
 
   proc.on("error", (err) => {
+    // Timer + post-check lock unbedingt freigeben — sonst hängt
+    // thinking-dot + autopump für diesen projektId für immer.
+    if (job._thinkingTimer) { clearInterval(job._thinkingTimer); job._thinkingTimer = null; }
     ccJobs.delete(projectId);
+    _ccPostChecks.delete(projectId);
+    _ccPostCheckStartedAt.delete(projectId);
     cleanupResolvedConfig(mcpConfigPath);
     console.error("[cc] proc error:", err.message);
     applyMutation("ADD_ACTIVITY", { projectId, event: {
@@ -3463,7 +3496,9 @@ function _startCcJob(project, taskId, prompt) {
     }});
     broadcastState();
     broadcastForProject({ type: "CC_STATUS", projectId, status: { state: "idle" }, error: err.message }, projectId);
+    broadcastForProject({ type: "CC_THINKING_TEXT", projectId, text: "" }, projectId);
     emitPush({ type: "cc_error", projectId, error: err.message });
+    _triggerAutoPumpNow();
   });
 
   return { ok: true, projectId, startedAt: job.startedAt };
