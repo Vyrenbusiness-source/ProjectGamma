@@ -2194,6 +2194,9 @@ function ScreenCloud({ project, onCcRun, onCcStop, ccStatus, ccOutput, ccRunning
         />
       )}
 
+      {/* 2-col layout: main content links + right-sidebar 320px (mockup) */}
+      <div className="pg-screen">
+      <div className="pg-main">
       {/* Aktuelle aufgabe sichtbar wenn run läuft oder in_progress-task vorhanden */}
       {(isRunning || inProgress.length > 0) && (
         <div className="cc-current-task">
@@ -2305,10 +2308,11 @@ function ScreenCloud({ project, onCcRun, onCcStop, ccStatus, ccOutput, ccRunning
             </div>
         }
       </div>
+      </div>{/* /pg-main */}
 
-      <div className="two-col">
+      <aside className="pg-aside">
         <div className="pg-side-panel">
-          <div className="panel-title">// metriken</div>
+          <div className="panel-title">Metriken</div>
           <div className="pg-metric-row"><span className="ico">📈</span><span className="label">events</span><span className="value">{metrics.events}</span></div>
           <div className="pg-metric-row"><span className="ico">✎</span><span className="label">writes</span><span className="value">{metrics.writes}</span></div>
           <div className="pg-metric-row"><span className="ico">👁</span><span className="label">reads</span><span className="value">{metrics.reads}</span></div>
@@ -2317,13 +2321,14 @@ function ScreenCloud({ project, onCcRun, onCcStop, ccStatus, ccOutput, ccRunning
           <div className="pg-metric-row"><span className="ico">⚠</span><span className="label">warnings</span><span className="value">{metrics.warnings}</span></div>
         </div>
         <div className="pg-side-panel">
-          <div className="panel-title">// nächster schritt</div>
-          <div style={{ fontSize: 14, color: "var(--ink)", fontWeight: 600 }}>{inProgress[0]?.title || "warten auf neuen task"}</div>
-          <div style={{ color: "var(--ink-soft)", fontSize: 12, marginTop: 8, lineHeight: 1.5 }}>
+          <div className="panel-title">Nächster Schritt</div>
+          <div style={{ fontSize: 14, color: "var(--ink)", fontWeight: 600 }}>{inProgress[0]?.title || "Warten auf neuen Task"}</div>
+          <div style={{ color: "var(--ink-soft)", fontSize: 12, marginTop: 10, lineHeight: 1.5 }}>
             cloud-code arbeitet an <strong>{inProgress.length}</strong> offenen tasks · {(project.rules || []).filter(r => r.active).length} regeln aktiv
           </div>
         </div>
-      </div>
+      </aside>
+      </div>{/* /pg-screen */}
     </>
   );
 }
