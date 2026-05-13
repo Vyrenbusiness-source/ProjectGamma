@@ -1632,7 +1632,16 @@ function ScreenTasks({ project, onCcRun }) {
     setAdding(false);
   };
 
-  const removeTask = (taskId) => sync.mutate("REMOVE_TASK", { projectId: project.id, taskId });
+  const removeTask = (taskId) => {
+    // Defensive: titel zeigen + bestätigen. user-report 'klick auf x cancelt
+    // alle' deutete auf accidental clicks oder unklare scope hin. mit
+    // confirm bekommt der user sicherheit dass nur DIESE eine aufgabe weg ist.
+    const t = (project.tasks || []).find(x => x.id === taskId);
+    const title = t ? t.title : "diese aufgabe";
+    if (!confirm("aufgabe wirklich löschen?\n\n„" + title.slice(0, 120) + "\"")) return;
+    console.log("[remove-task] id=" + taskId + " title=" + title);
+    sync.mutate("REMOVE_TASK", { projectId: project.id, taskId });
+  };
   const editTask = (taskId, patch) => sync.mutate("EDIT_TASK", { projectId: project.id, taskId, patch });
 
   const addSub = (taskId) => {
