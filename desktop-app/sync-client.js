@@ -209,15 +209,17 @@ class SyncClient {
       case "CC_TOOL_EVENT": {
         // Live-tool-events: pro projekt eine list of {id, tool, glyph, summary, state, ts}
         const arr = this.ccToolEvents[msg.projectId] || (this.ccToolEvents[msg.projectId] = []);
+        let mutated = false;
         if (msg.phase === "use") {
           arr.push({ id: msg.id, tool: msg.tool, glyph: msg.glyph,
                      summary: msg.summary || "", state: "running", ts: msg.ts });
           if (arr.length > 50) arr.shift();
+          mutated = true;
         } else if (msg.phase === "result") {
           const e = arr.find(x => x.id === msg.id);
-          if (e) { e.state = msg.isError ? "error" : "ok"; e.brief = msg.brief; }
+          if (e) { e.state = msg.isError ? "error" : "ok"; e.brief = msg.brief; mutated = true; }
         }
-        this._emit();
+        if (mutated) this._emit();
         return;
       }
       case "CC_THINKING_TEXT":
