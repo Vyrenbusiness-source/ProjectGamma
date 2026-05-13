@@ -395,6 +395,13 @@ let _dailyBudgetWarned = false; // 1× warnen statt jeden tick-spam
 // der 25s-tick pickte den nächsten task auf, retry (3s nach build-gate-fail)
 // crashte mit "läuft bereits" — silent fail. Jetzt: lock bis tail komplett.
 const _ccPostChecks = new Set(); // projectId — currently in build/runtime/review tail
+// User-feedback: 'token-ausgabe brutal, 500k in 30min' AND 'soll nicht
+// langsamer werden — sub-agents statt neue sessions'. Lösung:
+//   - concurrency=1 (eine session pro projekt zur zeit — sub-agents
+//     übernehmen die parallelität, nicht weitere top-level cli-spawns)
+//   - cooldown 30s (war 60s, jetzt nicht langsamer als vorher)
+//   - tick 10s (responsiv für nächste task wenn aktuelle done)
+//   - --continue flag pro projekt → prompt-cache 5min api-side
 const AUTOPUMP_COOLDOWN_MS = 30_000;
 const AUTOPUMP_TICK_MS = 10_000;
 const CC_RUNAWAY_LIMIT_MS = 10 * 60 * 1000; // 10min — danach killen wir runaway jobs
@@ -464,22 +471,39 @@ async function autoPumpTick() {
   if (!state.ccRunning) return;
   if (NOW() < _ccApiLimitedUntil) return; // claude API limit reached — warten
 
-  // SAFETY: daily-budget-cap. Wenn last-24h-cost > cap → autopump pausiert,
-  // user muss manuell entscheiden. Default $10/24h — kann via state.ccBudget
-  // .dailyCapUsd überschrieben werden. Aktivität-log einmal bei activation.
-  const cap = (state.ccBudget && state.ccBudget.dailyCapUsd) || 10.0;
+  // SAFETY: budget-caps. user-feedback war 500k tokens / 30min — wir
+  // brauchen GRANULAREN schutz: per-hour zusätzlich zu per-day.
+  // defaults: $2/hour, $10/24h. beide override-bar via state.ccBudget.
+  const capHour = (state.ccBudget && state.ccBudget.hourlyCapUsd) || 2.0;
+  const capDay = (state.ccBudget && state.ccBudget.dailyCapUsd) || 10.0;
+  const now1h = NOW() - 60 * 60 * 1000;
   const now24h = NOW() - 24 * 60 * 60 * 1000;
-  const last24hCost = ((state.ccBudget && state.ccBudget.jobs) || [])
-    .filter(j => j.ts >= now24h)
-    .reduce((s, j) => s + (j.costUsd || 0), 0);
-  if (last24hCost >= cap) {
+  const jobs = (state.ccBudget && state.ccBudget.jobs) || [];
+  const last1hCost = jobs.filter(j => j.ts >= now1h).reduce((s, j) => s + (j.costUsd || 0), 0);
+  const last24hCost = jobs.filter(j => j.ts >= now24h).reduce((s, j) => s + (j.costUsd || 0), 0);
+
+  if (last1hCost >= capHour) {
     if (!_dailyBudgetWarned) {
       _dailyBudgetWarned = true;
-      console.warn(`[autopump] daily-budget-cap reached: $${last24hCost.toFixed(2)} >= $${cap.toFixed(2)} — autopump pausiert`);
+      console.warn(`[autopump] hourly-budget-cap: $${last1hCost.toFixed(2)} >= $${capHour.toFixed(2)} — autopump pausiert`);
       for (const project of state.projects) {
         applyMutation("ADD_ACTIVITY", { projectId: project.id, event: {
           type: "warn",
-          text: `daily-budget-cap erreicht ($${last24hCost.toFixed(2)} / $${cap.toFixed(2)}) — autopump pausiert. Cap in settings hochsetzen oder bis morgen warten.`,
+          text: `hourly-budget-cap erreicht ($${last1hCost.toFixed(2)} / $${capHour.toFixed(2)}) — autopump pausiert für 1h. settings.ccBudget.hourlyCapUsd hochsetzen falls gewollt.`,
+        }});
+      }
+      broadcastState();
+    }
+    return;
+  }
+  if (last24hCost >= capDay) {
+    if (!_dailyBudgetWarned) {
+      _dailyBudgetWarned = true;
+      console.warn(`[autopump] daily-budget-cap: $${last24hCost.toFixed(2)} >= $${capDay.toFixed(2)} — autopump pausiert`);
+      for (const project of state.projects) {
+        applyMutation("ADD_ACTIVITY", { projectId: project.id, event: {
+          type: "warn",
+          text: `daily-budget-cap erreicht ($${last24hCost.toFixed(2)} / $${capDay.toFixed(2)}) — autopump pausiert. Cap hochsetzen oder bis morgen warten.`,
         }});
       }
       broadcastState();
@@ -491,11 +515,10 @@ async function autoPumpTick() {
   // OPTIMIERUNG: über ALLE idle projekte parallel pumpen — vorher 'break'
   // nach dem ersten match → 1 task pro 10s-tick total. jetzt: pro projekt
   // 1 task parallel. für multi-projekt-users massiver durchsatz-win.
-  // SAFETY: globales concurrency-limit (max 3 parallel) gegen API-burst.
-  // bei 10 projekten würde sonst gleichzeitig 10× claude-API gehämmert →
-  // rate-limit-fast-track + heftiger token-spike auf einmal. 3 ist guter
-  // kompromiss zwischen durchsatz + budget-kontrolle.
-  const MAX_CONCURRENT_CC = 3;
+  // SAFETY: globales concurrency-limit. user-feedback war 500k tokens/30min
+  // bei concurrency=3 → reduziert auf 1. Sequential statt parallel. dauert
+  // länger aber kosten/zeit/token verlauf ist linear vorhersehbar.
+  const MAX_CONCURRENT_CC = 1;
   if (ccJobs.size >= MAX_CONCURRENT_CC) return;
   let canStart = MAX_CONCURRENT_CC - ccJobs.size;
   for (const project of state.projects) {
@@ -2663,6 +2686,17 @@ function _startCcJob(project, taskId, prompt) {
     "    weg. NIEMALS regel deaktivieren um deinen weg zu rechtfertigen.",
     "  - Hard-block (z.b. fehlende API, externe service down) → done=false mit",
     "    KLARER fehler-beschreibung im summary. NICHT vorgaukeln.",
+    "  - TOOL FEHLT AM SYSTEM (z.b. flutter, npm, python, cargo, claude-cli):",
+    "    1× via Bash prüfen (`where flutter` / `which flutter`).",
+    "    wenn definitiv nicht gefunden → SOFORT abort mit done=false +",
+    "    klarer summary: 'flutter SDK fehlt — installieren: <link>'.",
+    "    NIEMALS endlos suchen / immer wieder verschiedene pfade probieren.",
+    "    NIEMALS retry-loops bei tool-missing (das fixt sich nicht von selbst).",
+    "    bekannte fehl-installation-meldungen:",
+    "    - 'flutter SDK fehlt — https://docs.flutter.dev/get-started/install'",
+    "    - 'node/npm fehlt — https://nodejs.org/de/download/'",
+    "    - 'python3 fehlt — https://www.python.org/downloads/'",
+    "    - 'cargo/rust fehlt — https://rustup.rs'",
     "",
     "SELBST-VERIFIKATION (du SOLLST nach jeder änderung verifizieren):",
     "  - code-änderung → Bash-tool: passenden test/lint/build laufen lassen",
@@ -2683,16 +2717,26 @@ function _startCcJob(project, taskId, prompt) {
     "  code-runner (run snippets), fetch (HTTP), github (issues/PRs falls token),",
     "  memory (knowledge-graph cross-session).",
     "",
-    "SUB-AGENTS (Task-tool): bei großem scope DARFST + SOLLST du sub-agenten",
-    "  parallel dispatchen statt linear selber abzuarbeiten. Use-cases:",
-    "  - mehrere unabhängige files refactoren → 1 sub-agent pro file",
-    "  - parallele recherche (grep + read in vielen modulen) → Explore-agent",
-    "  - großes feature mit klar trennbaren teilen (backend+frontend+tests)",
-    "    → je 1 sub-agent, du integrierst danach",
-    "  - audit über viele dateien → general-purpose-agent mit klarem scope",
-    "  Wichtig: jeder sub-agent-prompt MUSS self-contained sein (kein 'wie",
-    "  besprochen'), exakte file-paths + erwartetes ergebnis. Bei unabhängigen",
-    "  sub-tasks: alle Task-calls IN EINER message parallelisieren.",
+    "SUB-AGENTS (Task-tool): PFLICHT bei nontrivialem scope. Spawne sub-",
+    "agenten via Task-tool statt selber linear durchzuarbeiten — sonst",
+    "verbrennst du tokens für context den du nicht brauchst.",
+    "  WANN sub-agent: ",
+    "  - mehrere files zu lesen/scannen → Explore-agent ALLE auf einmal",
+    "  - 2+ unabhängige changes → 1 sub-agent pro change, parallel",
+    "  - großer codeblock zu refactoren → general-purpose mit klarem scope",
+    "  - audit über >3 files → general-purpose-agent",
+    "  WANN NICHT sub-agent:",
+    "  - trivial 1-file edit (z.b. nur einen typo fixen)",
+    "  - du brauchst den vollen state für decisions (selten)",
+    "  REGELN:",
+    "  - jeder sub-agent-prompt MUSS self-contained (kein 'wie besprochen')",
+    "  - exakte file-paths + erwartetes return-format vorgeben",
+    "  - bei N unabhängigen tasks: ALLE Task-calls IN EINER message parallel",
+    "  - sub-agent erbt NICHT deinen context — gib ihm was er braucht.",
+    "  TOKEN-EFFIZIENZ:",
+    "  - sub-agents lesen nur was sie brauchen → 10× weniger input-tokens",
+    "  - parallel statt sequenziell → schneller fertig",
+    "  - dein hauptkontext bleibt klein für die finale entscheidung",
     "",
     "Gib AM ANFANG deiner Antwort einen Plan aus (3-6 konkrete Schritte),",
     "AM ENDE den Status. Format (keine Markdown-Fencing):",
@@ -2778,6 +2822,16 @@ function _startCcJob(project, taskId, prompt) {
     // Hard-Budget pro Task (Sicherung gegen Runaway)
     "--max-budget-usd", String(state.ccBudget?.perTaskUsd ?? 2.0),
   ];
+  // --continue: resume die LETZTE conversation im cwd, statt jedes mal
+  // ne frische zu starten. effekt: API-prompt-cache (5min TTL) hits beim
+  // 2.,3.,4. task derselben projekt-cwd → massive token-ersparnis bei
+  // wiederholten cc-runs auf demselben projekt.
+  // skip wenn retry (frischer context für retry, sonst trägt cc den alten
+  // fehler durch) oder wenn manual /api/cc/run mit eigenem prompt.
+  const isRetry = !!(retryContext && retryContext.attempt > 0);
+  if (!isRetry && task && !prompt) {
+    args.push("--continue");
+  }
   if (mcpConfigPath) {
     args.push("--mcp-config", mcpConfigPath);
   }
@@ -4290,7 +4344,7 @@ async function runBugHunt(project) {
 // damit der user nicht jedes mal manuell '🐞 hunt' klicken muss.
 // Intervall 30min, skipped wenn bugHuntRunning oder cc gerade busy ist
 // auf diesem projekt.
-const BUG_AUTOSCAN_INTERVAL_MS = 30 * 60 * 1000; // 30min zwischen scans
+const BUG_AUTOSCAN_INTERVAL_MS = 2 * 60 * 60 * 1000; // 2h zwischen scans (war 30min — zu aggressiv)
 setInterval(() => {
   if (!state.ccRunning) return; // cc paused → nicht autoscanen
   if (NOW() < _ccApiLimitedUntil) return; // api-limit aktiv
