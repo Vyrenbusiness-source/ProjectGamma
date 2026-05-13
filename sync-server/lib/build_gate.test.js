@@ -98,6 +98,30 @@ test("runBuildGate: output wird auf 8kB capped", async () => {
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
+test("runBuildGate: timeout → timedOut:true + ok:false; prozess wird hart gekillt", async () => {
+  const dir = tempDir();
+  // 30s sleep als script-file (kein -e mit quotes, weil shell:true die mangelt).
+  // Timeout nach 500ms → timer muss greifen und prozessbaum killen.
+  // Auf windows mit shell:true wäre proc.kill('SIGKILL') alleine wirkungslos,
+  // taskkill /T /F killt den ganzen baum.
+  const script = path.join(dir, "sleep.js");
+  fs.writeFileSync(script, "setTimeout(function(){}, 30000);");
+  const t0 = Date.now();
+  const r = await runBuildGate({
+    projectPath: dir,
+    customCmd: "node",
+    customArgs: [script],
+    customTimeoutMs: 500,
+  });
+  const elapsed = Date.now() - t0;
+  assert.equal(r.timedOut, true);
+  assert.equal(r.ok, false);
+  // Sicherheitspuffer: muss klar unter 30s zurückkehren — wenn der orphan
+  // weiterläuft und das close-event blockiert, würde dieser test hängen.
+  assert.ok(elapsed < 10000, "muss nach timeout schnell zurückkehren, war: " + elapsed + "ms");
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
 test("runBuildGate: onProgress callback wird aufgerufen", async () => {
   const dir = tempDir();
   let progressChunks = 0;

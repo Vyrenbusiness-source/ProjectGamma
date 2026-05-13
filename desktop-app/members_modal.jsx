@@ -255,13 +255,14 @@
     useEffect(() => {
       let stop = false;
       async function tick() {
+        if (document.hidden) return;
         try {
           const r = await fetch(serverUrl + "/api/network-info");
           if (!stop && r.ok) setInfo(await r.json());
         } catch (_) {}
       }
       tick();
-      const t = setInterval(tick, 5000);
+      const t = setInterval(tick, 10000);
       return () => { stop = true; clearInterval(t); };
     }, [serverUrl]);
 

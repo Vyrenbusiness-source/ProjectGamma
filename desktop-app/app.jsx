@@ -312,19 +312,24 @@ function PairCodeModal({ onClose }) {
   const sessionsBefore = useRef(null);
 
   useEffect(() => { fetchLanInfo(client.serverUrl).then(setLanInfo); }, [client.serverUrl]);
-  // Tunnel-status laden + alle 3s pollen während starting/active.
+  // Tunnel-status laden + nur pollen während starting/active.
+  // Fix: vorher pollte er auch im idle-status alle 3s → unnötige requests.
+  // Jetzt: initial-fetch + interval nur wenn status transitioning, und
+  // pause wenn tab nicht sichtbar (saves CPU im hintergrund).
   useEffect(() => {
     let alive = true;
     async function poll() {
+      if (document.hidden) return;
       try {
         const r = await fetch(client.serverUrl + "/api/tunnel/status").then(r => r.json());
         if (alive) setTunnel(r);
       } catch (_) {}
     }
     poll();
-    const iv = setInterval(poll, 3000);
-    return () => { alive = false; clearInterval(iv); };
-  }, [client.serverUrl]);
+    const shouldPoll = tunnel.status === "starting" || tunnel.status === "active";
+    const iv = shouldPoll ? setInterval(poll, 3000) : null;
+    return () => { alive = false; if (iv) clearInterval(iv); };
+  }, [client.serverUrl, tunnel.status]);
 
   const toggleTunnel = async () => {
     setTunnelBusy(true);

@@ -79,16 +79,42 @@ function detectCheck(projectPath) {
 }
 
 /**
+ * Tötet einen child-process inkl. aller enkel-prozesse.
+ * Windows: shell:true → proc.pid zeigt auf cmd.exe; ein simples SIGKILL
+ * würde nur den wrapper killen und flutter/npm/python liefe als orphan
+ * weiter (blockiert ports/locks). `taskkill /T /F` killt den ganzen baum.
+ * Unix: SIGKILL reicht (signals propagieren über pgid bzw. controlling-tty).
+ */
+function killProcessTree(proc) {
+  if (!proc || proc.killed) return;
+  if (process.platform === "win32" && proc.pid) {
+    // NICHT proc.kill() zusätzlich aufrufen — würde cmd.exe sofort killen,
+    // bevor taskkill /T den baum traversieren kann. orphan-childs wären die folge.
+    try {
+      spawn("taskkill", ["/pid", String(proc.pid), "/T", "/F"], {
+        stdio: "ignore", windowsHide: true,
+      });
+      return;
+    } catch (_) { /* taskkill nicht da → fallback unten */ }
+  }
+  try { proc.kill("SIGKILL"); } catch (_) {}
+}
+
+/**
  * Führt den build-gate aus. Liefert { ok, kind, output, durationMs, skipped? }.
  * skipped:true wenn keine bekannte tech detected wurde — in dem fall darf
  * self-review fortlaufen (kein build-check vorhanden ist KEIN fehler).
+ * customTimeoutMs override für customCmd (default 120s) — primär für tests.
  */
-function runBuildGate({ projectPath, customCmd, customArgs, onProgress }) {
+function runBuildGate({ projectPath, customCmd, customArgs, customTimeoutMs, onProgress }) {
   return new Promise((resolve) => {
     const start = Date.now();
     let check;
     if (customCmd) {
-      check = { name: "custom", cmd: customCmd, args: customArgs || [], timeoutMs: 120 * 1000 };
+      check = {
+        name: "custom", cmd: customCmd, args: customArgs || [],
+        timeoutMs: customTimeoutMs || 120 * 1000,
+      };
     } else {
       check = detectCheck(projectPath);
     }
@@ -110,7 +136,7 @@ function runBuildGate({ projectPath, customCmd, customArgs, onProgress }) {
     });
     const timer = setTimeout(() => {
       killed = true;
-      try { proc.kill("SIGKILL"); } catch (_) {}
+      killProcessTree(proc);
     }, check.timeoutMs);
     proc.stdout.on("data", (c) => {
       const s = c.toString();
@@ -147,4 +173,4 @@ function runBuildGate({ projectPath, customCmd, customArgs, onProgress }) {
   });
 }
 
-module.exports = { detectCheck, runBuildGate, TECH_CHECKS };
+module.exports = { detectCheck, runBuildGate, killProcessTree, TECH_CHECKS };
