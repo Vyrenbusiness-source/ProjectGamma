@@ -377,10 +377,31 @@ setInterval(() => {
 
 // Auto-Pump: wenn ccRunning + kein Job läuft → starte den nächsten Task
 // automatisch. Reihenfolge: in_progress (höchste prio) > next (höchste prio).
-// "done" und "ohne pfad" werden geskippt. Cool-down 90s pro Task gegen Loops.
+// "done" und "ohne pfad" werden geskippt. Cool-down 30s pro Task gegen Loops.
 const _autoPumpCooldowns = new Map(); // taskId -> ts
 const _autoPumpMissingPathWarned = new Set(); // projectId -> 1× warnen statt 25s-spam
 let _ccApiLimitedUntil = 0; // ts — wenn claude API limit reached, pause auto-pump bis dahin
+
+// Post-cc-checks-lock: solange build-gate / runtime-test / self-review für
+// einen task laufen, soll autopump KEINEN neuen task auf demselben projekt
+// starten. Vorher fehlte das: ccJobs.delete passierte sofort bei cc-cli-close,
+// der 25s-tick pickte den nächsten task auf, retry (3s nach build-gate-fail)
+// crashte mit "läuft bereits" — silent fail. Jetzt: lock bis tail komplett.
+const _ccPostChecks = new Set(); // projectId — currently in build/runtime/review tail
+const AUTOPUMP_COOLDOWN_MS = 30_000;
+const AUTOPUMP_TICK_MS = 10_000;
+const CC_RUNAWAY_LIMIT_MS = 10 * 60 * 1000; // 10min — danach killen wir runaway jobs
+
+function _isProjectBusy(projectId) {
+  return ccJobs.has(projectId) || _ccPostChecks.has(projectId);
+}
+
+// Sofort autopump triggern (kein 25s-warten), z.b. wenn ein task gerade
+// fertig wurde. Async via setTimeout(0) damit der aktuelle handler
+// erstmal sauber zuende läuft.
+function _triggerAutoPumpNow() {
+  setTimeout(() => { autoPumpTick().catch(() => {}); }, 50);
+}
 
 // Failure-loop state: pro task tracken wir wie oft cc retried hat + den
 // letzten fehler-output, damit der retry-prompt gezielt fixen kann statt
@@ -401,7 +422,7 @@ async function autoPumpTick() {
   if (!state.ccRunning) return;
   if (NOW() < _ccApiLimitedUntil) return; // claude API limit reached — warten
   for (const project of state.projects) {
-    if (ccJobs.has(project.id)) continue;
+    if (_isProjectBusy(project.id)) continue;
     if (!project.path || !fs.existsSync(project.path)) {
       if (!_autoPumpMissingPathWarned.has(project.id)) {
         _autoPumpMissingPathWarned.add(project.id);
@@ -422,7 +443,7 @@ async function autoPumpTick() {
     // Ersten Kandidaten ohne aktiven Cool-down nehmen
     const candidate = queue.find(t => {
       const last = _autoPumpCooldowns.get(t.id) || 0;
-      return NOW() - last > 90_000;
+      return NOW() - last > AUTOPUMP_COOLDOWN_MS;
     });
     if (!candidate) continue;
     _autoPumpCooldowns.set(candidate.id, NOW());
@@ -439,7 +460,21 @@ async function autoPumpTick() {
     break;
   }
 }
-setInterval(autoPumpTick, 25 * 1000);
+setInterval(autoPumpTick, AUTOPUMP_TICK_MS);
+
+// Watchdog: kill runaway cc-jobs nach CC_RUNAWAY_LIMIT_MS (10min). Sonst
+// bleibt ccJobs für immer belegt wenn claude API hängt oder eine endlos-
+// schleife läuft, und autopump kann nichts mehr pumpen.
+setInterval(() => {
+  const now = NOW();
+  for (const [pid, job] of ccJobs) {
+    if (now - job.startedAt > CC_RUNAWAY_LIMIT_MS) {
+      console.warn("[cc-watchdog] runaway-kill projektId=" + pid + " task=" + job.taskId + " runtime=" + Math.round((now - job.startedAt)/1000) + "s");
+      try { job.proc.kill("SIGKILL"); } catch (_) {}
+      // ccJobs.delete passiert über on-close handler bei normalem kill
+    }
+  }
+}, 60_000);
 
 // Auto-answer-ticker: wenn projekt.ccAutoAnswer=true UND eine pendingQuestion
 // länger als delaySec offen ist, schicken wir automatisch eine konkrete antwort
@@ -2214,7 +2249,7 @@ function ccStatus(projectId) {
 async function triggerCc(projectId, taskId, prompt) {
   const project = state.projects.find(p => p.id === projectId);
   if (!project) { const e = new Error("projekt nicht gefunden"); e.status = 404; throw e; }
-  if (ccJobs.has(projectId)) { const e = new Error("cloud-code läuft bereits"); e.status = 409; throw e; }
+  if (_isProjectBusy(projectId)) { const e = new Error("cloud-code läuft bereits"); e.status = 409; throw e; }
   // Regel-Linter vor jedem Cloud-Code-Run (errors blockieren, warnings nur loggen)
   const lint = lintCcRules(project);
   console.log("[cc] " + formatCcLint(lint));
@@ -2663,10 +2698,50 @@ function _startCcJob(project, taskId, prompt) {
 
     if (parsedStatus && parsedStatus.done === true && taskId) {
       // ─── BUILD-GATE + FAILURE-LOOP ─────────────────────────
-      // Erst echten build-/test-check fahren (flutter analyze, npm test, ...).
-      // Wenn der gate rot ist: KEIN checkmark, sondern retry mit fehler-context.
-      // Wenn skipped (keine bekannte tech): direkt zu self-review.
-      // Wenn grün: self-review wie bisher.
+      // Lock: autopump soll während build-gate/runtime/review NICHT einen
+      // neuen task auf diesem projekt picken (sonst crasht der retry mit
+      // "läuft bereits"). _ccPostChecks.delete passiert in der release-
+      // funktion am ende aller pfade (success, retry, max-retry).
+      _ccPostChecks.add(projectId);
+      const releasePostCheck = () => {
+        _ccPostChecks.delete(projectId);
+        // sofort den nächsten task starten — kein 25s-warten mehr
+        _triggerAutoPumpNow();
+      };
+
+      // OPTIMIERUNG: skip build-gate komplett wenn cc 0 dateien geändert
+      // hat. read-only/analyse-tasks brauchen keine echte verifikation —
+      // genau wie self-review schon geskippt wird. spart 30-180s pro task.
+      const filesChangedList = Array.isArray(parsedStatus.filesChanged) ? parsedStatus.filesChanged : [];
+      if (filesChangedList.length === 0) {
+        applyMutation("ADD_ACTIVITY", { projectId, event: {
+          type: "info",
+          text: "build-gate + runtime-test übersprungen (0 dateien geändert)",
+        }});
+        // Direkt zu auto-checkmark (review wird intern auch geskippt da
+        // filesChanged.length === 0 → siehe skipReview branch unten).
+        // Wir simulieren build-gate=ok + runtime=skipped um den bestehenden
+        // flow nicht neu zu schreiben.
+        // → einfacher: jetzt direkt auto-mark-done aufrufen.
+        const tn = state.projects.find(p=>p.id===projectId)?.tasks.find(t=>t.id===taskId);
+        if (tn) {
+          (tn.subtasks || []).filter(s => !s.done).forEach(s => {
+            applyMutation("TOGGLE_SUBTASK", { projectId, taskId, subtaskId: s.id });
+          });
+          applyMutation("TOGGLE_TASK", { projectId, taskId });
+          applyMutation("ADD_ACTIVITY", { projectId, event: {
+            type: "check",
+            text: `cc auto-checkmark: <i>${escapeHtml(tn.title)}</i>` +
+                  (parsedStatus.summary ? ` · ${escapeHtml(parsedStatus.summary)}` : "") +
+                  " · (read-only, gates übersprungen)",
+          }});
+          _ccRetryContext.delete(taskId);
+          broadcastState();
+        }
+        releasePostCheck();
+        return;
+      }
+
       applyMutation("ADD_ACTIVITY", { projectId, event: {
         type: "info",
         text: `build-gate läuft (${project.tech || "?"}) …`,
