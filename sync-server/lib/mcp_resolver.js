@@ -21,12 +21,27 @@ function expandEnv(value, env) {
   return env[m[1]] || "";
 }
 
+// MCP-tier-allowlists: kleine tasks brauchen meistens nur filesystem +
+// sequential-thinking. puppeteer/code-runner/context7/fetch/github sind
+// schwergewicht (lange cold-start + große tool-schemas im prompt = mehr
+// tokens). Tiers spart pro spawn 6-8 server × 1-2s startup + ~7000
+// schema-tokens.
+const MCP_TIERS = {
+  minimal: new Set(["filesystem", "sequential-thinking", "memory"]),
+  // standard fügt context7 (lib-docs) hinzu — viele tasks brauchen das
+  standard: new Set(["filesystem", "sequential-thinking", "memory", "context7"]),
+  // full = alles aus mcp.json
+  full: null,
+};
+
 /**
  * Lädt mcp.json, filtert tote server (env-vars fehlen) und schreibt eine
  * resolved-config in eine temp-datei. Liefert deren Pfad zurück, oder null
  * falls keine config existiert.
+ *
+ * tier: "minimal" | "standard" | "full" (default "full" = legacy verhalten)
  */
-function resolveMcpConfig({ baseDir, env = process.env, tmpDir }) {
+function resolveMcpConfig({ baseDir, env = process.env, tmpDir, tier = "full" }) {
   const sourcePath = path.join(baseDir, "mcp.json");
   if (!fs.existsSync(sourcePath)) return null;
   let raw;
@@ -36,10 +51,12 @@ function resolveMcpConfig({ baseDir, env = process.env, tmpDir }) {
     console.warn("[mcp] mcp.json invalid:", e && e.message);
     return null;
   }
+  const allow = MCP_TIERS[tier] || null;
   const servers = (raw && raw.mcpServers) || {};
   const out = {};
   for (const [name, def] of Object.entries(servers)) {
     if (!def || typeof def !== "object") continue;
+    if (allow && !allow.has(name)) continue; // tier-filter
     const envIn = def.env || {};
     let skip = false;
     const envOut = {};

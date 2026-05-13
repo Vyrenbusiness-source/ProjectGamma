@@ -2385,28 +2385,35 @@ function _startCcJob(project, taskId, prompt) {
   // Bitte claude am Ende einen JSON-Block mit Regel-Vorschlägen auszugeben,
   // den der Server parsed und als „cc-vorschlag"-Regeln erstellt (inaktiv).
   const activeRules = project.rules.filter(r => r.active).map(r => "- " + r.text);
-  const inactiveRules = project.rules.filter(r => !r.active).map(r => "- " + r.text);
+  // inactiveRules sind oft "cc-vorschlag"-regeln die der user nicht akzeptiert
+  // hat. Wir trimmen aggressiv: nur 5 stück, je 100 zeichen — sonst werden
+  // alte ablehnungen sehr token-teuer in projekten mit vielen vorschlägen.
+  const inactiveRules = project.rules.filter(r => !r.active)
+    .slice(0, 5)
+    .map(r => "- " + String(r.text || "").slice(0, 100));
   // Tombstones: regeln, die der user kürzlich entfernt hat. Damit cc nicht
   // unbedacht dieselben texte als RULE_SUGGESTIONS wieder vorschlägt.
-  const removedRules = (project.removedRules || []).slice(0, 10).map(r => "- " + r.text);
+  // TOKEN-OPTIMIERUNG: nur top 5 + jeder text auf 80 zeichen kappen.
+  const removedRules = (project.removedRules || []).slice(0, 5)
+    .map(r => "- " + String(r.text || "").slice(0, 80));
   const goals = project.goals || [];
 
-  // PROJEKT-MEMORY: damit cc nicht nach jedem task den faden verliert,
-  // streamen wir 3 kontext-blöcke in den prompt:
-  //   1) letzte 5 wesentliche activity-events (write/check/warn, was passierte)
-  //   2) top 3 offene bugs (pending) — falls cc fixes priorisieren soll
-  //   3) letzte cc-summary (kurzer "wo standen wir" einzeiler)
+  // PROJEKT-MEMORY: kompakte kontext-blöcke. token-sparend:
+  //   - 3 letzte activity-events statt 5, je 100 zeichen kapping
+  //   - 3 top bugs (gleich), je 80 zeichen kapping
+  //   - letzte cc-summary auf 200 zeichen
+  // gesamt-trim: ~70% reduktion gegenüber vorher.
   const recentActivity = (project.activity || [])
     .filter(a => ["check","write","warn","edit","rule"].includes(a.type))
-    .slice(0, 5)
-    .map(a => "- " + stripHtml(a.text || ""));
+    .slice(0, 3)
+    .map(a => "- " + stripHtml(a.text || "").slice(0, 100));
   const openBugs = (project.bugs || [])
     .filter(b => b.status === "pending")
     .slice(0, 3)
-    .map(b => "- [" + (b.severity || "?") + "] " + (b.description || "").slice(0, 120));
+    .map(b => "- [" + (b.severity || "?") + "] " + (b.description || "").slice(0, 80));
   const lastCcCheck = (project.activity || [])
     .find(a => a.type === "check" && /cc auto-checkmark/.test(a.text || ""));
-  const lastCcSummary = lastCcCheck ? stripHtml(lastCcCheck.text) : null;
+  const lastCcSummary = lastCcCheck ? stripHtml(lastCcCheck.text).slice(0, 200) : null;
 
   // Failure-context: wenn dieser run ein retry ist (vorheriger build/test
   // fehlgeschlagen), fügen wir die fehlerausgabe in den prompt ein, damit
@@ -2446,8 +2453,14 @@ function _startCcJob(project, taskId, prompt) {
     "",
     "Du DARFST und SOLLST Dateien lesen und schreiben (bypassPermissions ist aktiv)",
     "um die Aufgabe zu erledigen. Halte alle aktiven Regeln strikt ein.",
-    "Es gibt KEIN wort-limit — schreibe so viel wie nötig, aber bleib auf der",
-    "aufgabe fokussiert (kein meta-talk).",
+    "",
+    "OUTPUT-BUDGET (wichtig — token + zeit sparen):",
+    "  - TASK_PLAN: max 6 schritte, je ein satz.",
+    "  - tool-aufrufe: kein meta-talk vor/nach. einfach machen.",
+    "  - TASK_STATUS.summary: max 200 zeichen (was du getan hast).",
+    "  - kein 'lass mich das jetzt tun…' / 'ich werde nun…' — direkt handeln.",
+    "  - keine wiederholungen vom prompt-content im output.",
+    "  - bei großen file-changes: NICHT den ganzen file-content zitieren.",
     "",
     "BLOCKER-RESOLUTION (wichtig wenn du auf hindernisse stößt):",
     "  - Build/test/lint fehler → fixe die URSACHE im code, NICHT umgehen.",
@@ -2551,14 +2564,6 @@ function _startCcJob(project, taskId, prompt) {
   // MCP-Konfig: gibt claude Zugriff auf filesystem, sequential-thinking,
   // context7 (lib-docs), puppeteer (browser-automation), code-runner,
   // ref-tools. Konfig liegt neben server.js.
-  // MCP-Konfig dynamisch auflösen: server ohne gesetzte env-vars (z.b.
-  // ref-tools ohne REF_API_KEY) werden gefiltert, sonst hängt claude beim
-  // tool-call.
-  const mcpConfigPath = resolveMcpConfig({ baseDir: __dirname });
-  // Task 3: stream-json + verbose → wir bekommen strukturierte events
-  // (tool_use, tool_result, result mit echten tokens) statt nur rohtext.
-  // Selbe model-tokens wie vorher (claude generiert dasselbe), nur das CLI
-  // emittiert es jsonl statt plaintext.
   // Model-routing: sonnet-4-6 default (schnell+billig), opus-4-7 nur wenn
   // big-signatur (architektur, refactor, retry, hohe priority). spart bei
   // 80%+ der tasks token-cost-ratio von ~3× (opus zu sonnet).
@@ -2567,6 +2572,12 @@ function _startCcJob(project, taskId, prompt) {
     retryAttempt: retryContext?.attempt || 0,
     prompt: fullPrompt,
   });
+  // MCP-Konfig dynamisch auflösen: tier-basierte allowlist (kleine tasks
+  // brauchen nicht puppeteer+github+code-runner+fetch — spart 6-8 server
+  // × ~1s startup + ~7000 schema-tokens pro spawn). standard für sonnet-4.6,
+  // full für opus-4.7.
+  const mcpTier = selectedModel === "claude-opus-4-7" ? "full" : "standard";
+  const mcpConfigPath = resolveMcpConfig({ baseDir: __dirname, tier: mcpTier });
   const args = [
     "--print",
     "--output-format", "stream-json",
