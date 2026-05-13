@@ -43,7 +43,7 @@
       setAutoFixing(true); setAutoFixLog("läuft… kann ~30s dauern");
       try {
         const r = await fetch(client.serverUrl + "/api/setup/auto-fix", { method: "POST", headers: auth() });
-        const data = await r.json();
+        const data = await r.json().catch(() => ({}));
         if (r.ok) {
           const inst = data.installed && data.installed.length
             ? "✓ installiert: " + data.installed.join(", ") : "keine npm-installs nötig";
