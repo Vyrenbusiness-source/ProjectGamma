@@ -479,9 +479,13 @@ async function autoPumpTick() {
 
   // SAFETY: budget-caps. user-feedback war 500k tokens / 30min — wir
   // brauchen GRANULAREN schutz: per-hour zusätzlich zu per-day.
-  // defaults: $2/hour, $10/24h. beide override-bar via state.ccBudget.
-  const capHour = (state.ccBudget && state.ccBudget.hourlyCapUsd) || 2.0;
-  const capDay = (state.ccBudget && state.ccBudget.dailyCapUsd) || 10.0;
+  // 2026-05-14: defaults von $2/h $10/24h auf $10/h $50/24h erhöht —
+  // $2/h triggerte zu oft autopump-pausen bei aktiver multi-task-arbeit
+  // (skeleton-aufsetzen + 4-6 tasks/h × $0.20 = $1.20/h ist normal,
+  // aber bei opus oder größeren tasks war 2$ schnell weg). user kann
+  // jederzeit niedriger setzen via SET_CC_BUDGET_CAPS.
+  const capHour = (state.ccBudget && state.ccBudget.hourlyCapUsd) || 10.0;
+  const capDay = (state.ccBudget && state.ccBudget.dailyCapUsd) || 50.0;
   const now1h = NOW() - 60 * 60 * 1000;
   const now24h = NOW() - 24 * 60 * 60 * 1000;
   const jobs = (state.ccBudget && state.ccBudget.jobs) || [];
@@ -587,23 +591,36 @@ setInterval(() => {
   }
 }, 60_000);
 
-// Stale-lock cleanup: _ccPostChecks-locks die >15min alt sind werden
+// Stale-lock cleanup: _ccPostChecks-locks die >5min alt sind werden
 // auto-released. schützt gegen hängende build-gates / runtime-tests deren
 // promise nie resolved (z.b. flutter pub get hängt, npm test deadlock).
 // Sonst bleibt autopump für diesen projekt-id für immer blockiert.
+// 2026-05-14: war 15min — viel zu lang. build-gate timeout ist 90-180s,
+// runtime-test 10s, self-review ~30s — wenn ein lock >5min hängt, ist
+// definitiv was kaputt. tick auf 30s damit detection schneller greift.
 const _ccPostCheckStartedAt = new Map(); // projectId -> startTs, parallel zu _ccPostChecks
-const STALE_LOCK_MS = 15 * 60 * 1000;
+const STALE_LOCK_MS = 5 * 60 * 1000;
 setInterval(() => {
   const now = NOW();
   for (const [pid, startTs] of _ccPostCheckStartedAt) {
     if (now - startTs > STALE_LOCK_MS) {
-      console.warn("[cc-postcheck-watchdog] stale lock release pid=" + pid + " age=" + Math.round((now - startTs)/1000) + "s");
+      const ageS = Math.round((now - startTs) / 1000);
+      console.warn("[cc-postcheck-watchdog] stale lock release pid=" + pid + " age=" + ageS + "s");
       _ccPostChecks.delete(pid);
       _ccPostCheckStartedAt.delete(pid);
+      // sichtbar im UI machen — sonst merkt der user nie warum autopump wieder
+      // läuft (oder dass es überhaupt ein hang gab).
+      try {
+        applyMutation("ADD_ACTIVITY", { projectId: pid, event: {
+          type: "warn",
+          text: `cc-postcheck-lock stale (>${Math.round(STALE_LOCK_MS/60000)}min, ${ageS}s gehängt) — autopump auto-released. ursache vermutlich: build-gate/runtime-test/self-review promise hängt.`,
+        }});
+        broadcastState();
+      } catch (_) { /* projekt evtl. gelöscht */ }
       _triggerAutoPumpNow();
     }
   }
-}, 60_000);
+}, 30_000);
 
 // Auto-answer-ticker: wenn projekt.ccAutoAnswer=true UND eine pendingQuestion
 // länger als delaySec offen ist, schicken wir automatisch eine konkrete antwort
@@ -3009,7 +3026,7 @@ function _startCcJob(project, taskId, prompt) {
     "--model", selectedModel,
     "--add-dir", cwd,
     // Hard-Budget pro Task (Sicherung gegen Runaway)
-    "--max-budget-usd", String(state.ccBudget?.perTaskUsd ?? 2.0),
+    "--max-budget-usd", String(state.ccBudget?.perTaskUsd ?? 5.0),
   ];
   if (isTrivialWriteTask) {
     // Trivial-write: NUR WebFetch/WebSearch sperren (Bash + Task brauchen wir
@@ -3202,7 +3219,7 @@ function _startCcJob(project, taskId, prompt) {
     const durationMs = NOW() - job.startedAt;
 
     // Globaler Tracker
-    if (!state.ccBudget) state.ccBudget = { totalTokensIn: 0, totalTokensOut: 0, totalCostUsd: 0, perTaskUsd: 2.0, jobs: [] };
+    if (!state.ccBudget) state.ccBudget = { totalTokensIn: 0, totalTokensOut: 0, totalCostUsd: 0, perTaskUsd: 5.0, jobs: [] };
     state.ccBudget.totalTokensIn += inputTokens;
     state.ccBudget.totalTokensOut += outputTokens;
     state.ccBudget.totalCostUsd += estCostUsd;
