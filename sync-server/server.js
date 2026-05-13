@@ -204,18 +204,36 @@ let claudeCliInfo = { installed: false, version: null, path: null, error: null }
 // sowohl npm-globale (.cmd) als auch Anthropic-standalone (.exe in
 // ~/.local/bin) installation ab. Fallback bleibt die alte windows-suche
 // für den fall, dass detection beim boot fehlschlug.
+// Cache für claudeBin-resolution: bei jedem spawn fs.existsSync auf 3 paths
+// ist teuer wenn cc auto-pumpt. 5min TTL ist konservativ — wenn der user
+// claude-cli neu installiert, müsste er eh den server neustarten.
+let _claudeBinCache = null;
+let _claudeBinCacheTs = 0;
+const _CLAUDE_BIN_TTL_MS = 5 * 60 * 1000;
 function resolveClaudeBinary() {
   if (claudeCliInfo.path && claudeCliInfo.path !== "auto-installed") return claudeCliInfo.path;
-  if (process.platform !== "win32") return "claude";
+  const now = Date.now();
+  if (_claudeBinCache && now - _claudeBinCacheTs < _CLAUDE_BIN_TTL_MS) return _claudeBinCache;
+  if (process.platform !== "win32") {
+    _claudeBinCache = "claude";
+    _claudeBinCacheTs = now;
+    return _claudeBinCache;
+  }
   const candidates = [
     path.join(process.env.APPDATA || "", "npm", "claude.cmd"),
     path.join(process.env.USERPROFILE || "", ".local", "bin", "claude.exe"),
     "claude.cmd",
   ];
   for (const c of candidates) {
-    if (c && (!path.isAbsolute(c) || fs.existsSync(c))) return c;
+    if (c && (!path.isAbsolute(c) || fs.existsSync(c))) {
+      _claudeBinCache = c;
+      _claudeBinCacheTs = now;
+      return c;
+    }
   }
-  return "claude.cmd";
+  _claudeBinCache = "claude.cmd";
+  _claudeBinCacheTs = now;
+  return _claudeBinCache;
 }
 
 // UPnP-portmap: versucht beim boot das port-mapping LAN-port → WAN-port
@@ -2764,7 +2782,21 @@ function _startCcJob(project, taskId, prompt) {
         }
 
         // ─── SELF-REVIEW (gate grün, runtime grün) ────────────
-        runSelfReview(project, taskId, parsedStatus, fullOutput).then(review => {
+        // Optimierung: skip self-review wenn cc 0 dateien geändert hat —
+        // bei reinen analyse-tasks (research/summary) ist review redundant
+        // und kostet einen zweiten claude-call (~5-15s + tokens).
+        const filesChanged = Array.isArray(parsedStatus.filesChanged) ? parsedStatus.filesChanged : [];
+        const skipReview = filesChanged.length === 0;
+        const reviewPromise = skipReview
+          ? Promise.resolve({ ok: true, issues: [], confidence: 0.9, skipped: true })
+          : runSelfReview(project, taskId, parsedStatus, fullOutput);
+        if (skipReview) {
+          applyMutation("ADD_ACTIVITY", { projectId, event: {
+            type: "info",
+            text: "self-review übersprungen (0 dateien geändert)",
+          }});
+        }
+        reviewPromise.then(review => {
           const tn = state.projects.find(p=>p.id===projectId)?.tasks.find(t=>t.id===taskId);
           if (!tn) return;
           if (review.ok) {

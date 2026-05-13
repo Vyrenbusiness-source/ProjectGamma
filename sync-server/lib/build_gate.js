@@ -63,19 +63,34 @@ const TECH_CHECKS = [
   },
 ];
 
+// Cache für detectCheck: tech-detection macht fs.existsSync für jeden
+// projekt-typ. Wechselt selten (manifest-files bleiben über stunden gleich).
+// 60s TTL ist defensiv genug für ad-hoc-änderungen.
+const _detectCache = new Map(); // projectPath -> { result, ts }
+const _DETECT_TTL_MS = 60_000;
+
 /**
  * Erkennt project-tech, ohne zu spawnen.
  * @param {string} projectPath
  * @returns {{name, cmd, args, timeoutMs} | null}
  */
 function detectCheck(projectPath) {
-  if (!projectPath || !fs.existsSync(projectPath)) return null;
-  for (const t of TECH_CHECKS) {
-    try {
-      if (t.detect(projectPath)) return { ...t };
-    } catch (_) { /* tech-detect-error → nächste tech */ }
+  if (!projectPath) return null;
+  const now = Date.now();
+  const cached = _detectCache.get(projectPath);
+  if (cached && now - cached.ts < _DETECT_TTL_MS) {
+    return cached.result ? { ...cached.result } : null;
   }
-  return null;
+  let result = null;
+  if (fs.existsSync(projectPath)) {
+    for (const t of TECH_CHECKS) {
+      try {
+        if (t.detect(projectPath)) { result = t; break; }
+      } catch (_) { /* tech-detect-error → nächste tech */ }
+    }
+  }
+  _detectCache.set(projectPath, { result, ts: now });
+  return result ? { ...result } : null;
 }
 
 /**
