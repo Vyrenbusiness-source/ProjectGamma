@@ -3,6 +3,7 @@
 // Listen + Details liegen in den dedizierten Tabs (aufgaben/regeln/ideen/cloud).
 
 import 'package:flutter/material.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import '../theme.dart';
 import '../sync_client.dart';
 import '../features/members/members_screen.dart';
@@ -19,8 +20,48 @@ class ProjectScreen extends StatefulWidget {
 class _ProjectScreenState extends State<ProjectScreen> {
   final _ideaCtrl = TextEditingController();
   bool _saving = false;
-  // D5 · onboarding dismiss-state (manuell)
-  bool _onboardDismissed = false;
+  // D5 + FIX #12 · onboarding dismiss-state persistiert in SharedPreferences
+  // pro projectId — sonst verschwindet der dismiss bei project-switch oder
+  // app-restart. Key analog desktop: `pg-onboarding-dismissed-<projectId>`.
+  final Set<String> _onboardDismissedIds = {};
+
+  @override
+  void initState() {
+    super.initState();
+    _loadOnboardDismissed();
+  }
+
+  Future<void> _loadOnboardDismissed() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final keys = prefs.getKeys()
+          .where((k) => k.startsWith('pg-onboarding-dismissed-'))
+          .map((k) => k.replaceFirst('pg-onboarding-dismissed-', ''));
+      if (!mounted) return;
+      setState(() {
+        _onboardDismissedIds.addAll(keys);
+      });
+    } catch (_) {}
+  }
+
+  Future<void> _setOnboardDismissed(String projectId, bool dismissed) async {
+    setState(() {
+      if (dismissed) {
+        _onboardDismissedIds.add(projectId);
+      } else {
+        _onboardDismissedIds.remove(projectId);
+      }
+    });
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final key = 'pg-onboarding-dismissed-$projectId';
+      if (dismissed) {
+        await prefs.setBool(key, true);
+      } else {
+        await prefs.remove(key);
+      }
+    } catch (_) {}
+  }
 
   Future<void> _quickSaveIdea() async {
     final text = _ideaCtrl.text.trim();
@@ -66,11 +107,12 @@ class _ProjectScreenState extends State<ProjectScreen> {
         //   step 1: ≥1 idee erfasst
         //   step 2: ≥1 mitglied außer owner (members > 1)
         //   step 3: ≥1 chat-message in der activity
+        // FIX #12: dismiss-state persistiert in SharedPreferences pro projectId
         _OnboardingBanner(
           project: p,
-          dismissed: _onboardDismissed,
-          onDismiss: () => setState(() => _onboardDismissed = true),
-          onExpand: () => setState(() => _onboardDismissed = false),
+          dismissed: _onboardDismissedIds.contains(p['id']),
+          onDismiss: () => _setOnboardDismissed(p['id'] as String, true),
+          onExpand: () => _setOnboardDismissed(p['id'] as String, false),
         ),
         // QUICK STATS — vier Kacheln auf einer Zeile
         Row(children: [

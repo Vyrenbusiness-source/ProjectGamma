@@ -224,8 +224,6 @@ class SyncClient {
         this.ccThinkingText[msg.projectId] = msg.text || "";
         this._emit();
         return;
-        this._emit();
-        break;
       case "ERROR":
         this.lastError = msg.error;
         this._emit();

@@ -66,10 +66,17 @@ async function commitChanges({ projectPath, message, authorName, authorEmail }) 
   if (authorEmail) cfg.push("-c", "user.email=" + authorEmail);
   const add = await _runGit(["add", "-A"], projectPath);
   if (!add.ok) return { committed: false, error: "git add fehler: " + add.output };
+  // FIX #15: message sanitize — null-bytes + CRLF raus, auf 200 chars cap
+  // (titles können user-input enthalten, sind keine geprüften strings)
+  const safeMsg = String(message || "[cc] auto-commit")
+    .replace(/[\r\n\0\t]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 200) || "[cc] auto-commit";
   // --no-verify: cc soll nicht durch pre-commit-hooks blockiert werden
   // (linter/test-hooks würden den autonom-flow zerschießen — wir haben
   // schon build-gate + self-review als gates).
-  const commitArgs = [...cfg, "commit", "-m", message || "[cc] auto-commit", "--no-verify"];
+  const commitArgs = [...cfg, "commit", "-m", safeMsg, "--no-verify"];
   const commit = await _runGit(commitArgs, projectPath);
   if (!commit.ok) return { committed: false, error: "git commit fehler: " + commit.output };
   const rev = await _runGit(["rev-parse", "--short", "HEAD"], projectPath);

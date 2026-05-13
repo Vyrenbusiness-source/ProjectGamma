@@ -19,7 +19,24 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const http = require("node:http");
-const { spawn } = require("node:child_process");
+const { spawn, spawnSync } = require("node:child_process");
+
+// FIX #14: auf windows killt child.kill() nur den top-process, nicht das
+// process-tree (z.B. cmd.exe → node.exe). Wir nutzen `taskkill /F /T /PID`
+// um den ganzen baum zu beenden — sonst bleibt der port bei retries belegt.
+function _killTree(child) {
+  if (!child || child.killed) return;
+  if (process.platform === "win32" && child.pid) {
+    try {
+      spawnSync("taskkill", ["/F", "/T", "/PID", String(child.pid)], {
+        windowsHide: true, stdio: "ignore",
+      });
+      return;
+    } catch (_) { /* fallback */ }
+  }
+  try { child.kill("SIGTERM"); } catch (_) {}
+  setTimeout(() => { try { child.kill("SIGKILL"); } catch (_) {} }, 800);
+}
 
 /**
  * Filtert eine filesChanged-liste auf runtime-relevante files.
@@ -134,9 +151,8 @@ async function runRuntimeTest({ projectPath, filesChanged, env }) {
     child.stderr && child.stderr.on("data", (c) => { if (buf.length < 4000) buf += c.toString(); });
 
     const probe = await _waitForListen(port);
-    // Cleanup egal ob ok oder nicht
-    try { child.kill("SIGTERM"); } catch (_) {}
-    setTimeout(() => { try { child.kill("SIGKILL"); } catch (_) {} }, 1500);
+    // Cleanup egal ob ok oder nicht — tree-kill für windows-process-trees
+    _killTree(child);
 
     if (probe.ok) {
       // Optional: JSON-body interpretieren bei /health

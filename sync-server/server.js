@@ -793,12 +793,22 @@ const MUT = {
     bug.status = bug.status || "pending";
     s.projects = s.projects.map(p => {
       if (p.id !== projectId) return p;
-      // Dedup: gleiche description oder gleiche location → keinen duplikat anlegen.
-      const existing = (p.bugs || []).find(b =>
-        b.status !== "resolved" && (
-          (b.description && bug.description && b.description.trim().toLowerCase() === bug.description.trim().toLowerCase()) ||
-          (b.location && bug.location && b.location.trim() === bug.location.trim() && b.description?.slice(0,40) === bug.description?.slice(0,40))
-        ));
+      // FIX #6: dedup nur wenn BEIDE seiten description haben.
+      // Vorher: undef===undef → wahr → alle bugs ohne description wurden geschluckt.
+      const newDescr = (bug.description || "").trim().toLowerCase();
+      const newLoc = (bug.location || "").trim();
+      const existing = (p.bugs || []).find(b => {
+        if (b.status === "resolved") return false;
+        const bDescr = (b.description || "").trim().toLowerCase();
+        const bLoc = (b.location || "").trim();
+        // Match 1: exact description (beide nicht-leer)
+        if (newDescr && bDescr && newDescr === bDescr) return true;
+        // Match 2: gleiche location + ähnlicher description-anfang
+        if (newLoc && bLoc && newLoc === bLoc && newDescr && bDescr) {
+          if (newDescr.slice(0, 40) === bDescr.slice(0, 40)) return true;
+        }
+        return false;
+      });
       if (existing) return p; // skip duplicate
       return { ...p, bugs: [bug, ...(p.bugs || [])].slice(0, 100) };
     });
@@ -2257,7 +2267,9 @@ function _startCcJob(project, taskId, prompt) {
   // Task 3: parser für stream-json. Hält line-buffer, liefert events.
   const streamParser = createStreamJsonParser();
   const job = {
-    proc, startedAt: NOW(), taskId, prompt: fullPrompt, lines: [], cwd,
+    // FIX #3: projectId direkt am job-objekt — _handleCcStreamEvent braucht
+    // ihn ohne ccJobs-iteration. Auch bug-resistant gegen flush nach delete.
+    projectId, proc, startedAt: NOW(), taskId, prompt: fullPrompt, lines: [], cwd,
     // Stream-json gefiltert: nur assistant text-content → für regex-parser
     // (TASK_PLAN/TASK_STATUS/RULE_SUGGESTIONS/QUESTION) am ende.
     assistantText: "",
@@ -2308,13 +2320,33 @@ function _startCcJob(project, taskId, prompt) {
   });
 
   proc.on("close", (code) => {
-    ccJobs.delete(projectId);
+    // FIX #2+#3: flush VOR ccJobs.delete machen wir nicht mehr nötig
+    // (job.projectId ist jetzt direkt am job), aber thinking-timer kann weg.
     if (job._thinkingTimer) { clearInterval(job._thinkingTimer); job._thinkingTimer = null; }
+
+    // Flush parser FIRST damit letzte events (oft result mit echten tokens)
+    // noch ankommen. _handleCcStreamEvent nutzt job.projectId, daher
+    // unabhängig von ccJobs-state.
+    for (const ev of streamParser.flush()) _handleCcStreamEvent(job, ev);
+
+    ccJobs.delete(projectId);
     cleanupResolvedConfig(mcpConfigPath);
     console.log("[cc] done", projectId, "exit", code);
 
-    // Flush parser (letzte zeile ohne newline)
-    for (const ev of streamParser.flush()) _handleCcStreamEvent(job, ev);
+    // FIX #9: pending tool_use-events ohne result → "cancelled" markieren,
+    // sonst bleiben sie für immer "running" in der UI.
+    for (const te of (job.toolEvents || [])) {
+      if (te.state === "running") {
+        te.state = "cancelled";
+        broadcastForProject({
+          type: "CC_TOOL_EVENT", projectId,
+          phase: "result", id: te.id, tool: te.tool,
+          isError: false, brief: "cancelled (cc beendet)", ts: NOW(),
+        }, projectId);
+      }
+    }
+    // FIX #18: thinking-text clearen damit UI nicht ewig „💭 …" zeigt
+    broadcastForProject({ type: "CC_THINKING_TEXT", projectId, text: "" }, projectId);
 
     // Für die regex-parser unten: assistant-text aus stream-json
     // (statt rohstdout — der ist jetzt jsonl, regex würde fehlschlagen)
@@ -2448,7 +2480,13 @@ function _startCcJob(project, taskId, prompt) {
               text: `cc retry ${attempt}/${MAX_CC_RETRIES} startet in 3s mit fehler-context…`,
             }});
             broadcastState();
+            // FIX #4: vor retry prüfen ob cc noch aktiv ist (user kann
+            // währenddessen „pause" geklickt haben)
             setTimeout(() => {
+              if (!state.ccRunning) {
+                console.log("[cc-retry] skip — cc inzwischen pausiert");
+                return;
+              }
               triggerCc(projectId, taskId, null).catch((e) => {
                 console.log("[cc-retry] trigger fehler:", e.message);
               });
@@ -2502,16 +2540,26 @@ function _startCcJob(project, taskId, prompt) {
               text: `cc retry ${attempt}/${MAX_CC_RETRIES} startet in 3s (runtime-fail)…`,
             }});
             broadcastState();
+            // FIX #4: vor retry ccRunning-check
             setTimeout(() => {
+              if (!state.ccRunning) {
+                console.log("[cc-runtime-retry] skip — cc inzwischen pausiert");
+                return;
+              }
               triggerCc(projectId, taskId, null).catch((e) => {
                 console.log("[cc-runtime-retry] trigger fehler:", e.message);
               });
             }, 3000);
             return; // kein self-review, kein checkmark
           }
+          // FIX #1: `tn` war nicht im scope — `taskNow` ist die richtige variable
           _ccRetryContext.delete(taskId);
           applyMutation("EDIT_TASK", { projectId, taskId, patch: {
-            meta: (tn.meta ? tn.meta + " · " : "") + `blockiert (runtime fail ${attempt}×)`,
+            meta: (taskNow.meta ? taskNow.meta + " · " : "") + `blockiert (runtime fail ${attempt}×)`,
+          }});
+          applyMutation("ADD_SYNC_LOG", { entry: {
+            source: "cloud", projectId,
+            text: `cc max-retries auf <i>${escapeHtml(taskNow.title)}</i>: runtime ${attempt}× rot`,
           }});
           broadcastState();
           return;
@@ -2560,17 +2608,31 @@ function _startCcJob(project, taskId, prompt) {
             // Bug-auto-resolve: wenn cc files berührt hat, die auf eine pending-bug-location passen,
             // markiere die bugs als "potentially-fixed". User kann via UI bestätigen oder reopen.
             // 0 LLM-tokens — reine heuristik auf filesChanged ∩ bug.location.
+            //
+            // FIX #5: substring-match war zu greedy ("a.js" matchte alles mit ".js").
+            // Jetzt: pfad-segment-vergleich (endsWith oder exact-match) + min-länge 6.
             if (Array.isArray(parsedStatus.filesChanged) && parsedStatus.filesChanged.length) {
               const proj = state.projects.find(p => p.id === projectId);
               const pendingBugs = (proj?.bugs || []).filter(b => b.status === "pending");
-              const changedNorm = parsedStatus.filesChanged.map(f =>
-                String(f).replace(/\\/g, "/").toLowerCase());
+              const changedNorm = parsedStatus.filesChanged
+                .map(f => String(f).replace(/\\/g, "/").toLowerCase().trim())
+                .filter(f => f.length > 0);
               let resolved = 0;
               for (const b of pendingBugs) {
                 if (!b.location) continue;
-                const loc = b.location.replace(/\\/g, "/").toLowerCase();
-                // Match: bug.location ist substring eines geänderten files
-                const hit = changedNorm.some(f => f.includes(loc.split(":")[0]) || loc.includes(f));
+                // bug.location kann „file.js:42" sein → nur file-teil
+                const locFile = b.location.replace(/\\/g, "/").toLowerCase().trim().split(":")[0];
+                if (!locFile || locFile.length < 6) continue; // zu kurz → too-many-false-positives
+                // Match wenn:
+                //   - exakter pfad-match, ODER
+                //   - changed-file endet mit "/" + locFile (locFile ist eine path-tail)
+                //   - locFile endet mit "/" + changed-file (changed ist eine path-tail vom bug)
+                const hit = changedNorm.some(f => {
+                  if (f === locFile) return true;
+                  if (f.endsWith("/" + locFile)) return true;
+                  if (locFile.endsWith("/" + f) && f.length >= 6) return true;
+                  return false;
+                });
                 if (hit) {
                   applyMutation("SET_BUG_STATUS", { projectId, bugId: b.id, status: "potentially-fixed" });
                   resolved++;
@@ -2718,8 +2780,10 @@ function _startCcJob(project, taskId, prompt) {
 // Task 3 · Pro stream-json-event: state-update + broadcast.
 // Keine LLM-tokens — alles deterministisch aus dem cli-output abgeleitet.
 function _handleCcStreamEvent(job, ev) {
-  const projectId = (state.projects.find(p =>
-    Array.from(ccJobs.entries()).some(([pid, j]) => j === job && pid === p.id)) || {}).id;
+  // FIX #2+#3: projectId direkt aus job-objekt — funktioniert auch wenn
+  // ccJobs.delete bereits gelaufen ist (z.B. nach proc.close → flush()).
+  // Vorher: O(jobs×projects)-iteration die nach delete leere result lieferte.
+  const projectId = job.projectId;
   if (!projectId) return;
   if (ev.kind === "init") {
     applyMutation("ADD_ACTIVITY", { projectId, event: {
@@ -2909,6 +2973,27 @@ app.post("/api/projects/:id/rules/cleanup", authMw, (req, res) => {
     }
   }
 
+  // FIX #10: bei aggressive auch active-rules zu removedRules (tombstone)
+  // pushen, damit rückgängig möglich + audit-trail in state existiert.
+  // Default (active=false only) ist sowieso harmlos da diese rules nie
+  // vom user genehmigt wurden.
+  let removedRulesTomb = project.removedRules ? [...project.removedRules] : [];
+  if (aggressive) {
+    const cleanupTs = NOW();
+    for (const r of movedToIdea) {
+      // Nur active-rules ins tombstone (sind die wo data-loss-risiko da ist)
+      const wasActive = (project.rules || []).some(x => x.id === r.id && x.active === true);
+      if (wasActive && r.text) {
+        removedRulesTomb.unshift({
+          text: r.text, ts: cleanupTs,
+          reason: "cleanup-aggressive",
+          category: r.category || null,
+        });
+      }
+    }
+    removedRulesTomb = removedRulesTomb.slice(0, 50);
+  }
+
   // State mutieren: ideen anhängen (dedup), rules ersetzen, rule_diffs ersetzen
   const ideaTexts = new Set((project.ideas || []).map(i => (i.text || "").trim().toLowerCase()));
   let addedIdeas = 0;
@@ -2922,17 +3007,23 @@ app.post("/api/projects/:id/rules/cleanup", authMw, (req, res) => {
     addedIdeas++;
   }
   applyMutation("PATCH_PROJECT", { projectId: project.id,
-    patch: { rules: kept, ruleDiffs: diffsKept } });
+    patch: { rules: kept, ruleDiffs: diffsKept, removedRules: removedRulesTomb } });
   applyMutation("ADD_ACTIVITY", { projectId: project.id, event: {
     type: "rule",
-    text: `regel-cleanup: ${movedToIdea.length - rejectedDiffs} task-artige cc-regeln + ${rejectedDiffs} pending-diffs → ideen (${addedIdeas} neu)`,
+    text: `regel-cleanup${aggressive ? " (aggressive)" : ""}: ${movedToIdea.length - rejectedDiffs} task-artige cc-regeln + ${rejectedDiffs} pending-diffs → ideen (${addedIdeas} neu)`,
+  }});
+  applyMutation("ADD_SYNC_LOG", { entry: {
+    source: "system", projectId: project.id,
+    text: `regel-cleanup ausgeführt · rules ${before}→${kept.length} · ${addedIdeas} ideen erzeugt${aggressive ? " (aggressive, rückgängig via removedRules)" : ""}`,
   }});
   broadcastState();
   res.json({
-    ok: true, projectId: project.id,
+    ok: true, projectId: project.id, aggressive,
     rulesBefore: before, rulesAfter: kept.length,
     diffsBefore: beforeDiffs, diffsRejected: rejectedDiffs,
     movedToIdea: movedToIdea.length, addedAsNewIdea: addedIdeas,
+    // Genaue texte zurückgeben — UI kann „rückgängig" anzeigen
+    movedTexts: movedToIdea.map(r => r.text).slice(0, 50),
   });
 });
 
