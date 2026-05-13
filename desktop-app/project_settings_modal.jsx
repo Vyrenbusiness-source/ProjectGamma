@@ -262,8 +262,8 @@
           headers: { "content-type": "application/json", authorization: "Bearer " + client.token },
           body: JSON.stringify({ projectId: project.id, text }),
         });
-        const data = await r.json();
-        if (!r.ok) throw new Error(data.error || "fehler");
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(data.error || `fehler (${r.status})`);
         setPreview(data);
       } catch (e) { setErr(e.message); }
       finally { setBusy(false); }
