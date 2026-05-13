@@ -1997,17 +1997,27 @@ app.post("/api/setup/auto-fix", authMw, (req, res) => {
   }
   const { spawn } = require("child_process");
   const npm = process.platform === "win32" ? "npm.cmd" : "npm";
+  // strict npm-package-name validation — shell:true unten ist auf win32
+  // nötig (npm.cmd, CVE-2024-27980), also muss der pkg-name garantiert
+  // shell-safe sein. erlaubt: optional @scope/, lowercase/digits/._-
+  const NPM_PKG_RE = /^(@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/;
   // Sequenziell installieren — npm-globals dürfen nicht parallelisiert werden
   (async () => {
     const installed = [];
+    const skipped = [];
     for (const m of npmInstalls) {
-      const proc = spawn(npm, ["install", "-g", m.install.npm], { shell: true, windowsHide: true });
+      const pkg = m.install.npm;
+      if (typeof pkg !== "string" || pkg.length > 214 || !NPM_PKG_RE.test(pkg)) {
+        skipped.push({ name: m.name, reason: "invalid pkg-name" });
+        continue;
+      }
+      const proc = spawn(npm, ["install", "-g", pkg], { shell: true, windowsHide: true });
       await new Promise((resolve) => {
         proc.on("close", (code) => { if (code === 0) installed.push(m.name); resolve(); });
         proc.on("error", () => resolve());
       });
     }
-    res.json({ ok: true, installed, manualSteps });
+    res.json({ ok: true, installed, manualSteps, skipped });
   })().catch((e) => res.status(500).json({ error: e.message }));
 });
 
