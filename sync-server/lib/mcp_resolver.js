@@ -47,8 +47,13 @@ const MCP_BLOCK = new Set(["fetch"]);
  * falls keine config existiert.
  *
  * tier: "minimal" | "standard" | "full" (default "full" = legacy verhalten)
+ * projectCwd: optional. wenn gesetzt, patcht filesystem-MCP-args so dass der
+ *   server-filesystem auf DIESES verzeichnis whitelisted ist (statt den hard-
+ *   coded path aus mcp.json). sonst rejected mcp__filesystem__* alle calls
+ *   mit "Access denied — path outside allowed directories" und der agent
+ *   loopt durch PowerShell/Bash-listing-versuche.
  */
-function resolveMcpConfig({ baseDir, env = process.env, tmpDir, tier = "full" }) {
+function resolveMcpConfig({ baseDir, env = process.env, tmpDir, tier = "full", projectCwd = null }) {
   const sourcePath = path.join(baseDir, "mcp.json");
   if (!fs.existsSync(sourcePath)) return null;
   let raw;
@@ -78,7 +83,19 @@ function resolveMcpConfig({ baseDir, env = process.env, tmpDir, tier = "full" })
       envOut[k] = expanded;
     }
     if (skip) continue;
-    const cleaned = { command: def.command, args: def.args };
+    let resolvedArgs = def.args;
+    // Filesystem-MCP-args werden auf projectCwd umgeschrieben — der server-
+    // filesystem akzeptiert mehrere whitelist-pfade als trailing args. Wir
+    // ersetzen alle nicht-flag-args nach dem package-name durch projectCwd.
+    if (name === "filesystem" && projectCwd && Array.isArray(def.args)) {
+      const args = [...def.args];
+      const pkgIdx = args.findIndex(a => typeof a === "string" && a.includes("server-filesystem"));
+      if (pkgIdx >= 0) {
+        // Behalte alles bis inklusive package-name, ersetze rest mit projectCwd.
+        resolvedArgs = args.slice(0, pkgIdx + 1).concat([projectCwd]);
+      }
+    }
+    const cleaned = { command: def.command, args: resolvedArgs };
     if (Object.keys(envOut).length) cleaned.env = envOut;
     if (def.cwd) cleaned.cwd = def.cwd;
     out[name] = cleaned;

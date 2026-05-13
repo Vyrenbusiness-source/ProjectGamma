@@ -137,3 +137,48 @@ test("Fix 5: fetch auch in standard-tier nicht (war eh nicht drin, regression-gu
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
+
+// ── TeamLink-Bug (2026-05-13): filesystem-MCP args dynamic ──────────────
+test("filesystem-MCP args werden auf projectCwd umgeschrieben", () => {
+  const tmpDir = fs.mkdtempSync(path.join(require("os").tmpdir(), "mcp-test-"));
+  try {
+    const customCwd = "C:\\Users\\Gexanx\\Desktop\\TeamTool";
+    const configPath = resolveMcpConfig({
+      baseDir: path.join(__dirname, ".."),
+      tier: "minimal",
+      tmpDir,
+      projectCwd: customCwd,
+    });
+    const resolved = JSON.parse(fs.readFileSync(configPath, "utf8"));
+    const fsArgs = resolved.mcpServers?.filesystem?.args || [];
+    // Letztes argument muss der custom cwd sein, nicht der hardcoded
+    // ProjectGamma-pfad aus mcp.json.
+    assert.equal(fsArgs[fsArgs.length - 1], customCwd,
+      "letztes filesystem-arg muss projectCwd sein, ist: " + JSON.stringify(fsArgs));
+    // Package-name muss noch davor stehen (-y, package, customCwd).
+    assert.ok(fsArgs.some(a => typeof a === "string" && a.includes("server-filesystem")),
+      "package-name fehlt: " + JSON.stringify(fsArgs));
+    fs.unlinkSync(configPath);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("filesystem-MCP ohne projectCwd: legacy-behavior (hardcoded path bleibt)", () => {
+  const tmpDir = fs.mkdtempSync(path.join(require("os").tmpdir(), "mcp-test-"));
+  try {
+    const configPath = resolveMcpConfig({
+      baseDir: path.join(__dirname, ".."),
+      tier: "minimal",
+      tmpDir,
+    });
+    const resolved = JSON.parse(fs.readFileSync(configPath, "utf8"));
+    const fsArgs = resolved.mcpServers?.filesystem?.args || [];
+    // Ohne projectCwd: args wie in mcp.json
+    assert.ok(fsArgs[fsArgs.length - 1].includes("ProjectGamma"),
+      "legacy: letztes arg sollte ProjectGamma sein, ist: " + JSON.stringify(fsArgs));
+    fs.unlinkSync(configPath);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});

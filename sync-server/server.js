@@ -2704,6 +2704,20 @@ function _startCcJob(project, taskId, prompt) {
   }).map(r => "- " + String(r.text || "").slice(0, 80));
   const goals = project.goals || [];
 
+  // Empty-dir-detection: bei einem frisch angelegten leeren projekt-folder
+  // hat der agent sonst die tendenz, erst zu listen ("was ist hier?") statt
+  // sofort zu schreiben. Das eskaliert zu PowerShell/Bash-listing-loops weil
+  // mcp-filesystem zusätzlich fehlt (siehe TeamLink-bug 2026-05-13). Wir
+  // detect das hier (sync, billig: nur top-level-count) und injecten einen
+  // expliziten "directory ist leer → SCHREIBEN, nicht listen"-hint.
+  let dirIsEmpty = false;
+  let dirTopLevelCount = -1;
+  try {
+    const entries = fs.readdirSync(cwd);
+    dirTopLevelCount = entries.filter(e => !e.startsWith(".")).length;
+    dirIsEmpty = dirTopLevelCount === 0;
+  } catch (_) { /* readdir fail → treat as non-empty (no hint) */ }
+
   // recentActivity/openBugs/lastCcCheck wurden entfernt — sie lenkten cc
   // vom konkreten task ab. wenn cc kontext braucht, soll er gezielt via
   // Read den state lesen. spart auch BM25-cycles pro spawn.
@@ -2736,6 +2750,13 @@ function _startCcJob(project, taskId, prompt) {
     task ? task.title : (prompt || "Was wäre als nächstes sinnvoll? Gib einen kurzen Plan in 3-5 Punkten."),
     task?.description ? "BESCHREIBUNG:\n" + task.description.slice(0, 1500) : "",
     task && prompt ? "\nZUSATZ: " + prompt : "",
+    "",
+    dirIsEmpty ? "📁 PROJEKT-DIRECTORY IST LEER (0 dateien sichtbar).\n" +
+      "→ SCHREIBE direkt die files die der task verlangt (Write-tool).\n" +
+      "→ KEIN `ls`/`Get-ChildItem`/`find`/Glob-suche zuerst — es gibt nichts zu finden.\n" +
+      "→ wenn der task verlangt 'aufsetzen/initialisieren/skeleton anlegen': starte mit\n" +
+      "   den essenziellen files (package.json/pubspec.yaml/Cargo.toml/README.md), dann sourcecode.\n" +
+      "→ ein eigener `mkdir` ist OK wenn der task subdirs braucht (z.B. src/, lib/, test/)." : "",
     "",
     "⚠️ FOKUS-GUARDRAIL (das ist die wichtigste regel hier):",
     "- mach NUR den AUFGABE-text oben. NICHTS sonst.",
@@ -2945,7 +2966,10 @@ function _startCcJob(project, taskId, prompt) {
 
   const mcpTier = isTrivialWriteTask ? "minimal" :
                   (selectedModel === "claude-opus-4-7" ? "full" : "standard");
-  const mcpConfigPath = resolveMcpConfig({ baseDir: __dirname, tier: mcpTier });
+  // projectCwd patcht filesystem-MCP-args dynamisch — sonst rejected der
+  // server-filesystem alle calls bei nicht-ProjectGamma-pfaden (siehe
+  // mcp_resolver.js comment).
+  const mcpConfigPath = resolveMcpConfig({ baseDir: __dirname, tier: mcpTier, projectCwd: cwd });
   const args = [
     "--print",
     "--output-format", "stream-json",
@@ -4540,7 +4564,7 @@ function _spawnClaudeReadOnly(project, prompt, opts) {
   }
   const cwd = project.path;
   const claudeBin = resolveClaudeBinary();
-  const mcpConfigPath = resolveMcpConfig({ baseDir: __dirname });
+  const mcpConfigPath = resolveMcpConfig({ baseDir: __dirname, projectCwd: cwd });
   // Token-spar: caller darf budget runtersetzen (z.B. decompose nur 0.20$).
   const budget = (opts && typeof opts.maxBudgetUsd === "number") ? String(opts.maxBudgetUsd) : "1.0";
   const args = [
@@ -4930,7 +4954,7 @@ async function runSelfReview(project, taskId, taskStatus, originalOutput) {
     "--tools", "default",
     "--add-dir", cwd,
   ];
-  const mcpConfigPath = resolveMcpConfig({ baseDir: __dirname });
+  const mcpConfigPath = resolveMcpConfig({ baseDir: __dirname, projectCwd: cwd });
   if (mcpConfigPath) args.push("--mcp-config", mcpConfigPath);
 
   return new Promise((resolve) => {
