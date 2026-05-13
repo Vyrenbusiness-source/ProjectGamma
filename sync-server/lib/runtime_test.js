@@ -19,24 +19,8 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const http = require("node:http");
-const { spawn, spawnSync } = require("node:child_process");
-
-// FIX #14: auf windows killt child.kill() nur den top-process, nicht das
-// process-tree (z.B. cmd.exe → node.exe). Wir nutzen `taskkill /F /T /PID`
-// um den ganzen baum zu beenden — sonst bleibt der port bei retries belegt.
-function _killTree(child) {
-  if (!child || child.killed) return;
-  if (process.platform === "win32" && child.pid) {
-    try {
-      spawnSync("taskkill", ["/F", "/T", "/PID", String(child.pid)], {
-        windowsHide: true, stdio: "ignore",
-      });
-      return;
-    } catch (_) { /* fallback */ }
-  }
-  try { child.kill("SIGTERM"); } catch (_) {}
-  setTimeout(() => { try { child.kill("SIGKILL"); } catch (_) {} }, 800);
-}
+const { spawn } = require("node:child_process");
+const { killTreeGraceful } = require("./process_kill");
 
 /**
  * Filtert eine filesChanged-liste auf runtime-relevante files.
@@ -152,7 +136,8 @@ async function runRuntimeTest({ projectPath, filesChanged, env }) {
 
     const probe = await _waitForListen(port);
     // Cleanup egal ob ok oder nicht — tree-kill für windows-process-trees
-    _killTree(child);
+    // (npm.cmd → node.exe würde sonst verwaisen und port halten).
+    killTreeGraceful(child);
 
     if (probe.ok) {
       // Optional: JSON-body interpretieren bei /health
@@ -185,8 +170,9 @@ async function runRuntimeTest({ projectPath, filesChanged, env }) {
     child.stderr && child.stderr.on("data", (c) => { if (buf.length < 2000) buf += c.toString(); });
 
     const probe = await _waitForListen(port, "127.0.0.1", "/index.html");
-    try { child.kill("SIGTERM"); } catch (_) {}
-    setTimeout(() => { try { child.kill("SIGKILL"); } catch (_) {} }, 1500);
+    // python -m http.server kann auf windows als python.exe → child python.exe
+    // laufen; ohne tree-kill bleibt der listener auf dem port hängen.
+    killTreeGraceful(child, { gracefulMs: 1500 });
 
     if (probe.ok && /<html|<!doctype/i.test(probe.body)) {
       return { ok: true, skipped: false, kind: tech.kind,

@@ -11,6 +11,7 @@
 const { spawn } = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
+const { killTreeSync } = require("./process_kill");
 
 function isGitRepo(projectPath) {
   if (!projectPath) return false;
@@ -29,7 +30,9 @@ function _runGit(args, cwd, timeoutMs = 30 * 1000) {
       stdio: ["ignore", "pipe", "pipe"],
       env: process.env,
     });
-    const timer = setTimeout(() => { try { proc.kill("SIGKILL"); } catch (_) {} }, timeoutMs);
+    // windows: child.kill() killt nur top-process — git kann credential-helper
+    // subprozesse haben. killTreeSync nutzt taskkill /T /F im windows-fall.
+    const timer = setTimeout(() => killTreeSync(proc, { signal: "SIGKILL" }), timeoutMs);
     proc.stdout.on("data", (c) => { buf += c.toString(); });
     proc.stderr.on("data", (c) => { buf += c.toString(); });
     proc.on("error", (e) => {

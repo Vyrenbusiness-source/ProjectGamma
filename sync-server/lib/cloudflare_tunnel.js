@@ -8,6 +8,7 @@ const fs = require("fs");
 const path = require("path");
 const https = require("https");
 const { spawn } = require("child_process");
+const { killTreeSync } = require("./process_kill");
 
 const RELEASE_URLS = {
   "win32-x64":   "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe",
@@ -132,7 +133,9 @@ function createCloudflareTunnel({ baseDir, localPort, logger = console }) {
   function stop() {
     if (proc) {
       status = "stopped"; emit();
-      try { proc.kill(); } catch (_) {}
+      // windows: cloudflared.exe kann subprozesse spawnen — taskkill /T /F
+      // killt den ganzen baum, sonst bleibt der tunnel-listener offen.
+      killTreeSync(proc);
       proc = null;
       url = null;
     }

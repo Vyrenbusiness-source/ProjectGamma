@@ -15,6 +15,7 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
+const { killTreeSync } = require("./process_kill");
 
 // Reihenfolge ist wichtig: flutter-projekte haben oft auch ein package.json
 // (für tooling), aber pubspec.yaml ist der eindeutige indikator.
@@ -94,28 +95,6 @@ function detectCheck(projectPath) {
 }
 
 /**
- * Tötet einen child-process inkl. aller enkel-prozesse.
- * Windows: shell:true → proc.pid zeigt auf cmd.exe; ein simples SIGKILL
- * würde nur den wrapper killen und flutter/npm/python liefe als orphan
- * weiter (blockiert ports/locks). `taskkill /T /F` killt den ganzen baum.
- * Unix: SIGKILL reicht (signals propagieren über pgid bzw. controlling-tty).
- */
-function killProcessTree(proc) {
-  if (!proc || proc.killed) return;
-  if (process.platform === "win32" && proc.pid) {
-    // NICHT proc.kill() zusätzlich aufrufen — würde cmd.exe sofort killen,
-    // bevor taskkill /T den baum traversieren kann. orphan-childs wären die folge.
-    try {
-      spawn("taskkill", ["/pid", String(proc.pid), "/T", "/F"], {
-        stdio: "ignore", windowsHide: true,
-      });
-      return;
-    } catch (_) { /* taskkill nicht da → fallback unten */ }
-  }
-  try { proc.kill("SIGKILL"); } catch (_) {}
-}
-
-/**
  * Führt den build-gate aus. Liefert { ok, kind, output, durationMs, skipped? }.
  * skipped:true wenn keine bekannte tech detected wurde — in dem fall darf
  * self-review fortlaufen (kein build-check vorhanden ist KEIN fehler).
@@ -151,7 +130,9 @@ function runBuildGate({ projectPath, customCmd, customArgs, customTimeoutMs, onP
     });
     const timer = setTimeout(() => {
       killed = true;
-      killProcessTree(proc);
+      // shell:true → proc.pid ist auf windows cmd.exe; nur taskkill /T /F
+      // erreicht den ganzen baum. killTreeSync zentralisiert den platform-split.
+      killTreeSync(proc, { signal: "SIGKILL" });
     }, check.timeoutMs);
     proc.stdout.on("data", (c) => {
       const s = c.toString();
@@ -188,4 +169,4 @@ function runBuildGate({ projectPath, customCmd, customArgs, customTimeoutMs, onP
   });
 }
 
-module.exports = { detectCheck, runBuildGate, killProcessTree, TECH_CHECKS };
+module.exports = { detectCheck, runBuildGate, TECH_CHECKS };

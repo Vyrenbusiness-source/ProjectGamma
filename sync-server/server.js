@@ -28,6 +28,7 @@ const { classify: classifyRuleOrIdea } = require("./lib/rule_idea_classifier");
 const { resolveMcpConfig, cleanupResolvedConfig } = require("./lib/mcp_resolver");
 const { createUsersStore } = require("./lib/users_store");
 const { createProjectMembershipStore, ROLES } = require("./lib/project_membership");
+const { killTreeSync, killTreeGraceful } = require("./lib/process_kill");
 const { hashPassword, verifyPassword } = require("./lib/password_hash");
 const { filterStateForSession, checkMutationAccess } = require("./lib/project_access");
 const { createOpLogStore } = require("./lib/op_log_store");
@@ -473,7 +474,10 @@ setInterval(() => {
   for (const [pid, job] of ccJobs) {
     if (now - job.startedAt > CC_RUNAWAY_LIMIT_MS) {
       console.warn("[cc-watchdog] runaway-kill projektId=" + pid + " task=" + job.taskId + " runtime=" + Math.round((now - job.startedAt)/1000) + "s");
-      try { job.proc.kill("SIGKILL"); } catch (_) {}
+      // windows: claude-cli spawnt sub-prozesse (node, git, etc.) — SIGKILL
+      // an top-process killt nur cmd.exe, kinder bleiben verwaist und halten
+      // ggf. ports/locks. killTreeSync → taskkill /pid /T /F im windows-fall.
+      killTreeSync(job.proc, { signal: "SIGKILL" });
       // ccJobs.delete passiert über on-close handler bei normalem kill
     }
   }
@@ -3269,7 +3273,9 @@ app.post("/api/cc/stop", authMw, (req, res) => {
   if (!_requireProjectAccess(req, res, project, ROLES.MEMBER)) return;
   const job = ccJobs.get(projectId);
   if (!job) return res.status(404).json({ error: "kein job läuft" });
-  try { job.proc.kill("SIGTERM"); } catch (e) {}
+  // windows: SIGTERM an top-process verwaist sub-prozesse. killTreeGraceful
+  // → taskkill /T /F (windows) bzw. SIGTERM → SIGKILL fallback (posix).
+  killTreeGraceful(job.proc, { gracefulMs: 1500 });
   ccJobs.delete(projectId);
   applyMutation("ADD_ACTIVITY", { projectId, event: { type: "info", text: "cloud-code abgebrochen" }});
   broadcastState();

@@ -11,6 +11,7 @@
 const { spawn } = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
+const { killTreeSync } = require("./process_kill");
 
 function _which(cmd, args = ["--version"], timeoutMs = 3000) {
   return new Promise((resolve) => {
@@ -31,7 +32,9 @@ function _which(cmd, args = ["--version"], timeoutMs = 3000) {
     proc.stderr.on("data", (c) => { if (out.length < 500) out += c.toString(); });
     proc.on("error", () => finish({ ok: false }));
     proc.on("close", (code) => finish({ ok: code === 0, version: out.split(/\r?\n/)[0].trim() }));
-    setTimeout(() => { try { proc.kill(); } catch (_) {} finish({ ok: false, error: "timeout" }); }, timeoutMs);
+    // windows: shell:true spawnt via cmd.exe → kind verwaist sonst.
+    // killTreeSync nutzt taskkill /T /F, sonst child.kill(SIGTERM).
+    setTimeout(() => { killTreeSync(proc); finish({ ok: false, error: "timeout" }); }, timeoutMs);
   });
 }
 
