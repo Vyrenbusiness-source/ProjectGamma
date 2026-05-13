@@ -130,11 +130,55 @@ if exist "%ADB%" (
   echo [2/2] adb nicht gefunden - handy verbindet via WLAN oder internet-tunnel
 )
 
-REM 8) Kurz warten, browser oeffnen.
-timeout /t 4 /nobreak >nul
+REM 8) Warten bis server wirklich antwortet, dann desktop-app oeffnen.
+REM    Pollen statt fixed-timeout, weil server-boot je nach maschine 1-8s dauert.
 echo.
-echo oeffne ProjectGamma im browser...
-start "" "http://localhost:7892/"
+echo [3/3] warte auf server...
+setlocal enabledelayedexpansion
+set BOOT_OK=0
+for /l %%i in (1,1,20) do (
+  if "!BOOT_OK!"=="0" (
+    curl -s -o nul -w "%%{http_code}" http://localhost:7892/health 2>nul | findstr "200" >nul
+    if not errorlevel 1 (
+      set BOOT_OK=1
+    ) else (
+      timeout /t 1 /nobreak >nul
+    )
+  )
+)
+
+if "!BOOT_OK!"=="1" (
+  echo [ok] server bereit. oeffne desktop-app...
+) else (
+  echo [warn] server noch nicht erreichbar nach 20s. oeffne trotzdem...
+)
+
+REM Desktop-app oeffnen — bevorzugt Chrome/Edge im app-modus (sieht nativer aus),
+REM sonst default-browser. URL = sync-server-root → express.static liefert
+REM ./desktop-app/index.html.
+set DESKTOP_URL=http://localhost:7892/index.html
+
+REM Try Chrome --app first (kein url-bar, eigene taskbar-icon)
+set CHROME=
+if exist "%ProgramFiles%\Google\Chrome\Application\chrome.exe" set CHROME=%ProgramFiles%\Google\Chrome\Application\chrome.exe
+if exist "%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe" set CHROME=%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe
+if exist "%LocalAppData%\Google\Chrome\Application\chrome.exe" set CHROME=%LocalAppData%\Google\Chrome\Application\chrome.exe
+
+set EDGE=
+if exist "%ProgramFiles%\Microsoft\Edge\Application\msedge.exe" set EDGE=%ProgramFiles%\Microsoft\Edge\Application\msedge.exe
+if exist "%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe" set EDGE=%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe
+
+if defined CHROME (
+  echo oeffne im Chrome-app-modus...
+  start "ProjectGamma" "!CHROME!" --app="!DESKTOP_URL!" --new-window
+) else if defined EDGE (
+  echo oeffne im Edge-app-modus...
+  start "ProjectGamma" "!EDGE!" --app="!DESKTOP_URL!" --new-window
+) else (
+  echo oeffne im default-browser...
+  start "" "!DESKTOP_URL!"
+)
+endlocal
 
 echo.
 echo ============================================
