@@ -1181,14 +1181,27 @@ app.get("/api/network-info", (req, res) => {
   res.json({ port: PORT, ips: lanIps, routes, tunnel: cf });
 });
 
-// Cloudflare Tunnel control — desktop-only (lokal/trusted).
+// Cloudflare Tunnel control — desktop-pair-session ODER user-account mit
+// owner-rolle in mindestens einem projekt (server-administration darf nur,
+// wer auch lokal oder als account-admin auf dem server registriert ist —
+// `/api/auth/register` ist beim ersten user localhost-gated).
+function _canControlTunnel(session) {
+  if (!session) return false;
+  if (isDesktopSession(session)) return true;
+  // user-token: owner irgendeines projekts?
+  if (session.userId && memberships) {
+    const list = memberships.listProjectsForUser(session.userId) || [];
+    return list.some(m => m.role === ROLES.OWNER);
+  }
+  return false;
+}
 app.post("/api/tunnel/start", authMw, async (req, res) => {
-  if (!isDesktopSession(req.session)) return res.status(403).json({ error: "desktop session required" });
+  if (!_canControlTunnel(req.session)) return res.status(403).json({ error: "desktop-session oder owner-account erforderlich" });
   const r = await cloudflareTunnel.start();
   res.json(r);
 });
 app.post("/api/tunnel/stop", authMw, (req, res) => {
-  if (!isDesktopSession(req.session)) return res.status(403).json({ error: "desktop session required" });
+  if (!_canControlTunnel(req.session)) return res.status(403).json({ error: "desktop-session oder owner-account erforderlich" });
   const r = cloudflareTunnel.stop();
   res.json(r);
 });
