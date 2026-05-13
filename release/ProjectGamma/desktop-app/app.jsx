@@ -103,6 +103,7 @@ const TABS = [
   { id: "ideas",    label: "ideen"     },
   { id: "team",     label: "team"      },
   { id: "cloud",    label: "cloud-code" },
+  { id: "preview",  label: "preview"   },
   { id: "sync",     label: "sync"      },
 ];
 
@@ -2554,6 +2555,257 @@ function ScreenCloud({ project, onCcRun, onCcStop, ccStatus, ccOutput, ccRunning
   );
 }
 
+// ─── Screen: Live-Preview ─────────────────────────────────────
+function ScreenPreview({ project }) {
+  const client = useSync();
+  const preview = project.preview || { command: "", port: null, url: "" };
+  const runtime = project.previewState || { state: "idle" };
+  const isRunning = runtime.state === "running";
+
+  const [editing, setEditing] = React.useState(false);
+  const [cmd, setCmd] = React.useState(preview.command || "");
+  const [port, setPort] = React.useState(preview.port || "");
+  const [urlOverride, setUrlOverride] = React.useState(preview.url || "");
+  const [suggestions, setSuggestions] = React.useState([]);
+  const [detecting, setDetecting] = React.useState(false);
+  const [detectFailed, setDetectFailed] = React.useState(false);
+  const [logs, setLogs] = React.useState([]);
+  const [busy, setBusy] = React.useState(false);
+  const [error, setError] = React.useState(null);
+  const [iframeKey, setIframeKey] = React.useState(0);
+
+  // Auto-detect + auto-apply: wenn kein command konfiguriert ist, holen wir
+  // die suggestions und übernehmen die erste automatisch. user-input ist
+  // optional, normaler weg ist: tab öffnen → start drücken.
+  React.useEffect(() => {
+    let cancelled = false;
+    if (!preview.command && project.path) {
+      setDetecting(true);
+      fetch(client.serverUrl + "/api/preview/detect?projectId=" + encodeURIComponent(project.id), {
+        headers: { authorization: "Bearer " + client.token },
+      }).then(r => r.json()).then(d => {
+        if (cancelled) return;
+        const sugs = Array.isArray(d.suggestions) ? d.suggestions : [];
+        setSuggestions(sugs);
+        setDetecting(false);
+        if (sugs.length > 0) {
+          // Auto-apply: erste suggestion ohne user-klick speichern. Beim
+          // nächsten render kommt preview.command aus dem state und der
+          // start-button ist enabled.
+          const first = sugs[0];
+          client.mutate("SET_PREVIEW_CONFIG", {
+            projectId: project.id,
+            preview: {
+              command: first.command || "",
+              port: first.port || null,
+              url: first.url || "",
+              cwdRel: first.cwdRel || "",
+              autoDetected: true,
+            },
+          });
+          setCmd(first.command || "");
+          setPort(first.port ? String(first.port) : "");
+          setUrlOverride(first.url || "");
+        } else {
+          setDetectFailed(true);
+          setEditing(true); // nur wenn auto-detect scheitert → manueller modus
+        }
+      }).catch(() => { if (!cancelled) { setDetecting(false); setDetectFailed(true); setEditing(true); } });
+    }
+    return () => { cancelled = true; };
+  }, [project.id, project.path, preview.command, client.serverUrl, client.token]);
+
+  // Subscribe to PREVIEW_OUTPUT for log-streaming (max ~200 lines)
+  React.useEffect(() => {
+    if (!client.ws) return;
+    const onMsg = (ev) => {
+      let m; try { m = JSON.parse(ev.data); } catch (_) { return; }
+      if (m.type === "PREVIEW_OUTPUT" && m.projectId === project.id) {
+        setLogs(prev => {
+          const next = [...prev, { stream: m.stream, text: m.chunk }];
+          return next.length > 200 ? next.slice(-200) : next;
+        });
+      }
+      if (m.type === "PREVIEW_STATUS" && m.projectId === project.id && m.status.state === "idle") {
+        // server-seitig prozess weg → iframe refresh nicht mehr sinnvoll
+      }
+    };
+    client.ws.addEventListener("message", onMsg);
+    return () => client.ws.removeEventListener("message", onMsg);
+  }, [client.ws, project.id]);
+
+  const saveConfig = () => {
+    const portNum = port === "" ? null : Number(port);
+    client.mutate("SET_PREVIEW_CONFIG", {
+      projectId: project.id,
+      preview: {
+        command: cmd.trim(),
+        port: Number.isFinite(portNum) ? portNum : null,
+        url: urlOverride.trim(),
+        autoDetected: false,
+      },
+    });
+    setEditing(false);
+  };
+
+  const applySuggestion = (sug) => {
+    setCmd(sug.command);
+    setPort(String(sug.port));
+    setUrlOverride("");
+  };
+
+  const start = async () => {
+    setBusy(true); setError(null); setLogs([]);
+    try {
+      const r = await fetch(client.serverUrl + "/api/preview/start", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer " + client.token },
+        body: JSON.stringify({ projectId: project.id }),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(d.error || "start fehlgeschlagen");
+      // dev-server braucht 2-4s bis er hört. iframe-key bumpen nach 2.5s
+      setTimeout(() => setIframeKey(k => k + 1), 2500);
+    } catch (e) { setError(e.message); }
+    finally { setBusy(false); }
+  };
+
+  const stop = async () => {
+    setBusy(true); setError(null);
+    try {
+      const r = await fetch(client.serverUrl + "/api/preview/stop", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer " + client.token },
+        body: JSON.stringify({ projectId: project.id }),
+      });
+      if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.error || "stop fehlgeschlagen"); }
+    } catch (e) { setError(e.message); }
+    finally { setBusy(false); }
+  };
+
+  const iframeUrl = (runtime.url || preview.url || (preview.port ? "http://localhost:" + preview.port : "")) || "";
+
+  return (
+    <div className="pg-screen" style={{ gridTemplateColumns: "minmax(0, 1fr) 360px" }}>
+      <div className="pg-main">
+        <div style={{ marginBottom: 12, display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+          <div className="eyebrow">// live-preview</div>
+          {isRunning ? (
+            <>
+              <span className="chip solid" style={{ background: "#1b3a23", borderColor: "#2a8a3a", color: "#7fd494" }}>● läuft</span>
+              <code style={{ fontSize: 11, color: "var(--ink-soft)" }}>{iframeUrl}</code>
+              <button className="btn tiny" onClick={() => setIframeKey(k => k + 1)} disabled={busy}>↻ refresh</button>
+              <button className="btn tiny danger" onClick={stop} disabled={busy}>stop</button>
+            </>
+          ) : detecting ? (
+            <>
+              <span className="chip" style={{ color: "var(--ink-faint)" }}>… erkenne projekt</span>
+            </>
+          ) : preview.command ? (
+            <>
+              <span className="chip" style={{ color: "var(--ink-faint)" }}>○ idle</span>
+              <code style={{ fontSize: 11, color: "var(--ink-soft)" }}>{preview.command}</code>
+              {preview.autoDetected && (
+                <span style={{ fontSize: 10, color: "var(--ink-faint)" }}>· auto-erkannt</span>
+              )}
+              <button className="btn tiny primary" onClick={start} disabled={busy}>▶ start</button>
+              <button className="btn tiny" onClick={() => setEditing(true)}>ändern</button>
+            </>
+          ) : (
+            <>
+              <span className="chip" style={{ color: "var(--ink-faint)" }}>○ kein dev-script gefunden</span>
+              <button className="btn tiny" onClick={() => setEditing(true)}>manuell konfigurieren</button>
+            </>
+          )}
+          {error && <span style={{ color: "#c33", fontSize: 12 }}>· {error}</span>}
+        </div>
+
+        {editing && (
+          <div className="card" style={{ marginBottom: 12, padding: 12 }}>
+            <div className="eyebrow" style={{ marginBottom: 8 }}>preview-konfig</div>
+            {suggestions.length > 0 && (
+              <div style={{ marginBottom: 10 }}>
+                <div style={{ fontSize: 11, color: "var(--ink-faint)", marginBottom: 4 }}>auto-erkannt:</div>
+                <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                  {suggestions.map((s, i) => (
+                    <button key={i} className="btn tiny" onClick={() => applySuggestion(s)}>
+                      {s.label} · :{s.port}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+            <label className="field">
+              <span className="eyebrow">command</span>
+              <input className="input" value={cmd} onChange={e => setCmd(e.target.value)}
+                     placeholder="npm run dev / flutter run -d chrome ..." />
+            </label>
+            <label className="field">
+              <span className="eyebrow">port</span>
+              <input className="input" type="number" value={port} onChange={e => setPort(e.target.value)}
+                     placeholder="5173 / 3000 / 8090" style={{ maxWidth: 120 }} />
+            </label>
+            <label className="field">
+              <span className="eyebrow">url override <span style={{ opacity: 0.5 }}>(optional)</span></span>
+              <input className="input" value={urlOverride} onChange={e => setUrlOverride(e.target.value)}
+                     placeholder="leer = http://localhost:<port>" />
+            </label>
+            <div style={{ display: "flex", gap: 8, marginTop: 6 }}>
+              <button className="btn primary" onClick={saveConfig} disabled={!cmd.trim()}>speichern</button>
+              <button className="btn" onClick={() => setEditing(false)}>abbrechen</button>
+            </div>
+            <div style={{ fontSize: 11, color: "var(--ink-faint)", marginTop: 10, lineHeight: 1.5 }}>
+              tipp: preview spawnt dein dev-script lokal im project-pfad. nur owner darf das (security).
+              shell-injection-zeichen (<code>; &amp; | ` $</code>) sind im command geblockt.
+            </div>
+          </div>
+        )}
+
+        <div style={{
+          border: "1.5px solid var(--line)", borderRadius: 6,
+          background: "#0a0a0c", height: "calc(100vh - 280px)", minHeight: 400,
+          display: "flex", flexDirection: "column",
+        }}>
+          {isRunning && iframeUrl ? (
+            <iframe key={iframeKey} src={iframeUrl}
+                    style={{ flex: 1, width: "100%", border: 0, background: "#fff" }}
+                    title="live preview" />
+          ) : (
+            <div style={{
+              flex: 1, display: "flex", alignItems: "center", justifyContent: "center",
+              color: "var(--ink-faint)", fontSize: 13, textAlign: "center", padding: 24,
+            }}>
+              {!preview.command
+                ? 'noch kein dev-command konfiguriert · klick auf „config".'
+                : "preview gestoppt · klick ▶ start"}
+            </div>
+          )}
+        </div>
+      </div>
+
+      <aside className="pg-aside">
+        <div className="pg-side-panel">
+          <div className="eyebrow" style={{ marginBottom: 8 }}>dev-server log</div>
+          <div style={{
+            fontFamily: "monospace", fontSize: 10, lineHeight: 1.4,
+            background: "#0a0a0c", padding: 8, borderRadius: 4,
+            height: "calc(100vh - 320px)", minHeight: 360, overflow: "auto",
+            color: "var(--ink-soft)",
+          }}>
+            {logs.length === 0 ? (
+              <div style={{ color: "var(--ink-faint)" }}>keine logs · noch nicht gestartet</div>
+            ) : logs.map((l, i) => (
+              <div key={i} style={{ color: l.stream === "stderr" ? "#e7a06a" : "var(--ink-soft)", whiteSpace: "pre-wrap" }}>
+                {l.text}
+              </div>
+            ))}
+          </div>
+        </div>
+      </aside>
+    </div>
+  );
+}
+
 // ─── Screen: Sync ─────────────────────────────────────────────
 function ScreenSync({ project, allSyncLog, lastFullSync, onSync, showToast }) {
   const log = allSyncLog.filter(e => e.projectId === project.id || !e.projectId).slice(0, 50);
@@ -3089,6 +3341,7 @@ function App() {
                              ccRunning={client.ccRunning}
                              setCcRunning={(v) => client.mutate("TOGGLE_CC", { running: v })} />
               )}
+              {client.activeTab === "preview" && <ScreenPreview project={project} />}
               {client.activeTab === "sync" && (
                 <ScreenSync project={project}
                             allSyncLog={client.syncLog}

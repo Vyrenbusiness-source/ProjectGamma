@@ -712,6 +712,30 @@ const MUT = {
     }
     s.projects = s.projects.map(p => p.id === projectId ? { ...p, ...patch } : p);
   },
+  // Live-Preview-Konfig: command (z.B. "npm run dev"), port (z.B. 5173),
+  // url (override, sonst http://localhost:<port>). cwdRel: optional, sub-
+  // ordner (z.B. "mobile-app") in dem das command gespawnt wird — sonst
+  // project.path. Persistent damit der user es nicht jedesmal neu eintippt.
+  SET_PREVIEW_CONFIG(s, { projectId, preview }) {
+    if (!preview || typeof preview !== "object") return;
+    // Sicherheit: cwdRel muss relativer pfad sein, ohne ../ und ohne
+    // shell-metazeichen. landet später in spawn(cwd:...).
+    let cwdRel = "";
+    if (typeof preview.cwdRel === "string" && preview.cwdRel.trim()) {
+      const r = preview.cwdRel.trim().replace(/\\/g, "/");
+      if (!r.includes("..") && !/[<>:"|?*;&`$\n\r]/.test(r) && r.length < 200) {
+        cwdRel = r;
+      }
+    }
+    const clean = {
+      command: typeof preview.command === "string" ? preview.command.slice(0, 500) : "",
+      port: Number.isFinite(preview.port) ? Math.max(0, Math.min(65535, preview.port | 0)) : null,
+      url: typeof preview.url === "string" ? preview.url.slice(0, 500) : "",
+      cwdRel,
+      autoDetected: !!preview.autoDetected,
+    };
+    s.projects = s.projects.map(p => p.id === projectId ? { ...p, preview: clean } : p);
+  },
   ADD_PROJECT(s, { project }) {
     // Bugfix: leerer pfad ist OK (optional!), wird erst validiert wenn nicht-leer.
     // Vorher: assertSafeProjectPath warf bei "" → projekt-create scheiterte komplett.
@@ -3089,15 +3113,38 @@ function _startCcJob(project, taskId, prompt) {
       // genau wie self-review schon geskippt wird. spart 30-180s pro task.
       const filesChangedList = Array.isArray(parsedStatus.filesChanged) ? parsedStatus.filesChanged : [];
       if (filesChangedList.length === 0) {
+        // GUARD: wenn der task-text explizit nach einer datei verlangt
+        // (erstelle/schreibe/lege an/create/write/...), darf der read-only-
+        // skip-pfad NICHT auto-checkmark feuern. Sonst markiert cc tasks als
+        // done obwohl die geforderte datei nie geschrieben wurde.
+        const tnPre = state.projects.find(p => p.id === projectId)?.tasks.find(t => t.id === taskId);
+        const taskText = ((tnPre?.title || "") + " " + (tnPre?.description || "")).toLowerCase();
+        const requiresWrite = /\b(erstelle|erstellen|schreibe|schreib|schreiben|lege an|anlegen|generiere|generieren|create|write|implement|implementiere|implementieren|baue|bauen|hinzuf[uü]gen|hinzuf[uü]ge|add )\b/.test(taskText);
+        if (requiresWrite) {
+          applyMutation("ADD_ACTIVITY", { projectId, event: {
+            type: "warn",
+            text: `cc behauptet done — aber 0 dateien geändert obwohl task ausdrücklich eine datei verlangt. NICHT auto-checkmark.`,
+          }});
+          applyMutation("ADD_SYNC_LOG", { entry: {
+            source: "cloud", projectId,
+            text: `cc-task „${escapeHtml((tnPre?.title || "").slice(0,80))}" verifikation: keine datei erstellt — task bleibt offen`,
+          }});
+          // Retry-counter erhöhen damit autopump beim nächsten anlauf einen
+          // schärferen prompt mitgibt (oder nach max-retry FAILED markiert).
+          const prev = _ccRetryContext.get(taskId) || { attempt: 0, kind: "missing-write", projectId };
+          _ccRetryContext.set(taskId, {
+            ...prev, attempt: (prev.attempt || 0) + 1,
+            kind: "missing-write",
+            lastNote: "cc claimed done but wrote 0 files; task description requires file creation",
+            projectId,
+          });
+          releasePostCheck();
+          return;
+        }
         applyMutation("ADD_ACTIVITY", { projectId, event: {
           type: "info",
           text: "build-gate + runtime-test übersprungen (0 dateien geändert)",
         }});
-        // Direkt zu auto-checkmark (review wird intern auch geskippt da
-        // filesChanged.length === 0 → siehe skipReview branch unten).
-        // Wir simulieren build-gate=ok + runtime=skipped um den bestehenden
-        // flow nicht neu zu schreiben.
-        // → einfacher: jetzt direkt auto-mark-done aufrufen.
         const tn = state.projects.find(p=>p.id===projectId)?.tasks.find(t=>t.id===taskId);
         if (tn) {
           (tn.subtasks || []).filter(s => !s.done).forEach(s => {
@@ -3646,6 +3693,322 @@ app.get("/api/cc/status", authMw, (req, res) => {
   res.json({ jobs: out });
 });
 
+// ─── Live-Preview ─────────────────────────────────────────
+// Dev-server pro projekt starten (npm run dev / flutter run --web / etc.)
+// und in der UI als iframe einbetten. Owner-only, in-memory job-map (kein
+// persistierter zustand des prozesses — kill bei server-restart).
+const previewJobs = new Map(); // projectId -> { proc, command, port, url, startedAt, logs }
+const PREVIEW_LOG_LIMIT = 200;
+
+function previewStatus(projectId) {
+  const j = previewJobs.get(projectId);
+  if (!j) return { state: "idle" };
+  return {
+    state: "running", command: j.command, port: j.port, url: j.url,
+    startedAt: j.startedAt, pid: j.proc?.pid,
+  };
+}
+
+// Auto-detect: aus package.json + pubspec.yaml ein vernünftiges command
+// + port raten. Sucht auch in standard-subdirs (web/, frontend/, desktop-app/,
+// mobile-app/, apps/*, packages/*), damit monorepos automatisch greifen.
+// Keine LLM-tokens, pure heuristik.
+function detectPreviewConfig(cwd) {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const suggestions = [];
+  // Suchpfade: root + erste-ebene-subdirs, die häufig dev-server enthalten.
+  const candidates = [cwd];
+  const commonSubs = ["web", "frontend", "client", "app", "apps", "packages", "desktop-app", "mobile-app", "ui", "site"];
+  for (const sub of commonSubs) {
+    const p = path.join(cwd, sub);
+    try {
+      if (fs.existsSync(p) && fs.statSync(p).isDirectory()) {
+        candidates.push(p);
+        // apps/* + packages/* eine ebene tiefer
+        if (sub === "apps" || sub === "packages") {
+          try {
+            for (const child of fs.readdirSync(p).slice(0, 10)) {
+              const cp = path.join(p, child);
+              if (fs.statSync(cp).isDirectory()) candidates.push(cp);
+            }
+          } catch (_) {}
+        }
+      }
+    } catch (_) {}
+  }
+
+  for (const dir of candidates) {
+    const rel = path.relative(cwd, dir) || ".";
+    try {
+      const pkgPath = path.join(dir, "package.json");
+      if (fs.existsSync(pkgPath)) {
+        const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+        const scripts = pkg.scripts || {};
+        let port = 3000;
+        const allDeps = Object.assign({}, pkg.dependencies || {}, pkg.devDependencies || {});
+        if (allDeps.vite || allDeps["@vitejs/plugin-react"] || allDeps["@vitejs/plugin-vue"]) port = 5173;
+        else if (allDeps.next) port = 3000;
+        else if (allDeps.astro) port = 4321;
+        else if (allDeps["@sveltejs/kit"]) port = 5173;
+        else if (allDeps.nuxt || allDeps.nuxt3) port = 3000;
+        // cd <dir> nur wenn nicht root — cmd.exe-kompatibel via "&&" wäre
+        // shell-injection. Stattdessen brauchen wir keinen cd da das spawn
+        // schon cwd setzt — aber preview spawnt im project.path. workaround:
+        // wir suggest-en command + zusätzliches workdir-feld? simpler:
+        // wir geben den relativen pfad als HINWEIS im label, command bleibt
+        // npm run dev. spawn nutzt project.path als cwd — also funktioniert
+        // nur wenn package.json im root liegt. für monorepos: wir lassen
+        // user via 'cwd-tipp' wissen, aber stripen cd aus dem command.
+        // Bessere lösung: command-prefix mit shell-safe cwd-switch via
+        // 'pushd <dir> && command' — aber das fällt unter shell-injection-
+        // sperre. → wir packen statt dessen 'npm --prefix <dir> run dev'.
+        if (scripts.dev) suggestions.push({
+          command: "npm run dev", port,
+          cwdRel: rel === "." ? "" : rel,
+          label: rel !== "." ? `${rel} · npm run dev` : "npm run dev",
+        });
+        if (scripts.start && !scripts.dev) suggestions.push({
+          command: "npm start", port,
+          cwdRel: rel === "." ? "" : rel,
+          label: rel !== "." ? `${rel} · npm start` : "npm start",
+        });
+      }
+    } catch (_) {}
+    try {
+      const pubPath = path.join(dir, "pubspec.yaml");
+      if (fs.existsSync(pubPath)) {
+        suggestions.push({
+          command: "flutter run -d chrome --web-port=8090",
+          port: 8090,
+          cwdRel: rel === "." ? "" : rel,
+          label: rel !== "." ? `${rel} · flutter run -d chrome` : "flutter run -d chrome",
+        });
+      }
+    } catch (_) {}
+    // Python web
+    try {
+      if (fs.existsSync(path.join(dir, "manage.py"))) {
+        suggestions.push({
+          command: "python manage.py runserver 0.0.0.0:8000", port: 8000,
+          cwdRel: rel === "." ? "" : rel,
+          label: rel !== "." ? `${rel} · django runserver` : "django runserver",
+        });
+      } else if (fs.existsSync(path.join(dir, "app.py")) || fs.existsSync(path.join(dir, "wsgi.py"))) {
+        suggestions.push({
+          command: "python -m flask run --host=0.0.0.0 --port=5000", port: 5000,
+          cwdRel: rel === "." ? "" : rel,
+          label: rel !== "." ? `${rel} · flask run` : "flask run",
+        });
+      }
+    } catch (_) {}
+    // Statisches HTML (index.html ohne package.json) → http-server
+    try {
+      if (fs.existsSync(path.join(dir, "index.html")) &&
+          !fs.existsSync(path.join(dir, "package.json")) &&
+          !fs.existsSync(path.join(dir, "pubspec.yaml"))) {
+        suggestions.push({
+          command: "npx --yes serve -l 4173 .", port: 4173,
+          cwdRel: rel === "." ? "" : rel,
+          label: rel !== "." ? `${rel} · statisches HTML` : "statisches HTML",
+        });
+      }
+    } catch (_) {}
+  }
+
+  return suggestions;
+}
+
+app.get("/api/preview/detect", authMw, (req, res) => {
+  const projectId = String(req.query.projectId || "");
+  const project = state.projects.find(p => p.id === projectId);
+  if (!project) return res.status(404).json({ error: "projekt nicht gefunden" });
+  if (!_requireProjectAccess(req, res, project, ROLES.VIEWER)) return;
+  if (!project.path) return res.json({ suggestions: [] });
+  try { assertSafeProjectPath(project.path, "preview.detect.cwd"); }
+  catch (e) { return res.status(400).json({ error: e.message }); }
+  res.json({ suggestions: detectPreviewConfig(project.path) });
+});
+
+app.post("/api/preview/start", authMw, (req, res) => {
+  const { projectId } = req.body || {};
+  const project = state.projects.find(p => p.id === projectId);
+  if (!project) return res.status(404).json({ error: "projekt nicht gefunden" });
+  // Owner-only — preview spawnt arbitrary shell commands, das ist kein
+  // viewer/member-job. (Same trust model wie cc-runs.)
+  if (!_requireProjectAccess(req, res, project, ROLES.OWNER)) return;
+  if (!project.path) return res.status(400).json({ error: "projekt hat keinen pfad gesetzt" });
+  try { assertSafeProjectPath(project.path, "preview.start.cwd"); }
+  catch (e) { return res.status(400).json({ error: e.message }); }
+  if (previewJobs.has(projectId)) return res.status(409).json({ error: "preview läuft schon" });
+
+  const cfg = project.preview || {};
+  const command = (cfg.command || "").trim();
+  if (!command) return res.status(400).json({ error: "kein command konfiguriert" });
+  // Sicherheit: ein paar offensichtliche shell-injektions-vektoren blocken.
+  // Owner-trust ist da, aber wir wollen nicht via getätigtes-preview-feld
+  // die ganze platte löschen wenn jemand das config-feld als attack-vector
+  // benutzt (z.B. via leaked OWNER-session).
+  if (/[;&|`$\n\r]/.test(command)) {
+    return res.status(400).json({ error: "command enthält unzulässige zeichen (; & | ` $ newline)" });
+  }
+  const port = Number.isFinite(cfg.port) ? cfg.port : null;
+  const url = cfg.url || (port ? `http://localhost:${port}` : "");
+
+  // PATH-Augmentation: viele projekte bundlen ihr SDK lokal (Flutter/,
+  // flutter/, .fvm/, node_modules/.bin). Wenn wir diese ordner in PATH
+  // prepend-en, funktioniert "flutter run", "next dev" etc. ohne dass der
+  // user den SDK global installieren muss.
+  const augmentedPath = (() => {
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const sep = process.platform === "win32" ? ";" : ":";
+    const candidates = [
+      path.join(project.path, "Flutter", "flutter", "bin"),
+      path.join(project.path, "Flutter", "bin"),
+      path.join(project.path, "flutter", "bin"),
+      path.join(project.path, ".fvm", "flutter_sdk", "bin"),
+      path.join(project.path, "node_modules", ".bin"),
+    ];
+    const prefix = candidates.filter(p => {
+      try { return fs.existsSync(p); } catch (_) { return false; }
+    });
+    if (prefix.length === 0) return process.env.PATH;
+    return prefix.join(sep) + sep + (process.env.PATH || "");
+  })();
+
+  // cwd: bei monorepo-detection liegt das command in einem sub-ordner. wir
+  // hängen den ans project.path und prüfen mit assertSafeProjectPath dass
+  // niemand via cwdRel rausbricht.
+  const path = require("node:path");
+  const fs = require("node:fs");
+  const spawnCwd = cfg.cwdRel
+    ? path.resolve(project.path, cfg.cwdRel)
+    : project.path;
+  try { assertSafeProjectPath(spawnCwd, "preview.start.spawnCwd"); }
+  catch (e) { return res.status(400).json({ error: e.message }); }
+  if (!fs.existsSync(spawnCwd)) {
+    return res.status(400).json({ error: "preview-cwd existiert nicht: " + spawnCwd });
+  }
+  // resolve ist relativ zu root sicher, aber zusätzlich: cwdRel darf nicht
+  // aus project.path raushebeln (via symlinks / ..).
+  if (!spawnCwd.toLowerCase().startsWith(path.resolve(project.path).toLowerCase())) {
+    return res.status(400).json({ error: "preview-cwd liegt außerhalb des projects" });
+  }
+
+  const { spawn, spawnSync } = require("node:child_process");
+  const spawnEnv = {
+    ...process.env,
+    PATH: augmentedPath,
+    Path: augmentedPath, // windows-case
+    BROWSER: "none", // verhindert dass dev-server eigenes browser-tab öffnet
+  };
+
+  // Auto-bootstrap: flutter run -d chrome braucht ein web/ unterverzeichnis.
+  // Wenn das fehlt, läuft `flutter create . --platforms=web` einmalig durch,
+  // damit der user nicht "flutter create" manuell tippen muss. blockierend
+  // (~5-15s), aber nur beim allerersten start.
+  if (/^flutter\s+run\b/.test(command) && !fs.existsSync(path.join(spawnCwd, "web"))) {
+    console.log("[preview] flutter web-support fehlt, bootstrappe via 'flutter create .'");
+    try {
+      const r = spawnSync("flutter", ["create", ".", "--platforms=web"], {
+        cwd: spawnCwd, shell: true, windowsHide: true,
+        env: spawnEnv, timeout: 30_000, stdio: ["ignore", "pipe", "pipe"],
+      });
+      if (r.status !== 0) {
+        const errOut = (r.stderr?.toString() || r.stdout?.toString() || "").slice(0, 500);
+        return res.status(500).json({ error: "flutter create fehlgeschlagen: " + errOut });
+      }
+      applyMutation("ADD_ACTIVITY", { projectId, event: {
+        type: "info", text: "preview: flutter web-support automatisch eingerichtet (flutter create .)",
+      }});
+    } catch (e) {
+      return res.status(500).json({ error: "flutter-bootstrap fehler: " + e.message });
+    }
+  }
+
+  let proc;
+  try {
+    proc = spawn(command, [], {
+      cwd: spawnCwd,
+      shell: true,
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"],
+      env: spawnEnv,
+    });
+  } catch (e) {
+    return res.status(500).json({ error: "spawn fehlgeschlagen: " + e.message });
+  }
+
+  const job = {
+    proc, command, port, url, startedAt: NOW(),
+    logs: [], // ring-buffer
+  };
+  previewJobs.set(projectId, job);
+
+  const pushLog = (stream, chunk) => {
+    const text = chunk.toString();
+    job.logs.push({ ts: NOW(), stream, text });
+    if (job.logs.length > PREVIEW_LOG_LIMIT) job.logs.splice(0, job.logs.length - PREVIEW_LOG_LIMIT);
+    broadcastForProject({
+      type: "PREVIEW_OUTPUT", projectId, chunk: text, stream,
+    }, projectId);
+  };
+  proc.stdout.on("data", c => pushLog("stdout", c));
+  proc.stderr.on("data", c => pushLog("stderr", c));
+  proc.on("error", (err) => {
+    console.error("[preview] proc error:", err.message);
+    previewJobs.delete(projectId);
+    broadcastForProject({ type: "PREVIEW_STATUS", projectId, status: { state: "idle", error: err.message } }, projectId);
+    applyMutation("ADD_ACTIVITY", { projectId, event: {
+      type: "warn", text: "preview-server fehler: " + escapeHtml(err.message),
+    }});
+    broadcastState();
+  });
+  proc.on("close", (code) => {
+    previewJobs.delete(projectId);
+    console.log("[preview] done", projectId, "exit", code);
+    broadcastForProject({ type: "PREVIEW_STATUS", projectId, status: { state: "idle", exitCode: code } }, projectId);
+    applyMutation("ADD_ACTIVITY", { projectId, event: {
+      type: "info", text: "preview-server beendet (exit " + code + ")",
+    }});
+    broadcastState();
+  });
+
+  applyMutation("ADD_ACTIVITY", { projectId, event: {
+    type: "info", text: "preview-server gestartet · <code>" + escapeHtml(command) + "</code>",
+  }});
+  broadcastState();
+  broadcastForProject({ type: "PREVIEW_STATUS", projectId, status: previewStatus(projectId) }, projectId);
+  res.json({ ok: true, status: previewStatus(projectId) });
+});
+
+app.post("/api/preview/stop", authMw, (req, res) => {
+  const { projectId } = req.body || {};
+  const project = state.projects.find(p => p.id === projectId);
+  if (!project) return res.status(404).json({ error: "projekt nicht gefunden" });
+  if (!_requireProjectAccess(req, res, project, ROLES.OWNER)) return;
+  const job = previewJobs.get(projectId);
+  if (!job) return res.status(404).json({ error: "kein preview läuft" });
+  // dev-server-prozesse (vite/next/flutter) spawnen sub-prozesse — auf
+  // windows tötet child.kill() nur cmd.exe-wrapper, kinder bleiben. tree-kill.
+  killTreeGraceful(job.proc, { gracefulMs: 1500 });
+  previewJobs.delete(projectId);
+  res.json({ ok: true });
+});
+
+app.get("/api/preview/status", authMw, (req, res) => {
+  const projectId = String(req.query.projectId || "");
+  const project = state.projects.find(p => p.id === projectId);
+  if (!project) return res.status(404).json({ error: "projekt nicht gefunden" });
+  if (!_requireProjectAccess(req, res, project, ROLES.VIEWER)) return;
+  const job = previewJobs.get(projectId);
+  res.json({
+    status: previewStatus(projectId),
+    logs: job ? job.logs.slice(-50) : [],
+  });
+});
+
 // Vorschläge generieren: claude analysiert Projekt + schlägt 5-10 Improvements vor
 app.post("/api/cc/suggest", authMw, async (req, res) => {
   const { projectId } = req.body || {};
@@ -4039,7 +4402,12 @@ function publicState(session) {
   // collab-szenario).
   return {
     ...base,
-    projects: (base.projects || []).map(p => ({ ...p, pathValid: projectPathValid(p) })),
+    projects: (base.projects || []).map(p => ({
+      ...p,
+      pathValid: projectPathValid(p),
+      // Live-preview-runtime-status (in-memory, nicht persistiert)
+      previewState: previewStatus(p.id),
+    })),
     // Transient: auto-pump-pause-flag. Wenn _ccApiLimitedUntil in der zukunft
     // liegt, war kurz vorher ein API-limit. UI zeigt warnung + resume-button.
     ccApiLimitedUntil: _ccApiLimitedUntil > NOW() ? _ccApiLimitedUntil : 0,
