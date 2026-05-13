@@ -655,9 +655,18 @@ function Sidebar({ projects, activeId, onSelect, onNew, ccRunning }) {
     if (!!b.starred - !!a.starred) return !!b.starred - !!a.starred;
     return (a.name || "").localeCompare(b.name || "");
   });
+  // Aktueller user für die user-card unten in sidebar (mockup-style).
+  // Bevorzugt account-email (deviceName=email nach login), fallback pair-deviceName.
+  const myEmail = (sync.deviceName && /@/.test(sync.deviceName))
+    ? sync.deviceName
+    : (sync.deviceName || "desktop");
+  const initial = (myEmail.match(/^./) || ["?"])[0].toUpperCase();
+  const displayName = /@/.test(myEmail)
+    ? myEmail.split("@")[0]
+    : myEmail;
   return (
     <div className="side">
-      <div className="eyebrow">// projekte</div>
+      <div className="eyebrow">Projekte</div>
       {sorted.map(p => {
         // D4 · Live-counts pro projekt — auf den ersten blick sichtbar
         const openTasks = (p.tasks || []).filter(t => !t.done).length;
@@ -686,12 +695,21 @@ function Sidebar({ projects, activeId, onSelect, onNew, ccRunning }) {
         </div>
         );
       })}
-      <button className="new-btn" onClick={onNew}>+ neues projekt</button>
+      <button className="new-btn" onClick={onNew}>+ Neues Projekt</button>
 
       <div className="cc-ambient">
         <span className={"cc-dot" + (ccRunning ? " live" : "")}>
           cloud-code · {ccRunning ? "arbeitet" : "pause"}
         </span>
+      </div>
+
+      {/* User-card unten (mockup-style: avatar + name + email) */}
+      <div className="side-user-card">
+        <div className="avatar">{initial}</div>
+        <div className="user-info">
+          <div className="user-name">{displayName}</div>
+          <div className="user-email">{myEmail}</div>
+        </div>
       </div>
     </div>
   );

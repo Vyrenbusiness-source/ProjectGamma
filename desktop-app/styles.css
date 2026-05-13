@@ -175,74 +175,117 @@ html[data-theme="dim"] .app::before { display: none; }
 
 /* ─── Sidebar ───────────────────────────────────────────────── */
 .side {
-  border-right: 2px solid var(--line);
-  padding: 14px 12px;
-  background: rgba(0,0,0,0.02);
-  display: flex; flex-direction: column; gap: 8px;
+  border-right: 1px solid var(--line);
+  padding: 16px 12px;
+  background: var(--paper-2);
+  display: flex; flex-direction: column; gap: 4px;
   overflow-y: auto;
 }
-.side h3 {
-  font-family: "Architects Daughter", sans-serif;
-  font-size: 13px; font-weight: 700; color: var(--ink-soft);
-  margin: 0; padding: 0 4px;
-  text-transform: lowercase;
-  letter-spacing: 0.04em;
-}
 .side .eyebrow {
-  font-family: "JetBrains Mono", monospace;
-  font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase;
-  color: var(--ink-soft); padding: 6px 4px 2px;
+  font-family: inherit;
+  font-size: 11px;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  font-weight: 500;
+  color: var(--ink-faint);
+  padding: 6px 8px 10px;
 }
 .proj-item {
-  display: flex; align-items: center; gap: 6px;
-  padding: 7px 9px;
-  border-radius: 4px;
+  display: flex; align-items: center; gap: 8px;
+  padding: 10px 10px;
+  border-radius: 8px;
   cursor: pointer;
-  border: 2px solid transparent;
-  font-size: 14px;
-  transition: background 0.12s;
+  border: 1px solid transparent;
+  font-size: 13px;
+  transition: background 0.12s, border-color 0.12s;
 }
 .proj-item:hover { background: rgba(0,0,0,0.04); }
 .proj-item.active {
-  background: var(--ink);
-  color: var(--paper);
+  background: var(--paper);
+  border-color: var(--line);
+  color: var(--ink);
 }
-.proj-item .star { width: 14px; opacity: 0.9; flex-shrink: 0; }
-.proj-item .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-/* D4 · Counts unterhalb des projekt-namens, klein + monospace */
-.proj-item .proj-info { flex: 1; display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.proj-item .star {
+  width: 14px; flex-shrink: 0;
+  color: var(--ink-soft);
+}
+.proj-item.active .star { color: var(--ok); }
+.proj-item .name {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-weight: 500;
+}
+.proj-item .proj-info { flex: 1; display: flex; flex-direction: column; gap: 3px; min-width: 0; }
 .proj-item .proj-counts {
-  display: flex; gap: 6px;
-  font-family: "JetBrains Mono", monospace;
-  font-size: 9.5px; color: var(--ink-faint);
+  display: flex; gap: 8px;
+  font-size: 11px;
+  color: var(--ink-faint);
+  font-family: inherit;
 }
-.proj-item.active .proj-counts { color: rgba(250,248,243,0.7); }
-.proj-item .proj-count.attention { color: #CC8800; font-weight: 600; }
-.proj-item.active .proj-count.attention { color: #FFD080; }
+.proj-item.active .proj-counts { color: var(--ink-soft); }
+.proj-item .proj-count.attention { color: #d4a017; font-weight: 600; }
 .proj-item .badge {
-  font-family: "JetBrains Mono", monospace;
-  font-size: 10px;
+  font-size: 11px;
   opacity: 0.7;
 }
 .side .new-btn {
-  margin-top: 6px;
-  border: 2px dashed var(--line);
-  padding: 8px 9px;
-  border-radius: 4px;
+  margin-top: 8px;
+  border: 1px solid var(--line);
+  padding: 10px 12px;
+  border-radius: 8px;
   text-align: left;
   background: transparent;
   color: var(--ink-soft);
   font-size: 13px;
   font-family: inherit;
+  font-weight: 500;
+  cursor: pointer;
 }
-.side .new-btn:hover { background: rgba(0,0,0,0.04); color: var(--ink); }
+.side .new-btn:hover {
+  background: rgba(0,0,0,0.04);
+  color: var(--ink);
+  border-color: var(--ink-soft);
+}
+html[data-theme="dim"] .side .new-btn:hover { background: rgba(255,255,255,0.05); }
+
+/* User-card unten in sidebar (mockup-style) */
+.side-user-card {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 8px;
+  border-top: 1px solid var(--line);
+  margin-top: auto;
+}
+.side-user-card .avatar {
+  width: 32px; height: 32px;
+  border-radius: 8px;
+  background: var(--ink);
+  color: var(--paper);
+  display: flex; align-items: center; justify-content: center;
+  font-weight: 600;
+  font-size: 13px;
+  flex-shrink: 0;
+}
+.side-user-card .user-info { flex: 1; min-width: 0; }
+.side-user-card .user-name {
+  font-size: 13px; font-weight: 500;
+  color: var(--ink);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.side-user-card .user-email {
+  font-size: 11px;
+  color: var(--ink-faint);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 
 /* Cloud-Code ambient at bottom of sidebar */
 .cc-ambient {
-  margin-top: auto;
-  padding: 10px 8px;
-  border-top: 2px dashed var(--line);
+  /* margin-top:auto entfernt — user-card unten übernimmt jetzt das
+     bottom-pushing (siehe .side-user-card). cc-ambient stackt nach
+     dem 'neues projekt'-button. */
+  padding: 10px 8px 4px;
   display: flex; flex-direction: column; gap: 4px;
+  font-size: 11px;
 }
 .cc-dot {
   display: inline-flex; align-items: center; gap: 6px;
@@ -346,12 +389,14 @@ html[data-theme="dim"] .app::before { display: none; }
 }
 .tab .count {
   font-family: inherit;
-  font-size: 11px;
+  font-size: 10.5px;
   color: var(--ink-faint);
-  margin-left: 6px;
+  margin-left: 5px;
   background: transparent;
   padding: 0;
-  font-weight: 600;
+  font-weight: 500;
+  vertical-align: super;
+  line-height: 1;
 }
 .tab.active .count { color: var(--ink-soft); background: transparent; }
 
