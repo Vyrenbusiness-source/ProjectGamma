@@ -1081,10 +1081,12 @@ const _NON_PROJECT_MUTATIONS = new Set([
 function _projectIdForOp(type, payload) {
   if (_NON_PROJECT_MUTATIONS.has(type)) return null;
   if (type === "ADD_PROJECT") {
-    // Beim ADD_PROJECT hat das gerade angelegte project schon eine id, weil
-    // MUT.ADD_PROJECT sie inline generiert. State ist bereits gespeichert.
-    const last = state.projects[state.projects.length - 1];
-    return last ? last.id : null;
+    // payload.project ist dieselbe object-ref, die MUT.ADD_PROJECT in
+    // state.projects gepusht hat — id ist inline gesetzt (siehe MUT.ADD_PROJECT).
+    // Race-fix: state.projects[length-1] ist bei parallelen ADD_PROJECT
+    // fragil und kann auf ein anderes gleichzeitig angelegtes projekt zeigen.
+    const created = payload && payload.project;
+    return created && created.id ? created.id : null;
   }
   if (type === "REMOVE_PROJECT") return payload && payload.projectId;
   return (payload && payload.projectId) || null;
@@ -2570,15 +2572,27 @@ function _startCcJob(project, taskId, prompt) {
     // (statt rohstdout — der ist jetzt jsonl, regex würde fehlschlagen)
     const fullOutput = job.assistantText || job.lines.join("");
 
-    // Claude-API-Limit erkennen → Auto-Pump für 10 Minuten pausieren
-    if (/hit your limit|rate limit|usage limit/i.test(fullOutput) ||
-        /hit your limit|rate limit|usage limit/i.test(job.lines.join(""))) {
+    // Claude-API-Limit erkennen → Auto-Pump für 10 Minuten pausieren.
+    // BUG-FIX: die alte regex /hit your limit|rate limit|usage limit/i
+    // hat false-positive auf normalen cc-output gematcht — z.B. tasks
+    // mit titel "add rate-limit middleware" oder code-kommentare über
+    // rate-limiting → autopump pausiert ohne grund 10min. jetzt nur noch
+    // unzweideutige Anthropic-API-error-patterns (json error-type,
+    // 429-status, spezifische CLI-fehlermeldungen).
+    // Auch wichtig: stderr (lines) prüfen ist sinnvoll — assistantText
+    // (fullOutput) ist content, der cc generiert hat → enthält bei
+    // normalen tasks oft "rate limit" als ganz normalen begriff.
+    const stderrText = job.lines.join("");
+    const apiLimitRegex = /("type"\s*:\s*"rate_limit_error")|(\brate_limit_error\b)|(\b429\s+(too many|rate)\b)|(\bhit your (usage|API|monthly) limit\b)|(\bquota exceeded\b)|(\byou.?ve (used|reached) your (usage|monthly|API)\b)/i;
+    if (apiLimitRegex.test(stderrText) || (job.realUsage === null && apiLimitRegex.test(fullOutput))) {
       _ccApiLimitedUntil = NOW() + 10 * 60 * 1000;
       console.log("[autopump] claude API limited — pausiere bis", new Date(_ccApiLimitedUntil).toLocaleTimeString());
       applyMutation("ADD_ACTIVITY", { projectId, event: {
         type: "warn",
-        text: "claude-api limit erreicht · auto-pump pausiert für 10min",
+        text: "claude-api limit erreicht · auto-pump pausiert für 10min — im cloud-code-tab gibt es einen 'fortsetzen jetzt'-button",
       }});
+      // ccApiLimitedUntil wird in publicState() injiziert (transient,
+      // NICHT persistent), damit nach server-restart kein stale-flag bleibt.
     }
 
     // Task 3: ECHTE token-zahlen aus result-event statt char/4-schätzung.
@@ -3111,6 +3125,16 @@ function _handleCcStreamEvent(job, ev) {
   }
 }
 
+// Auto-pump pause sofort beenden — falls die rate-limit-detection fälschlich
+// getriggert hat oder das echte limit vorbei ist + man nicht warten will.
+app.post("/api/cc/resume-now", authMw, (req, res) => {
+  const wasLimited = _ccApiLimitedUntil > NOW();
+  _ccApiLimitedUntil = 0;
+  console.log("[autopump] manual resume — limit-pause geleert (war aktiv:", wasLimited, ")");
+  broadcastState();
+  res.json({ ok: true, wasLimited });
+});
+
 app.post("/api/cc/stop", authMw, (req, res) => {
   const { projectId } = req.body || {};
   const project = state.projects.find(p => p.id === projectId);
@@ -3469,6 +3493,9 @@ function publicState(session) {
   return {
     ...base,
     projects: (base.projects || []).map(p => ({ ...p, pathValid: projectPathValid(p) })),
+    // Transient: auto-pump-pause-flag. Wenn _ccApiLimitedUntil in der zukunft
+    // liegt, war kurz vorher ein API-limit. UI zeigt warnung + resume-button.
+    ccApiLimitedUntil: _ccApiLimitedUntil > NOW() ? _ccApiLimitedUntil : 0,
   };
 }
 

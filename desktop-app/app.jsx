@@ -1935,6 +1935,24 @@ function ScreenCloud({ project, onCcRun, onCcStop, ccStatus, ccOutput, ccRunning
               </span>
             )}
           </div>
+          {client.state?.ccApiLimitedUntil && client.state.ccApiLimitedUntil > Date.now() && (
+            <div style={{
+              marginTop: 8, padding: "8px 12px",
+              border: "1.5px solid #c80", background: "#fff8e8",
+              borderRadius: 6, fontSize: 12, color: "#8a5500",
+              display: "flex", alignItems: "center", gap: 10,
+            }}>
+              <span>⏸ <strong>auto-pump pausiert</strong> bis {new Date(client.state.ccApiLimitedUntil).toLocaleTimeString()} (claude-api limit erreicht)</span>
+              <button className="btn tiny" onClick={async () => {
+                try {
+                  await fetch(client.serverUrl + "/api/cc/resume-now", {
+                    method: "POST",
+                    headers: { authorization: "Bearer " + client.token },
+                  });
+                } catch (_) {}
+              }}>fortsetzen jetzt</button>
+            </div>
+          )}
         </div>
         <div className="cc-controls">
           {isRunning
