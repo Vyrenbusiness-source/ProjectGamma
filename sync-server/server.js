@@ -759,6 +759,16 @@ const MUT = {
     project.messages    = project.messages    || [];
     project.notes       = project.notes       || [];
     project.appointments = project.appointments || [];
+    // Bug-fix (2026-05-14): pre-populated tasks/rules/ideas (z.B. von einem
+    // template-import oder batch-create) bekamen vorher KEINE id. Folge: cc-
+    // pipeline triggert mit taskId=undefined → _startCcJob findet keinen task
+    // → fallback-prompt 'Was wäre als nächstes sinnvoll?' → cc gibt nur einen
+    // plan ab, schreibt nichts (TeamLink-bug). Jetzt: jedem item ohne id eine
+    // generieren — der ADD_TASK/ADD_RULE/ADD_IDEA-pfad macht das schon, aber
+    // hier ist die single source of truth für ALLE einstiegspfade.
+    for (const item of project.tasks) if (!item.id) item.id = genId();
+    for (const item of project.rules) if (!item.id) item.id = genId();
+    for (const item of project.ideas) if (!item.id) item.id = genId();
     project.lastSync = NOW();
     s.projects.push(project);
   },
