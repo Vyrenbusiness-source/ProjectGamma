@@ -34,12 +34,23 @@
     const [uploading, setUploading] = useState(false);
     const [pendingAttachment, setPendingAttachment] = useState(null); // { fileId, name, kind, url }
     const [error, setError] = useState(null);
+    const [authedEmail, setAuthedEmail] = useState(null);
     const messages = project.messages || [];
     const listRef = useRef(null);
     const fileInputRef = useRef(null);
     useEffect(() => {
       if (listRef.current) listRef.current.scrollTop = listRef.current.scrollHeight;
     }, [messages.length]);
+    // Bug-fix: sync.deviceName kann pair-token "desktop" sein während posts
+    // via account-login mit email gemacht wurden — match-failure → alles links.
+    useEffect(() => {
+      let cancelled = false;
+      sync.getMe?.().then(m => {
+        if (!cancelled && m && m.user && m.user.email) setAuthedEmail(m.user.email);
+      }).catch(() => {});
+      return () => { cancelled = true; };
+    }, []);
+    const effectiveMyEmail = authedEmail || myEmail;
 
     const send = () => {
       const t = draft.trim();
@@ -114,7 +125,9 @@
               noch keine nachrichten. schreib was, deine team-mitglieder sehen es live.
             </div>
           ) : messages.map(m => {
-            const isOwn = myEmail && authorLabel(m) === myEmail;
+            const lbl = authorLabel(m);
+            const isOwn = !!((effectiveMyEmail && lbl === effectiveMyEmail) ||
+                            (myEmail && lbl === myEmail));
             return (
               <div key={m.id} style={{
                 marginBottom: 8,

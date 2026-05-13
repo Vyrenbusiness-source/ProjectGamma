@@ -932,22 +932,28 @@ function OnboardingBlock({ project, myEmail, onSetTab, onOpenMembers }) {
   const progress = [hasIdeas, hasTeam, hasMessages].filter(Boolean).length;
   const collapsed = allDone || manualDismissed;
 
+  // Bug-fix: vorher verschwand MiniChat wenn onboarding collapsed → user
+  // dachte chat sei weg. jetzt: kollabierte version zeigt nur kompakte
+  // bar + MiniChat darunter (full width).
   if (collapsed) {
     return (
-      <div className="box" style={{
-        marginBottom: 14, padding: "8px 14px",
-        display: "flex", alignItems: "center", gap: 10,
-        fontSize: 12, color: "var(--ink-soft)",
-      }}>
-        <span style={{ fontSize: 14 }}>{allDone ? "✓" : "·"}</span>
-        <span style={{ flex: 1 }}>
-          {allDone ? "onboarding abgeschlossen · alle 3 schritte fertig" : "onboarding minimiert"}
-        </span>
-        <button className="btn tiny" onClick={() => {
-          try { localStorage.removeItem(dismissKey); } catch (_) {}
-          setManualDismissed(false);
-        }}>einblenden</button>
-      </div>
+      <>
+        <div className="box" style={{
+          marginBottom: 14, padding: "8px 14px",
+          display: "flex", alignItems: "center", gap: 10,
+          fontSize: 12, color: "var(--ink-soft)",
+        }}>
+          <span style={{ fontSize: 14 }}>{allDone ? "✓" : "·"}</span>
+          <span style={{ flex: 1 }}>
+            {allDone ? "onboarding abgeschlossen · alle 3 schritte fertig" : "onboarding minimiert"}
+          </span>
+          <button className="btn tiny" onClick={() => {
+            try { localStorage.removeItem(dismissKey); } catch (_) {}
+            setManualDismissed(false);
+          }}>einblenden</button>
+        </div>
+        <MiniChat project={project} myEmail={myEmail} onSetTab={onSetTab} />
+      </>
     );
   }
 
@@ -1035,25 +1041,78 @@ function StatChip({ label, value, accent, onClick }) {
   );
 }
 
-// Mini-Chat: scrollbare preview der letzten 50 nachrichten + input.
+// Mini-Chat: scrollbare preview der letzten 50 nachrichten + input + upload.
 // Draft wird beim projekt-wechsel zurückgesetzt — sonst landet text im falschen projekt.
 function MiniChat({ project, myEmail, onSetTab }) {
   const [draft, setDraft] = useState("");
+  const [authedEmail, setAuthedEmail] = useState(null); // aus /api/auth/me
+  const [uploading, setUploading] = useState(false);
+  const [pendingAttachment, setPendingAttachment] = useState(null);
+  const [uploadError, setUploadError] = useState(null);
   const listRef = useRef(null);
-  useEffect(() => { setDraft(""); }, [project.id]);
+  const fileInputRef = useRef(null);
+  useEffect(() => { setDraft(""); setPendingAttachment(null); }, [project.id]);
   const messages = project.messages || [];
-  // Vorher slice(-3) → user sah nur 3 alte nachrichten und dachte chat sei limitiert.
-  // Jetzt: letzte 50 (server cap = 500), scrollbar, mit auto-scroll zum bottom.
   const last = messages.slice(-50);
   useEffect(() => {
     if (listRef.current) listRef.current.scrollTop = listRef.current.scrollHeight;
   }, [messages.length]);
 
+  // Bug-fix: sync.deviceName kann "desktop" sein (pair-token) während
+  // posts via account-login mit email gemacht wurden → mismatch, alle
+  // nachrichten landen links. Fix: /api/auth/me bei mount fetchen, dann
+  // gegen die TATSÄCHLICHE user-email matchen (preferred über deviceName).
+  useEffect(() => {
+    let cancelled = false;
+    sync.getMe?.().then(m => {
+      if (!cancelled && m && m.user && m.user.email) setAuthedEmail(m.user.email);
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
+  // Effektiver vergleichs-wert für isOwn: was IMMER der currently-authed
+  // user ist, dann fallback auf deviceName (für pair-token-session).
+  const effectiveMyEmail = authedEmail || myEmail;
+
   const send = () => {
     const t = draft.trim();
-    if (!t) return;
-    sync.mutate("ADD_MESSAGE", { projectId: project.id, message: { text: t } });
+    if (!t && !pendingAttachment) return;
+    const message = { text: t };
+    if (pendingAttachment) message.attachment = pendingAttachment;
+    sync.mutate("ADD_MESSAGE", { projectId: project.id, message });
     setDraft("");
+    setPendingAttachment(null);
+    setUploadError(null);
+  };
+
+  const onPickFile = () => { if (fileInputRef.current) fileInputRef.current.click(); };
+  const onFileSelected = async (e) => {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = "";
+    if (!file) return;
+    if (file.size > 8 * 1024 * 1024) { setUploadError("datei zu groß (max 8 MB)"); return; }
+    setUploading(true); setUploadError(null);
+    try {
+      const buf = await file.arrayBuffer();
+      const bytes = new Uint8Array(buf);
+      let bin = "";
+      const CHUNK = 0x8000;
+      for (let i = 0; i < bytes.length; i += CHUNK) {
+        bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+      }
+      const base64 = btoa(bin);
+      const r = await fetch(sync.serverUrl + "/api/projects/" + encodeURIComponent(project.id) + "/attachments", {
+        method: "POST",
+        headers: { "content-type": "application/json", "authorization": "Bearer " + sync.token },
+        body: JSON.stringify({ name: file.name, contentType: file.type || "application/octet-stream", base64 }),
+      });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(data.error || ("upload " + r.status));
+      setPendingAttachment({ fileId: data.fileId, name: data.name, kind: data.kind, url: data.url });
+    } catch (e) {
+      setUploadError(e.message || "upload fehlgeschlagen");
+    } finally {
+      setUploading(false);
+    }
   };
 
   return (
@@ -1081,7 +1140,11 @@ function MiniChat({ project, myEmail, onSetTab }) {
           </div>
         ) : last.map(m => {
           const author = m.authorEmail || (m.author && m.author.startsWith("device:") ? m.author.slice(7) : (m.author || "?"));
-          const isOwn = myEmail && author === myEmail;
+          // Match gegen effectiveMyEmail (priorität: /api/auth/me email)
+          // ODER pair-token-deviceName. So funktioniert auch der hybrid-fall
+          // (logged-in user-account aber sync.deviceName noch alt).
+          const isOwn = !!((effectiveMyEmail && author === effectiveMyEmail) ||
+                          (myEmail && author === myEmail));
           return (
             <div key={m.id} style={{
               display: "flex", justifyContent: isOwn ? "flex-end" : "flex-start",
@@ -1097,12 +1160,46 @@ function MiniChat({ project, myEmail, onSetTab }) {
               }}>
                 {!isOwn && <div style={{ fontSize: 10, opacity: 0.6, marginBottom: 1 }}>{author}</div>}
                 {m.text}
+                {m.attachment && m.attachment.url && (
+                  <div style={{ marginTop: 4 }}>
+                    {m.attachment.kind === "image" ? (
+                      <img src={(sync.serverUrl || "") + m.attachment.url}
+                           alt={m.attachment.name}
+                           style={{ maxWidth: "100%", borderRadius: 4, display: "block" }} />
+                    ) : (
+                      <div style={{ fontSize: 10.5, opacity: 0.85, fontFamily: "monospace" }}>
+                        📎 {m.attachment.name}
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
             </div>
           );
         })}
       </div>
+      {pendingAttachment && (
+        <div style={{
+          marginBottom: 4, padding: "4px 8px",
+          border: "1.5px dashed var(--ink)", borderRadius: 4,
+          display: "flex", alignItems: "center", gap: 6,
+          fontSize: 11, background: "rgba(0,0,0,0.03)",
+        }}>
+          <span>{pendingAttachment.kind === "image" ? "🖼" : "📎"}</span>
+          <span style={{ flex: 1, fontFamily: "monospace", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{pendingAttachment.name}</span>
+          <button className="btn tiny" onClick={() => setPendingAttachment(null)}>×</button>
+        </div>
+      )}
+      {uploadError && (
+        <div style={{ marginBottom: 4, fontSize: 10.5, color: "var(--danger, #c33)" }}>⚠ {uploadError}</div>
+      )}
+      <input ref={fileInputRef} type="file" style={{ display: "none" }}
+        onChange={onFileSelected}
+        accept="image/*,application/pdf,application/zip,text/*,audio/*,video/*" />
       <div style={{ display: "flex", gap: 6 }}>
+        <button className="btn tiny" onClick={onPickFile} disabled={uploading} title="anhang (max 8 MB)">
+          {uploading ? "…" : "📎"}
+        </button>
         <input className="input" style={{ flex: 1 }}
                placeholder="nachricht an team…"
                value={draft}
@@ -1111,10 +1208,11 @@ function MiniChat({ project, myEmail, onSetTab }) {
                  if ((e.metaKey || e.ctrlKey) && e.key === "Enter") send();
                  else if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
                }} />
-        <button className="btn primary tiny" onClick={send} disabled={!draft.trim()}>senden</button>
+        <button className="btn primary tiny" onClick={send}
+                disabled={(!draft.trim() && !pendingAttachment) || uploading}>senden</button>
       </div>
       <div style={{ fontSize: 10, color: "var(--ink-faint)", marginTop: 4, textAlign: "right" }}>
-        ⌘/Strg+Enter · senden
+        Enter · senden · 📎 anhang
       </div>
     </div>
   );
