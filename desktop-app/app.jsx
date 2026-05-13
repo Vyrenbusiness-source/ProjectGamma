@@ -1817,33 +1817,165 @@ function ScreenRules({ project }) {
         <span className="squig">cloud code</span> respektiert diese regeln bei jeder änderung.
       </div>
 
-      <div className="three-col">
-        {grouped.map(g => (
-          <div className="box" key={g.name}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 6 }}>
-              <span className="eyebrow">// {g.name}</span>
-              <span className="chip">{g.items.filter(r => r.active).length}/{g.items.length}</span>
-            </div>
-            {g.items.length === 0
-              ? <div className="empty" style={{ padding: 14 }}><div>noch keine regel.</div></div>
-              : g.items.map(r => (
-                  <div className="rule-row" key={r.id}>
-                    <span className={"check" + (r.active ? " done" : "")} onClick={() => toggle(r.id)} />
-                    <div className={"text" + (r.active ? "" : " inactive")}>
-                      <Editable value={r.text} onChange={v => editRule(r.id, v.trim() || r.text)} />
-                    </div>
-                    <button className="x-btn" onClick={() => remove(r.id)}>×</button>
-                  </div>
-                ))
-            }
-            <button className="btn tiny" style={{ marginTop: 10 }}
-                    onClick={() => setAdding({ open: true, category: g.name, text: "" })}>
-              + hinzufügen
-            </button>
+      {/* 2-col layout: rules-cols main + right-sidebar mit donut + top + activity */}
+      <div className="pg-screen">
+        <div className="pg-main">
+          <div className="three-col">
+            {grouped.map(g => (
+              <div className="box" key={g.name}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 8 }}>
+                  <span className={"pg-cat pg-cat-" + g.name}>{g.name}</span>
+                  <span className="chip">{g.items.filter(r => r.active).length}/{g.items.length}</span>
+                </div>
+                {g.items.length === 0
+                  ? <div className="empty" style={{ padding: 14 }}><div>noch keine regel.</div></div>
+                  : g.items.map(r => (
+                      <div className="rule-row" key={r.id}>
+                        <span className={"check" + (r.active ? " done" : "")} onClick={() => toggle(r.id)} />
+                        <div className={"text" + (r.active ? "" : " inactive")}>
+                          <Editable value={r.text} onChange={v => editRule(r.id, v.trim() || r.text)} />
+                        </div>
+                        <button className="x-btn" onClick={() => remove(r.id)}>×</button>
+                      </div>
+                    ))
+                }
+                <button className="btn tiny" style={{ marginTop: 10 }}
+                        onClick={() => setAdding({ open: true, category: g.name, text: "" })}>
+                  + hinzufügen
+                </button>
+              </div>
+            ))}
           </div>
-        ))}
+        </div>
+        <aside className="pg-aside">
+          <RulesByCategoryPanel rules={rules} />
+          <RulesTopExecutedPanel rules={rules} activity={project.activity || []} />
+          <RulesActivityPanel activity={project.activity || []} />
+        </aside>
       </div>
     </>
+  );
+}
+
+// Donut-chart + legend für regeln nach kategorie (SVG, kein chart-lib).
+function RulesByCategoryPanel({ rules }) {
+  const COLORS = {
+    "code-stil":  "#5dd07a",
+    "architektur": "#ff8c66",
+    "workflow":    "#a78bfa",
+    "ci-cd":       "#22d3ee",
+    "sonstige":    "#6b7280",
+  };
+  const counts = {};
+  for (const r of rules) {
+    if (!r.active) continue;
+    const c = r.category || "sonstige";
+    counts[c] = (counts[c] || 0) + 1;
+  }
+  const total = Object.values(counts).reduce((a, b) => a + b, 0) || 1;
+  // SVG-donut
+  const cx = 50, cy = 50, r = 36, sw = 14;
+  let offset = -Math.PI / 2;
+  const segments = Object.entries(counts).map(([cat, count]) => {
+    const frac = count / total;
+    const angle = frac * 2 * Math.PI;
+    const x1 = cx + Math.cos(offset) * r;
+    const y1 = cy + Math.sin(offset) * r;
+    offset += angle;
+    const x2 = cx + Math.cos(offset) * r;
+    const y2 = cy + Math.sin(offset) * r;
+    const large = angle > Math.PI ? 1 : 0;
+    return {
+      cat, count,
+      path: `M ${cx} ${cy} L ${x1} ${y1} A ${r} ${r} 0 ${large} 1 ${x2} ${y2} Z`,
+      color: COLORS[cat] || COLORS.sonstige,
+    };
+  });
+  return (
+    <div className="pg-side-panel">
+      <div className="panel-title">Regeln nach Kategorie</div>
+      <div className="pg-donut-wrap">
+        <svg width="100" height="100" viewBox="0 0 100 100" style={{ flexShrink: 0 }}>
+          {segments.length === 0 ? (
+            <circle cx={cx} cy={cy} r={r} fill="none" stroke="var(--line)" strokeWidth={sw} />
+          ) : segments.map((s, i) => (
+            <path key={i} d={s.path} fill={s.color} />
+          ))}
+          <circle cx={cx} cy={cy} r={r - sw} fill="var(--paper)" />
+        </svg>
+        <div className="pg-donut-legend">
+          {Object.entries(counts).length === 0
+            ? <div style={{ fontSize: 11, color: "var(--ink-faint)" }}>keine aktiven regeln</div>
+            : Object.entries(counts).map(([cat, count]) => (
+              <div className="pg-donut-legend-row" key={cat}>
+                <span className="dot" style={{ background: COLORS[cat] || COLORS.sonstige }} />
+                <span className="lbl">{cat}</span>
+                <span className="num">{count}</span>
+              </div>
+            ))
+          }
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Top-5 regeln nach aktivity-erwähnungen (proxy für "ausführungen").
+function RulesTopExecutedPanel({ rules, activity }) {
+  // count rule.text-mentions in activity-events
+  const counts = new Map();
+  for (const a of activity) {
+    const txt = (a.text || "").toLowerCase();
+    for (const r of rules) {
+      if (!r.active) continue;
+      const key = r.text.toLowerCase().slice(0, 30);
+      if (key && txt.includes(key)) {
+        counts.set(r.id, (counts.get(r.id) || 0) + 1);
+      }
+    }
+  }
+  const top = [...rules]
+    .filter(r => r.active)
+    .map(r => ({ r, n: counts.get(r.id) || 0 }))
+    .sort((a, b) => b.n - a.n)
+    .slice(0, 5);
+  return (
+    <div className="pg-side-panel">
+      <div className="panel-title">Top Regeln nach Erwähnungen</div>
+      {top.length === 0 || top.every(t => t.n === 0)
+        ? <div style={{ fontSize: 11, color: "var(--ink-faint)" }}>noch keine cc-runs mit regel-bezug</div>
+        : top.map(({ r, n }) => (
+          <div className="pg-metric-row" key={r.id}>
+            <span className="ico">📈</span>
+            <span className="label" style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 12 }}>{r.text}</span>
+            <span className="value">{n}</span>
+          </div>
+        ))
+      }
+    </div>
+  );
+}
+
+// Letzte regel-bezogene activity (rule-type events).
+function RulesActivityPanel({ activity }) {
+  const ruleActs = (activity || []).filter(a => a.type === "rule" || /regel/i.test(a.text || "")).slice(0, 5);
+  return (
+    <div className="pg-side-panel">
+      <div className="panel-title">Letzte Aktivitäten</div>
+      {ruleActs.length === 0
+        ? <div style={{ fontSize: 11, color: "var(--ink-faint)" }}>noch keine regel-änderungen</div>
+        : ruleActs.map(a => (
+          <div className="pg-metric-row" key={a.id} style={{ alignItems: "flex-start" }}>
+            <span className="ico" style={{ color: "var(--ok)" }}>✓</span>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontSize: 12, color: "var(--ink)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+                   dangerouslySetInnerHTML={{ __html: a.text }} />
+              <div style={{ fontSize: 10.5, color: "var(--ink-faint)", marginTop: 2 }}>{relTime(a.ts)}</div>
+            </div>
+          </div>
+        ))
+      }
+    </div>
   );
 }
 

@@ -24,20 +24,20 @@
    Aktiviert via <html data-theme="dim">.
    ──────────────────────────────────────────────────────────── */
 html[data-theme="dim"] {
-  /* Neutrale dunkle palette nach user-mockup — kein warm-tint mehr.
-     Hierarchie: bg < paper < paper-2. Borders sind subtil aber sichtbar. */
-  --paper: #161616;        /* card-bg */
-  --paper-2: #1c1c1c;       /* etwas heller für titlebar/zebra */
-  --paper-soft: #1f1f1f;
-  --ink: #f0f0f0;          /* clean off-white text */
-  --ink-soft: #9a9a9a;     /* neutral gray für sekundär-text */
-  --ink-faint: #5e5e5e;    /* dimmer für hint-text */
-  --line: #2a2a2a;         /* subtle neutral border */
-  --bg: #0d0d0d;           /* deep near-black bg */
+  /* Palette nach user-feedback nochmal angepasst — bg deutlich dunkler,
+     cards subtil heller für hierarchie ohne harsh borders. */
+  --paper: #131316;        /* card-bg subtle elevation */
+  --paper-2: #17171a;       /* titlebar/sidebar bg */
+  --paper-soft: #1a1a1d;
+  --ink: #ededed;          /* clean off-white text */
+  --ink-soft: #888a90;     /* neutral gray für sekundär-text */
+  --ink-faint: #55575b;    /* dimmer für hint-text */
+  --line: #23252a;         /* subtle neutral border */
+  --bg: #08080a;           /* deep near-black main bg */
   --accent: #5dd07a;
   --danger: #e07070;
   --ok: #5dd07a;
-  --dot-color: rgba(255,255,255,0);  /* kein dot-pattern mehr in dim-mode */
+  --dot-color: rgba(255,255,255,0);
   --dot-color-2: rgba(255,255,255,0);
   color-scheme: dark;
 }
@@ -1509,10 +1509,17 @@ html[data-theme="dim"] .statcard-row .ico {
   content: "•";
   margin-right: 5px;
 }
-.pg-cat.qualitaet { color: var(--ok); }
-.pg-cat.sicherheit { color: #ff9966; }
-.pg-cat.workflow { color: #8aa9ff; }
-.pg-cat.cicd { color: #cc88ff; }
+/* Kategorie-farben matched zum mockup-design */
+.pg-cat-code-stil   { color: #5dd07a; border-color: rgba(93,208,122,0.4); background: rgba(93,208,122,0.08); }
+.pg-cat-architektur { color: #ff8c66; border-color: rgba(255,140,102,0.4); background: rgba(255,140,102,0.08); }
+.pg-cat-workflow    { color: #a78bfa; border-color: rgba(167,139,250,0.4); background: rgba(167,139,250,0.08); }
+.pg-cat-ci-cd       { color: #22d3ee; border-color: rgba(34,211,238,0.4); background: rgba(34,211,238,0.08); }
+.pg-cat-sonstige    { color: #6b7280; border-color: rgba(107,114,128,0.4); background: rgba(107,114,128,0.08); }
+/* Legacy classes (pg-cat.qualitaet usw) — fallback aufs alte sicher */
+.pg-cat.qualitaet { color: #5dd07a; }
+.pg-cat.sicherheit { color: #ff8c66; }
+.pg-cat.workflow { color: #a78bfa; }
+.pg-cat.cicd { color: #22d3ee; }
 
 /* Clean row for rules/tasks */
 .pg-row {
