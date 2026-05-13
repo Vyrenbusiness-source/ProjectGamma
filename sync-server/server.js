@@ -384,6 +384,7 @@ setInterval(() => {
 const _autoPumpCooldowns = new Map(); // taskId -> ts
 const _autoPumpMissingPathWarned = new Set(); // projectId -> 1× warnen statt 25s-spam
 let _ccApiLimitedUntil = 0; // ts — wenn claude API limit reached, pause auto-pump bis dahin
+let _dailyBudgetWarned = false; // 1× warnen statt jeden tick-spam
 
 // Post-cc-checks-lock: solange build-gate / runtime-test / self-review für
 // einen task laufen, soll autopump KEINEN neuen task auf demselben projekt
@@ -459,10 +460,43 @@ function stripHtml(s) {
 async function autoPumpTick() {
   if (!state.ccRunning) return;
   if (NOW() < _ccApiLimitedUntil) return; // claude API limit reached — warten
+
+  // SAFETY: daily-budget-cap. Wenn last-24h-cost > cap → autopump pausiert,
+  // user muss manuell entscheiden. Default $10/24h — kann via state.ccBudget
+  // .dailyCapUsd überschrieben werden. Aktivität-log einmal bei activation.
+  const cap = (state.ccBudget && state.ccBudget.dailyCapUsd) || 10.0;
+  const now24h = NOW() - 24 * 60 * 60 * 1000;
+  const last24hCost = ((state.ccBudget && state.ccBudget.jobs) || [])
+    .filter(j => j.ts >= now24h)
+    .reduce((s, j) => s + (j.costUsd || 0), 0);
+  if (last24hCost >= cap) {
+    if (!_dailyBudgetWarned) {
+      _dailyBudgetWarned = true;
+      console.warn(`[autopump] daily-budget-cap reached: $${last24hCost.toFixed(2)} >= $${cap.toFixed(2)} — autopump pausiert`);
+      for (const project of state.projects) {
+        applyMutation("ADD_ACTIVITY", { projectId: project.id, event: {
+          type: "warn",
+          text: `daily-budget-cap erreicht ($${last24hCost.toFixed(2)} / $${cap.toFixed(2)}) — autopump pausiert. Cap in settings hochsetzen oder bis morgen warten.`,
+        }});
+      }
+      broadcastState();
+    }
+    return;
+  }
+  _dailyBudgetWarned = false;
+
   // OPTIMIERUNG: über ALLE idle projekte parallel pumpen — vorher 'break'
   // nach dem ersten match → 1 task pro 10s-tick total. jetzt: pro projekt
   // 1 task parallel. für multi-projekt-users massiver durchsatz-win.
+  // SAFETY: globales concurrency-limit (max 3 parallel) gegen API-burst.
+  // bei 10 projekten würde sonst gleichzeitig 10× claude-API gehämmert →
+  // rate-limit-fast-track + heftiger token-spike auf einmal. 3 ist guter
+  // kompromiss zwischen durchsatz + budget-kontrolle.
+  const MAX_CONCURRENT_CC = 3;
+  if (ccJobs.size >= MAX_CONCURRENT_CC) return;
+  let canStart = MAX_CONCURRENT_CC - ccJobs.size;
   for (const project of state.projects) {
+    if (canStart <= 0) break;
     if (_isProjectBusy(project.id)) continue;
     if (!project.path || !fs.existsSync(project.path)) {
       if (!_autoPumpMissingPathWarned.has(project.id)) {
@@ -498,7 +532,8 @@ async function autoPumpTick() {
     triggerCc(project.id, candidate.id, null).catch(e => {
       console.log("[autopump] error:", e.message);
     });
-    // KEIN break — nächstes projekt direkt mit-pumpen.
+    canStart--;
+    // KEIN break — nächstes projekt direkt mit-pumpen (bis canStart=0).
   }
 }
 setInterval(autoPumpTick, AUTOPUMP_TICK_MS);

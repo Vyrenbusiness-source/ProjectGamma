@@ -976,7 +976,7 @@ function OnboardingBlock({ project, myEmail, onSetTab, onOpenMembers }) {
             done={hasMessages} />
         </div>
       </div>
-      <MiniChat project={project} myEmail={myEmail} />
+      <MiniChat project={project} myEmail={myEmail} onSetTab={onSetTab} />
     </div>
   );
 }
@@ -1035,13 +1035,19 @@ function StatChip({ label, value, accent, onClick }) {
   );
 }
 
-// Mini-Chat: kompakte preview der letzten 3 nachrichten + input.
+// Mini-Chat: scrollbare preview der letzten 50 nachrichten + input.
 // Draft wird beim projekt-wechsel zurückgesetzt — sonst landet text im falschen projekt.
-function MiniChat({ project, myEmail }) {
+function MiniChat({ project, myEmail, onSetTab }) {
   const [draft, setDraft] = useState("");
+  const listRef = useRef(null);
   useEffect(() => { setDraft(""); }, [project.id]);
   const messages = project.messages || [];
-  const last = messages.slice(-3);
+  // Vorher slice(-3) → user sah nur 3 alte nachrichten und dachte chat sei limitiert.
+  // Jetzt: letzte 50 (server cap = 500), scrollbar, mit auto-scroll zum bottom.
+  const last = messages.slice(-50);
+  useEffect(() => {
+    if (listRef.current) listRef.current.scrollTop = listRef.current.scrollHeight;
+  }, [messages.length]);
 
   const send = () => {
     const t = draft.trim();
@@ -1051,15 +1057,23 @@ function MiniChat({ project, myEmail }) {
   };
 
   return (
-    <div className="box" style={{ display: "flex", flexDirection: "column", minHeight: 200 }}>
-      <div className="eyebrow">// projekt-chat <span style={{ opacity: 0.5 }}>· {messages.length}</span></div>
-      <div style={{
+    <div className="box" style={{ display: "flex", flexDirection: "column", minHeight: 240 }}>
+      <div className="eyebrow" style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <span style={{ flex: 1 }}>// projekt-chat <span style={{ opacity: 0.5 }}>· {messages.length}</span></span>
+        {onSetTab && messages.length > 0 && (
+          <button className="btn tiny" onClick={() => onSetTab("team")}
+                  title="alle nachrichten · notizen · termine">
+            → team-tab
+          </button>
+        )}
+      </div>
+      <div ref={listRef} style={{
         flex: 1, marginTop: 8, marginBottom: 8,
-        minHeight: 80,
+        minHeight: 80, maxHeight: 280, overflowY: "auto",
         background: "rgba(0,0,0,0.02)",
         border: "1.5px dashed var(--line)", borderRadius: 6,
         padding: 8, display: "flex", flexDirection: "column", gap: 6,
-        justifyContent: last.length === 0 ? "center" : "flex-end",
+        justifyContent: last.length === 0 ? "center" : "flex-start",
       }}>
         {last.length === 0 ? (
           <div style={{ color: "var(--ink-faint)", fontSize: 12, fontStyle: "italic", textAlign: "center" }}>
