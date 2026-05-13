@@ -311,6 +311,34 @@ try {
   console.log("[store] loaded sessions:", sessions.size);
 } catch (e) {}
 
+// One-time security-cleanup: vor dem patch für /api/pair/desktop-init konnte
+// jeder über cloudflare-tunnel einen desktop-pair-token bekommen (isLocal-
+// check wurde umgangen). Existierende desktop-pair-sessions könnten also
+// fremde token sein → einmalig revoken. Marker liegt neben SESSIONS_FILE.
+// Owner reloadet einmal die desktop-app + bekommt frischen token via
+// localhost (jetzt strict-gated).
+const TUNNEL_SECURITY_MARKER = path.join(__dirname, ".tunnel-security-fixed-v1");
+if (!fs.existsSync(TUNNEL_SECURITY_MARKER)) {
+  let revoked = 0;
+  for (const [token, s] of sessions) {
+    if (s.deviceType === "desktop" && s.pairedWith === "self") {
+      sessions.delete(token);
+      revoked++;
+    }
+  }
+  if (revoked > 0) {
+    persistSessionsSync();
+    console.warn(`[security] tunnel-fix: revoked ${revoked} pre-patch desktop pair-session(s) — owner muss desktop einmal neu laden (localhost-pair).`);
+  }
+  try { fs.writeFileSync(TUNNEL_SECURITY_MARKER, String(NOW()), "utf8"); } catch (_) {}
+}
+
+function persistSessionsSync() {
+  const obj = {};
+  for (const [token, s] of sessions) obj[token] = s;
+  try { fs.writeFileSync(SESSIONS_FILE, JSON.stringify(obj, null, 2), "utf8"); } catch (_) {}
+}
+
 function persistSessions() {
   const obj = {};
   for (const [token, s] of sessions) obj[token] = s;
@@ -1116,6 +1144,10 @@ app.get("/health", (req, res) => {
     sessions: sessions.size,
     pairings: pairings.size,
     projects: state.projects.length,
+    // isLocal: false → der client erreicht den server über tunnel/FQDN, NICHT
+    // direkt über localhost/LAN. BootPairing darf dann KEIN auto-selfInit
+    // versuchen (würde 403 geben) → user muss team-beitreten wählen.
+    isLocal: isLocalRequest(req),
   });
 });
 
@@ -1257,15 +1289,40 @@ app.post("/api/pair/init", (req, res) => {
   });
 });
 
+// Helper: prüft ob ein Request WIRKLICH vom localhost kommt — nicht nur per
+// socket-IP, sondern auch per host-header. Sonst kann ein cloudflare-tunnel
+// (cloudflared läuft auf dem server und forwarded an 127.0.0.1) den localhost-
+// gate umgehen: socket-IP wäre 127.0.0.1, aber der originale request kam aus
+// dem internet. Verifiziert: über tunnel war /api/pair/desktop-init aufrufbar
+// und gab pair-tokens mit vollzugriff aus.
+function isLocalRequest(req) {
+  const ip = req.ip || req.connection?.remoteAddress || "";
+  const ipIsLocal =
+    ip === "127.0.0.1" || ip === "::1" || ip === "::ffff:127.0.0.1" ||
+    ip.startsWith("127.");
+  if (!ipIsLocal) return false;
+  // host-header muss localhost oder eine LAN-IP sein. Tunnel-hostnames
+  // (*.trycloudflare.com, *.ngrok.io, eigene FQDNs) → block.
+  const host = (req.hostname || "").toLowerCase();
+  return (
+    host === "localhost" ||
+    host === "127.0.0.1" ||
+    host === "::1" ||
+    host === "[::1]" ||
+    /^192\.168\./.test(host) ||
+    /^10\./.test(host) ||
+    /^172\.(1[6-9]|2[0-9]|3[01])\./.test(host)
+  );
+}
+
 // Desktop-Self-Init: nur über localhost erreichbar, erzeugt Desktop-Session
 // ohne Pairing-Code (Desktop ist Trust-Boundary). Idempotent: wenn schon eine
 // Desktop-Session mit gleichem Namen existiert, wird der bestehende Token zurückgegeben.
 app.post("/api/pair/desktop-init", (req, res) => {
-  const ip = req.ip || req.connection?.remoteAddress || "";
-  const isLocal =
-    ip === "127.0.0.1" || ip === "::1" || ip === "::ffff:127.0.0.1" ||
-    ip.startsWith("127.") || req.hostname === "localhost";
-  if (!isLocal) return res.status(403).json({ error: "nur lokal erreichbar" });
+  if (!isLocalRequest(req)) {
+    console.warn("[pair] desktop-init blocked: non-local request host=" + req.hostname + " ip=" + req.ip);
+    return res.status(403).json({ error: "nur lokal erreichbar — für team-collab nutze account-login (team beitreten)" });
+  }
 
   const deviceName = (req.body && req.body.deviceName) || "desktop";
 
