@@ -2298,7 +2298,7 @@ function ScreenCloud({ project, onCcRun, onCcStop, ccStatus, ccOutput, ccRunning
         headers: { authorization: "Bearer " + client.token, "content-type": "application/json" },
         body: JSON.stringify({ name: file.name, contentType: file.type || "application/octet-stream", base64: b64 }),
       });
-      const data = await r.json();
+      const data = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error(data.error || "fehler " + r.status);
       setAttachments(a => [...a, { name: data.name, url: data.url, kind: data.kind, size: data.size }]);
     } catch (e) {
