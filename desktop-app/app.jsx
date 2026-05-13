@@ -118,16 +118,23 @@ function Editable({ value, onChange, multiline = false, placeholder, className =
 // Wird gezeigt wenn keine Desktop-Session existiert (also beim allerersten Start
 // oder wenn Server unerreichbar). Versucht zuerst self-init mit Default-URL.
 function BootPairing({ onReady }) {
+  // ZWEI MODI:
+  // (a) "self" — default. Lokaler server, selfInit() = pair-token via /api/pair/desktop-init
+  //     (localhost-only-gated server-seitig). Klappt nur wenn du dein eigenes
+  //     start.bat gestartet hast.
+  // (b) "team" — wenn du auf einem TEAM-server eines anderen kollegen mitarbeitest.
+  //     Kein selfInit (würde 403 geben), sondern direkt zum AccountAuthModal
+  //     mit der team-URL. Du registrierst/loginst dich auf dem fremden server.
+  const [mode, setMode] = useState("self");
   const [serverUrl, setServerUrl] = useState(sync.serverUrl);
+  const [teamUrl, setTeamUrl] = useState("");
   const [status, setStatus] = useState("connecting");
   const [error, setError] = useState(null);
+  const [showAccountForTeam, setShowAccountForTeam] = useState(false);
 
-  const tryInit = useCallback(async () => {
+  const trySelfInit = useCallback(async () => {
     setStatus("connecting"); setError(null);
     try {
-      // Health-Check zuerst — sync.serverUrl wird erst NACH erfolg gesetzt,
-      // damit der client nicht mit einer kaputten URL hängenbleibt wenn der
-      // user eine falsche eingibt + nachträglich korrigiert.
       const r = await fetch(serverUrl + "/health").then(r => r.json()).catch(() => null);
       if (!r || !r.ok) throw new Error("server nicht erreichbar unter " + serverUrl);
       sync.serverUrl = serverUrl;
@@ -141,39 +148,114 @@ function BootPairing({ onReady }) {
     }
   }, [serverUrl, onReady]);
 
-  // Auto-Versuch beim Mount (nur). Bei manueller url-änderung klickt der user
-  // den "erneut versuchen"-button → onClick nutzt latest closure (kein stale).
+  const tryJoinTeam = useCallback(async () => {
+    setStatus("connecting"); setError(null);
+    try {
+      const url = teamUrl.trim().replace(/\/+$/, "");
+      if (!url.startsWith("http")) throw new Error("URL muss mit http(s):// beginnen");
+      const r = await fetch(url + "/health").then(r => r.json()).catch(() => null);
+      if (!r || !r.ok) throw new Error("server nicht erreichbar unter " + url);
+      // serverUrl IM CLIENT setzen, aber KEIN selfInit (würde 403 geben).
+      // Stattdessen account-modal aufrufen mit dieser url als kontext.
+      sync.serverUrl = url;
+      localStorage.setItem("projectgamma.sync.url", url);
+      setStatus("idle");
+      setShowAccountForTeam(true);
+    } catch (e) {
+      setStatus("error");
+      setError(e.message || String(e));
+    }
+  }, [teamUrl]);
+
+  // Auto-Versuch beim Mount NUR in mode=self. Bei team braucht der user erst die URL.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  useEffect(() => { tryInit(); }, []);
+  useEffect(() => { if (mode === "self") trySelfInit(); }, []);
+
+  // Wenn account-modal nach team-join geschlossen wird → onReady aufrufen wenn token jetzt da
+  const checkSessionReady = useCallback(() => {
+    setShowAccountForTeam(false);
+    if (sync.token) {
+      sync.connect();
+      setTimeout(() => onReady(), 250);
+    }
+  }, [onReady]);
 
   return (
     <div className="boot">
       <div className="boot-card">
         <div className="eyebrow">// projectgamma · desktop</div>
-        <h1 className="h1" style={{ marginTop: 6 }}>verbinde mit sync-server</h1>
-        <div style={{ color: "var(--ink-soft)", fontSize: 13, marginTop: 4 }}>
-          desktop authentifiziert sich automatisch beim lokalen server (vertrauter context).
+        <h1 className="h1" style={{ marginTop: 6 }}>willkommen</h1>
+
+        {/* Mode-toggle: eigener server vs team beitreten */}
+        <div style={{ display: "flex", gap: 6, marginTop: 14 }}>
+          <button className={"btn tiny" + (mode === "self" ? " primary" : "")}
+                  onClick={() => { setMode("self"); setError(null); setStatus("idle"); }}>
+            🏠 eigener server (lokal)
+          </button>
+          <button className={"btn tiny" + (mode === "team" ? " primary" : "")}
+                  onClick={() => { setMode("team"); setError(null); setStatus("idle"); }}>
+            👥 team beitreten (anderer server)
+          </button>
         </div>
 
         <hr className="div" style={{ margin: "18px 0" }} />
 
-        <label className="field">
-          <span className="eyebrow">server-url</span>
-          <input className="input big" value={serverUrl} onChange={e => setServerUrl(e.target.value)} />
-        </label>
+        {mode === "self" && (
+          <>
+            <div style={{ color: "var(--ink-soft)", fontSize: 13, marginBottom: 12 }}>
+              desktop authentifiziert sich automatisch beim lokalen server. nur lokal
+              erreichbar — für team-collab oben „team beitreten" wählen.
+            </div>
+            <label className="field">
+              <span className="eyebrow">server-url</span>
+              <input className="input big" value={serverUrl} onChange={e => setServerUrl(e.target.value)} />
+            </label>
+            <div className="boot-status">
+              {status === "connecting" && <span className="cc-dot live">verbinde…</span>}
+              {status === "ready"      && <span className="cc-dot live">erfolgreich verbunden</span>}
+              {status === "error"      && <span style={{ color: "#c33" }}>⚠ {error}</span>}
+            </div>
+            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 14 }}>
+              <button className="btn" onClick={trySelfInit} disabled={status === "connecting"}>
+                {status === "error" ? "erneut versuchen" : "verbinden"}
+              </button>
+            </div>
+          </>
+        )}
 
-        <div className="boot-status">
-          {status === "connecting" && <span className="cc-dot live">verbinde…</span>}
-          {status === "ready"      && <span className="cc-dot live">erfolgreich verbunden</span>}
-          {status === "error"      && <span style={{ color: "#c33" }}>⚠ {error}</span>}
-        </div>
-
-        <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 14 }}>
-          <button className="btn" onClick={tryInit} disabled={status === "connecting"}>
-            {status === "error" ? "erneut versuchen" : "verbinden"}
-          </button>
-        </div>
+        {mode === "team" && (
+          <>
+            <div style={{ color: "var(--ink-soft)", fontSize: 13, marginBottom: 12 }}>
+              du tritt einem team bei, das auf einem ANDEREN server läuft.<br />
+              dein kollege hat dir eine team-url geschickt (z.B. cloudflared tunnel
+              oder LAN-IP). du registrierst dich dort + er muss dich noch als
+              mitglied einladen.
+            </div>
+            <label className="field">
+              <span className="eyebrow">team-server-url</span>
+              <input className="input big" value={teamUrl}
+                     placeholder="https://abc.trycloudflare.com  oder  http://192.168.1.42:7892"
+                     onChange={e => setTeamUrl(e.target.value)}
+                     onKeyDown={e => { if (e.key === "Enter") tryJoinTeam(); }} />
+            </label>
+            <div className="boot-status">
+              {status === "connecting" && <span className="cc-dot live">prüfe server…</span>}
+              {status === "error"      && <span style={{ color: "#c33" }}>⚠ {error}</span>}
+            </div>
+            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 14 }}>
+              <button className="btn primary" onClick={tryJoinTeam}
+                      disabled={status === "connecting" || !teamUrl.trim()}>
+                weiter zum login →
+              </button>
+            </div>
+          </>
+        )}
       </div>
+
+      {/* AccountAuthModal nach erfolgreichem team-server-check */}
+      {showAccountForTeam && window.AccountAuthModal && (
+        <window.AccountAuthModal onClose={checkSessionReady} />
+      )}
     </div>
   );
 }

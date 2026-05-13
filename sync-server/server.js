@@ -199,6 +199,25 @@ let claudeCliInfo = { installed: false, version: null, path: null, error: null }
   console.warn("[claude] " + claudeCliInfo.error);
 })();
 
+// Zentrale claude-binary-resolution für alle spawn-call-sites.
+// Nutzt das beim boot detektierte resultat (claudeCliInfo.path) — deckt
+// sowohl npm-globale (.cmd) als auch Anthropic-standalone (.exe in
+// ~/.local/bin) installation ab. Fallback bleibt die alte windows-suche
+// für den fall, dass detection beim boot fehlschlug.
+function resolveClaudeBinary() {
+  if (claudeCliInfo.path && claudeCliInfo.path !== "auto-installed") return claudeCliInfo.path;
+  if (process.platform !== "win32") return "claude";
+  const candidates = [
+    path.join(process.env.APPDATA || "", "npm", "claude.cmd"),
+    path.join(process.env.USERPROFILE || "", ".local", "bin", "claude.exe"),
+    "claude.cmd",
+  ];
+  for (const c of candidates) {
+    if (c && (!path.isAbsolute(c) || fs.existsSync(c))) return c;
+  }
+  return "claude.cmd";
+}
+
 // UPnP-portmap: versucht beim boot das port-mapping LAN-port → WAN-port
 // automatisch über UPnP zu setzen. Klappt mit ~70% der heimrouter, fallback
 // = LAN-only oder ngrok.
@@ -2220,22 +2239,9 @@ function _startCcJob(project, taskId, prompt) {
     "   schon erledigt hast (kein leerer commit!).",
   ].filter(Boolean).join("\n");
 
-  // Versuche claude CLI zu starten. Auf Windows den vollen Pfad zur npm-globalen
-  // claude.cmd suchen, falls "claude" nicht im PATH ist.
-  function resolveClaudeBin() {
-    if (process.platform !== "win32") return "claude";
-    const tryPaths = [
-      path.join(process.env.APPDATA || "", "npm", "claude.cmd"),
-      path.join(process.env.APPDATA || "", "npm", "claude.ps1"),
-      "claude.cmd",
-      "claude",
-    ];
-    for (const p of tryPaths) {
-      if (p && fs.existsSync(p)) return p;
-    }
-    return "claude.cmd";
-  }
-  const claudeBin = resolveClaudeBin();
+  // Claude CLI binary über zentralen helper resolven (deckt npm-global UND
+  // Anthropic-standalone-installer in ~/.local/bin/claude.exe ab).
+  const claudeBin = resolveClaudeBinary();
   console.log("[cc] using claude bin:", claudeBin);
 
   // Prompt in temporärer Datei → claude mit -p "@file" oder via stdin pipe.
@@ -3100,11 +3106,7 @@ app.post("/api/cc/summarize", authMw, async (req, res) => {
 // Kein projekt-bezug, läuft als ein-shot read-only claude-call.
 function _spawnClaudeOneShot(prompt) {
   const cwd = process.cwd();
-  const claudeBin = (function () {
-    if (process.platform !== "win32") return "claude";
-    const p = path.join(process.env.APPDATA || "", "npm", "claude.cmd");
-    return fs.existsSync(p) ? p : "claude.cmd";
-  })();
+  const claudeBin = resolveClaudeBinary();
   const args = [
     "--print",
     "--permission-mode", "bypassPermissions",
@@ -3248,11 +3250,7 @@ function publicState(session) {
 // ─── Vorschläge + Bug-Hunt (claude-Analyse-Pässe) ──────────
 function _spawnClaudeReadOnly(project, prompt, opts) {
   const cwd = project.path && fs.existsSync(project.path) ? project.path : process.cwd();
-  const claudeBin = (function () {
-    if (process.platform !== "win32") return "claude";
-    const p = path.join(process.env.APPDATA || "", "npm", "claude.cmd");
-    return fs.existsSync(p) ? p : "claude.cmd";
-  })();
+  const claudeBin = resolveClaudeBinary();
   const mcpConfigPath = resolveMcpConfig({ baseDir: __dirname });
   // Token-spar: caller darf budget runtersetzen (z.B. decompose nur 0.20$).
   const budget = (opts && typeof opts.maxBudgetUsd === "number") ? String(opts.maxBudgetUsd) : "1.0";
@@ -3484,11 +3482,7 @@ async function runSelfReview(project, taskId, taskStatus, originalOutput) {
   if (!task) return { ok: true, issues: [], confidence: 0.5 };
 
   const cwd = project.path && fs.existsSync(project.path) ? project.path : process.cwd();
-  const claudeBin = (function () {
-    if (process.platform !== "win32") return "claude";
-    const p = path.join(process.env.APPDATA || "", "npm", "claude.cmd");
-    return fs.existsSync(p) ? p : "claude.cmd";
-  })();
+  const claudeBin = resolveClaudeBinary();
 
   const filesChanged = (taskStatus.filesChanged || []).slice(0, 10);
   const reviewPrompt = [

@@ -129,6 +129,10 @@
             </div>
             <button className="btn tiny" onClick={onClose}>×</button>
           </div>
+          {/* TEAM-URL teilen — wichtig für cross-network collab. Damit andere
+              kollegen sich auf DIESEN server registrieren können. */}
+          <TeamUrlPanel serverUrl={client.serverUrl} />
+
           <div style={{
             display: "flex", gap: 8, alignItems: "center",
             padding: 10, marginBottom: 12,
@@ -230,6 +234,122 @@
               </div>
             </div>
           )}
+        </div>
+      </div>
+    );
+  }
+
+  // TeamUrlPanel · zeigt die URLs unter denen DIESER server für team-mitglieder
+  // erreichbar ist. Lädt /api/network-info (öffentlich) → routes[]: lan + public-ip + tunnel.
+  // Copy-button für jede route. Auto-start cloudflared tunnel auf knopfdruck.
+  function TeamUrlPanel({ serverUrl }) {
+    const [info, setInfo] = useState(null);
+    const [tunnelBusy, setTunnelBusy] = useState(false);
+    const [copied, setCopied] = useState(null);
+
+    useEffect(() => {
+      let stop = false;
+      async function tick() {
+        try {
+          const r = await fetch(serverUrl + "/api/network-info");
+          if (!stop && r.ok) setInfo(await r.json());
+        } catch (_) {}
+      }
+      tick();
+      const t = setInterval(tick, 5000);
+      return () => { stop = true; clearInterval(t); };
+    }, [serverUrl]);
+
+    if (!info) return null;
+    const routes = info.routes || [];
+    const tunnel = info.tunnel || {};
+    const hasPublicTunnel = tunnel.status === "active" && tunnel.url;
+
+    const startTunnel = async () => {
+      setTunnelBusy(true);
+      try {
+        const client = window.useSync ? window.useSync() : null;
+        await fetch(serverUrl + "/api/tunnel/start", {
+          method: "POST",
+          headers: client && client.token ? { authorization: "Bearer " + client.token } : {},
+        });
+      } catch (_) {}
+      setTunnelBusy(false);
+    };
+    const stopTunnel = async () => {
+      setTunnelBusy(true);
+      try {
+        const client = window.useSync ? window.useSync() : null;
+        await fetch(serverUrl + "/api/tunnel/stop", {
+          method: "POST",
+          headers: client && client.token ? { authorization: "Bearer " + client.token } : {},
+        });
+      } catch (_) {}
+      setTunnelBusy(false);
+    };
+    const copy = async (url) => {
+      try { await navigator.clipboard.writeText(url); setCopied(url); setTimeout(() => setCopied(null), 1500); }
+      catch (_) {}
+    };
+
+    return (
+      <div style={{
+        padding: 10, marginBottom: 12,
+        border: "2px solid var(--ink)", borderRadius: 6,
+      }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+          <span style={{ fontSize: 18 }}>🔗</span>
+          <strong style={{ fontSize: 13 }}>team-URLs · für kollegen die sich hier registrieren wollen</strong>
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+          {routes.map((r, i) => (
+            <div key={i} style={{
+              display: "flex", alignItems: "center", gap: 8,
+              padding: "5px 8px", background: "rgba(0,0,0,0.04)", borderRadius: 4,
+              fontFamily: "JetBrains Mono, monospace", fontSize: 11.5,
+            }}>
+              <span style={{ minWidth: 100, color: "var(--ink-faint)" }}>
+                {r.kind === "public-ip" ? "🌐 internet" :
+                 r.kind === "lan" ? "🏠 LAN" :
+                 r.kind === "tunnel" ? "🚀 tunnel" : r.kind}
+              </span>
+              <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis" }}>{r.url}</span>
+              {r.needsPortForward && <span style={{ fontSize: 10, color: "#CC8800" }}>port-forward nötig</span>}
+              <button className="btn tiny" onClick={() => copy(r.url)}
+                      style={{ fontSize: 10 }}>
+                {copied === r.url ? "✓" : "kopieren"}
+              </button>
+            </div>
+          ))}
+          {hasPublicTunnel && (
+            <div style={{
+              display: "flex", alignItems: "center", gap: 8,
+              padding: "5px 8px", background: "rgba(0,200,0,0.08)",
+              border: "1.5px solid #2a8a3a", borderRadius: 4,
+              fontFamily: "JetBrains Mono, monospace", fontSize: 11.5,
+            }}>
+              <span style={{ minWidth: 100, color: "#2a8a3a" }}>🚀 tunnel aktiv</span>
+              <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis" }}>{tunnel.url}</span>
+              <button className="btn tiny" onClick={() => copy(tunnel.url)}
+                      style={{ fontSize: 10 }}>{copied === tunnel.url ? "✓" : "kopieren"}</button>
+              <button className="btn tiny" onClick={stopTunnel} disabled={tunnelBusy}>stop</button>
+            </div>
+          )}
+          {!hasPublicTunnel && (
+            <button className="btn tiny"
+                    onClick={startTunnel} disabled={tunnelBusy}
+                    style={{ marginTop: 4, alignSelf: "flex-start" }}>
+              {tunnelBusy ? "starte tunnel…" : "🚀 cloudflared-tunnel starten (öffentliche URL)"}
+            </button>
+          )}
+        </div>
+        <div style={{
+          marginTop: 8, fontSize: 10.5, color: "var(--ink-faint)",
+          fontFamily: "JetBrains Mono, monospace", lineHeight: 1.5,
+        }}>
+          {hasPublicTunnel
+            ? "schick deinem kollegen die tunnel-URL. er wählt im welcome-screen \"team beitreten\", trägt die URL ein, registriert sich. dann kannst du ihn unten einladen."
+            : "kollege im selben WLAN → LAN-URL reicht. von außen → tunnel starten."}
         </div>
       </div>
     );
