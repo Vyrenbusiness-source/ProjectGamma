@@ -19,16 +19,20 @@ function applyTheme(theme) {
   } catch (_) {}
 }
 // Initial apply NOCH BEVOR React mountet, damit kein flash.
+// Default: "dim" (soft-dark) — user-request: dark als standard.
 (function() {
   try {
-    const t = localStorage.getItem("pg-theme") || "light";
+    const t = localStorage.getItem("pg-theme") || "dim";
     if (t === "dim") document.documentElement.setAttribute("data-theme", "dim");
-  } catch (_) {}
+  } catch (_) {
+    // localStorage nicht verfügbar → trotzdem dim als default
+    document.documentElement.setAttribute("data-theme", "dim");
+  }
 })();
 function ThemeToggle() {
   const [theme, setTheme] = useState(() => {
-    try { return localStorage.getItem("pg-theme") || "light"; }
-    catch (_) { return "light"; }
+    try { return localStorage.getItem("pg-theme") || "dim"; }
+    catch (_) { return "dim"; }
   });
   const toggle = () => {
     const next = theme === "dim" ? "light" : "dim";
