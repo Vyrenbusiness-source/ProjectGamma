@@ -96,16 +96,15 @@ const SUGGESTED_RULES = [
   { category: "workflow",    text: "kein force-push auf main/master" },
 ];
 const TECH_OPTIONS = ["flutter", "dart", "react", "typescript", "python", "rust", "go", "andere"];
+// Nav-cleanup (2026-05-13): 8 top-tabs → 4 sidebar-nav-items.
+// Siehe docs/superpowers/specs/2026-05-13-desktop-nav-cleanup-design.md
 const TABS = [
-  { id: "overview", label: "übersicht" },
-  { id: "tasks",    label: "aufgaben"  },
-  { id: "rules",    label: "regeln"    },
-  { id: "ideas",    label: "ideen"     },
-  { id: "team",     label: "team"      },
-  { id: "cloud",    label: "cloud-code" },
-  { id: "preview",  label: "preview"   },
-  { id: "sync",     label: "sync"      },
+  { id: "tasks",   label: "aufgaben",    icon: "✓" },
+  { id: "ideas",   label: "ideen",       icon: "💡" },
+  { id: "rules",   label: "regeln",      icon: "§" },
+  { id: "cloud",   label: "cloud-agent", icon: "☁" },
 ];
+const OLD_TAB_IDS = new Set(["overview", "preview", "team", "sync"]);
 
 const NOW = () => Date.now();
 const uid = () => Math.random().toString(36).slice(2, 9);
@@ -697,7 +696,18 @@ function Confirm({ title, message, confirmLabel = "ok", cancelLabel = "abbrechen
 }
 
 // ─── Sidebar ──────────────────────────────────────────────────
-function Sidebar({ projects, activeId, onSelect, onNew, ccRunning }) {
+function Sidebar({ projects, activeId, onSelect, onNew, ccRunning,
+                   activeTab, onTab, onOpenSettings }) {
+  const activeProject = projects.find(p => p.id === activeId);
+  const navCounts = activeProject ? {
+    tasks: (activeProject.tasks || []).filter(t => !t.done).length,
+    rules: (activeProject.rules || []).filter(r => r.active).length,
+    ideas: (activeProject.ideas || []).filter(i => i.status === "unprocessed").length,
+  } : null;
+  const pqRaw = activeProject?.pendingQuestion;
+  const ccPending = typeof pqRaw === "string"
+    ? pqRaw.trim().length > 0
+    : !!(pqRaw && (pqRaw.text || pqRaw.question));
   // Clean sidebar: pro projekt nur stern + name. zahlen liegen jetzt in den
   // stat-chips der übersicht — hier würden sie nur ablenken.
   // Sortierung: favoriten zuerst, sonst alphabetisch.
@@ -747,6 +757,33 @@ function Sidebar({ projects, activeId, onSelect, onNew, ccRunning }) {
       })}
       <button className="new-btn" onClick={onNew}>+ Neues Projekt</button>
 
+      {activeProject && (
+        <div className="side-nav">
+          <div className="eyebrow" style={{ marginTop: 18 }}>Ansicht</div>
+          {TABS.map(t => {
+            const isActive = activeTab === t.id;
+            const isCcPending = t.id === "cloud" && ccPending && !isActive;
+            const count = navCounts?.[t.id] || 0;
+            return (
+              <button key={t.id}
+                      className={"nav-item" + (isActive ? " active" : "") + (isCcPending ? " cc-pending" : "")}
+                      onClick={() => onTab && onTab(t.id)}
+                      title={isCcPending ? "cloud-agent hat eine frage" : t.label}>
+                <span className="nav-icon">{isCcPending ? "❓" : t.icon}</span>
+                <span className="nav-label">{t.label}</span>
+                {count > 0 && <span className="nav-badge">{count}</span>}
+              </button>
+            );
+          })}
+          <button className="nav-item nav-settings"
+                  onClick={() => onOpenSettings && onOpenSettings()}
+                  title="einstellungen · team · sync">
+            <span className="nav-icon">⚙</span>
+            <span className="nav-label">einstellungen</span>
+          </button>
+        </div>
+      )}
+
       <div className="cc-ambient">
         <span className={"cc-dot" + (ccRunning ? " live" : "")}>
           cloud-code · {ccRunning ? "arbeitet" : "pause"}
@@ -766,38 +803,18 @@ function Sidebar({ projects, activeId, onSelect, onNew, ccRunning }) {
 }
 
 // ─── Main Head ────────────────────────────────────────────────
-function MainHead({ project, activeTab, onTab, onAction, onDelete }) {
-  const counts = {
-    tasks: (project.tasks || []).filter(t => !t.done).length,
-    rules: (project.rules || []).filter(r => r.active).length,
-    ideas: (project.ideas || []).filter(i => i.status === "unprocessed").length,
-  };
-  // Cloud-code hat eine offene Frage → tab visuell hervorheben (atmender ❓-dot)
-  // damit user sie nicht übersieht. pendingQuestion ist ein string (siehe
-  // SET_PENDING_QUESTION mutation). Frühere version checkte .text/.question →
-  // war immer false. Jetzt: string-check.
-  const pqRaw = project.pendingQuestion;
-  const ccPending = typeof pqRaw === "string"
-    ? pqRaw.trim().length > 0
-    : !!(pqRaw && (pqRaw.text || pqRaw.question));
-  // Einklapp-toggle: header schrumpft auf 1 zeile (titel + tabs + buttons).
-  // Persistent in localStorage damit es nicht bei jedem reload zurückspringt.
-  const [collapsed, setCollapsed] = useState(() => {
-    try { return localStorage.getItem("projectgamma.header.collapsed") === "1"; } catch (_) { return false; }
-  });
-  const toggleCollapsed = () => {
-    const next = !collapsed;
-    setCollapsed(next);
-    try { localStorage.setItem("projectgamma.header.collapsed", next ? "1" : "0"); } catch (_) {}
-  };
+function MainHead({ project, onAction, onDelete }) {
+  // Maximal-clean header (2026-05-13): nur eine zeile mit ★-toggle + name +
+  // ✎-edit + 1 primary-button + ⋯-overflow. Beschreibung/ziele/pfad/tech-select
+  // sind im ✎-button (öffnet ProjectSettingsModal) versteckt.
+  // Counts + ccPending wanderten in die Sidebar (nav-section).
   const patch = (p) => sync.mutate("PATCH_PROJECT", { projectId: project.id, patch: p });
   return (
-    <div className={"main-head" + (collapsed ? " collapsed" : "")}>
+    <div className="main-head clean">
       <div className="head-top">
         <div className="title-block">
-          <div className="eyebrow">// projekt</div>
-          <h1 className="h1">
-            <span style={{ marginRight: 6, cursor: "pointer" }}
+          <h1 className="h1 clean-h1">
+            <span className="star-toggle"
                   title={project.starred ? "stern entfernen" : "favorit setzen"}
                   onClick={() => sync.mutate("TOGGLE_STAR", { projectId: project.id })}>
               {project.starred ? "★" : "☆"}
@@ -805,102 +822,21 @@ function MainHead({ project, activeTab, onTab, onAction, onDelete }) {
             <Editable value={project.name}
                       onChange={v => patch({ name: v.trim() || project.name })}
                       placeholder="projektname" />
+            <button className="head-edit-hint"
+                    onClick={() => onAction("openProjectSettings")}
+                    title="projekt-details bearbeiten (beschreibung, ziele, pfad, tech)">
+              ✎
+            </button>
           </h1>
-          {!collapsed && (
-            <>
-              <div className="sub" style={{ display: "flex", gap: 8, alignItems: "center", maxWidth: "100%", overflow: "hidden" }}>
-                <select className="tech-select" value={project.tech || "andere"}
-                        onChange={e => patch({ tech: e.target.value })}>
-                  {TECH_OPTIONS.map(t => <option key={t} value={t}>{t}</option>)}
-                </select>
-                <span style={{ color: "var(--ink-faint)" }}>·</span>
-                <span style={{ color: "var(--ink-soft)", whiteSpace: "nowrap" }}>cloud-code aktiv</span>
-                <span style={{ color: "var(--ink-faint)" }}>·</span>
-                {/* Description: clamp auf 1 zeile + ellipsis. klick öffnet projekt-details modal
-                    (dort vollständig editierbar). Verhindert dass lange texte die buttons
-                    rechts aus dem header drücken. */}
-                <span onClick={() => onAction("openProjectSettings")}
-                      title={(project.description || "").length > 0
-                              ? "voll lesen + bearbeiten (projekt-details)"
-                              : "beschreibung hinzufügen (projekt-details)"}
-                      style={{
-                        flex: 1, minWidth: 0,
-                        overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
-                        cursor: "pointer", color: project.description ? "var(--ink-soft)" : "var(--ink-faint)",
-                        fontStyle: project.description ? "normal" : "italic",
-                      }}>
-                  {project.description || "+ kurzbeschreibung hinzufügen…"}
-                </span>
-              </div>
-              {/* Ziele-preview · dezent unter beschreibung. klick öffnet projekt-details. */}
-              {(() => {
-                const goals = project.goals || [];
-                if (goals.length === 0) return null;
-                const preview = goals.slice(0, 3).join("  ·  ");
-                const more = goals.length > 3 ? `  +${goals.length - 3}` : "";
-                return (
-                  <div className="sub goals-preview"
-                       style={{ marginTop: 4, fontSize: 11.5, color: "var(--ink-soft)", cursor: "pointer", display: "flex", alignItems: "center", gap: 6 }}
-                       onClick={() => onAction("openProjectSettings")}
-                       title="projekt-details bearbeiten">
-                    <span style={{ color: "var(--ink-faint)" }}>ziele:</span>
-                    <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{preview}{more}</span>
-                    <span style={{ color: "var(--ink-faint)" }}>✎</span>
-                  </div>
-                );
-              })()}
-              <div className="sub" style={{ marginTop: 4, fontFamily: "JetBrains Mono, monospace", fontSize: 11, color: "var(--ink-faint)" }}>
-                <Editable value={project.path || ""}
-                          onChange={v => patch({ path: v.trim() })}
-                          placeholder="+ lokalen pfad hinzufügen (für IDE-launch)" />
-              </div>
-            </>
-          )}
         </div>
         <div className="actions actions-bar" style={{ flexShrink: 0 }}>
-          {/* D2 · Klare hierarchie:
-              1× PRIMARY (handy verbinden — täglich, auffälligste action)
-              2× SECONDARY-ICON (mitglieder, account — situativ)
-              Rest in OVERFLOW-MENU (⋯) — settings, openIDE, export, sync, löschen, etc. */}
           <button className="btn tiny primary" onClick={() => onAction("pairMobile")} title="QR + 6-stelliger code für mobile-gerät">+ handy verbinden</button>
-          <button className="btn tiny icon-only" onClick={() => onAction("openMembers")} title="mitglieder einladen / verwalten">👥</button>
-          <button className="btn tiny icon-only" onClick={() => onAction("openAuth")} title="account · login / registrieren">🔐</button>
-          {/* Overflow-Menu — inkl. settings (war primary, ist eigentlich rare) */}
           {window.MoreMenu
             ? <window.MoreMenu onAction={onAction} onDelete={onDelete} hasPath={!!project.path} />
             : (
               <button className="btn tiny" onClick={() => onAction("openSettings")} title="weitere actions">⋯</button>
             )}
-          {/* Header-collapse-toggle bleibt sichtbar */}
-          <button className="btn tiny icon-only" onClick={toggleCollapsed}
-                  title={collapsed ? "header ausklappen" : "header einklappen (beschreibung+pfad verstecken)"}>
-            {collapsed ? "⌄" : "⌃"}
-          </button>
         </div>
-      </div>
-      <div className="tabs">
-        {TABS.map(t => {
-          const isCcPending = t.id === "cloud" && ccPending && activeTab !== "cloud";
-          return (
-            <button key={t.id}
-                    className={"tab" + (activeTab === t.id ? " active" : "") + (isCcPending ? " cc-pending" : "")}
-                    onClick={() => onTab(t.id)}
-                    title={isCcPending ? "cloud-code hat eine frage — bitte beantworten" : undefined}
-                    style={isCcPending ? {
-                      // Sanftes "atmen" + ❓-prefix damit der user es nicht übersieht.
-                      animation: "pg-cc-pulse 1.6s ease-in-out infinite",
-                      borderColor: "#cc8800",
-                      color: "#cc8800",
-                      fontWeight: 600,
-                    } : undefined}>
-              {isCcPending && <span style={{ marginRight: 4 }}>❓</span>}
-              {t.label}
-              {t.id === "tasks" && counts.tasks > 0 && <span className="count">{counts.tasks}</span>}
-              {t.id === "rules" && counts.rules > 0 && <span className="count">{counts.rules}</span>}
-              {t.id === "ideas" && counts.ideas > 0 && <span className="count">{counts.ideas}</span>}
-            </button>
-          );
-        })}
       </div>
     </div>
   );
@@ -3135,6 +3071,65 @@ function NewProjectModal({ onClose, onCreate }) {
   );
 }
 
+// ─── ProjectHubModal ──────────────────────────────────────────
+// Tabs: team / sync / general. Ersetzt die alten top-tabs team/sync.
+function ProjectHubModal({ project, client, initialTab, onClose,
+                          onOpenApiKeys, onOpenMembers,
+                          allSyncLog, lastFullSync, onSync, showToast }) {
+  const [tab, setTab] = useState(initialTab || "team");
+  const TeamPanel = window.TeamPanel;
+  // ESC schließt das modal — sonst fühlt sich der user gefangen.
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === "Escape") onClose(); };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [onClose]);
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal hub-modal" onClick={e => e.stopPropagation()}>
+        <div className="modal-head hub-head">
+          <button className="hub-back" onClick={onClose} title="zurück zur übersicht (ESC)">
+            ← zurück
+          </button>
+          <h2 className="h2 hub-title">einstellungen · {project.name}</h2>
+          <button className="modal-close" onClick={onClose} aria-label="schließen" title="schließen (ESC)">✕</button>
+        </div>
+        <div className="hub-tabs">
+          <button className={"hub-tab" + (tab === "team" ? " active" : "")}
+                  onClick={() => setTab("team")}>👥 team</button>
+          <button className={"hub-tab" + (tab === "sync" ? " active" : "")}
+                  onClick={() => setTab("sync")}>🔄 sync</button>
+          <button className={"hub-tab" + (tab === "general" ? " active" : "")}
+                  onClick={() => setTab("general")}>⚙ allgemein</button>
+        </div>
+        <div className="hub-body">
+          {tab === "team" && (
+            TeamPanel
+              ? <TeamPanel project={project} sync={client} myEmail={client.deviceName} />
+              : <div className="empty"><div>team-modul lädt…</div></div>
+          )}
+          {tab === "sync" && (
+            <ScreenSync project={project}
+                        allSyncLog={allSyncLog}
+                        lastFullSync={lastFullSync}
+                        onSync={onSync}
+                        showToast={showToast} />
+          )}
+          {tab === "general" && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+              <button className="btn" onClick={onOpenApiKeys}>🔑 API-keys & setup</button>
+              <button className="btn" onClick={onOpenMembers}>👥 mitglieder verwalten</button>
+              <div style={{ marginTop: 12, padding: 12, background: "var(--paper-soft, #f5f1e8)", borderRadius: 6, fontSize: 12, color: "var(--ink-soft)" }}>
+                projekt-details (name, pfad, ziele) bearbeiten: im header oben auf den projektnamen oder das ✎-icon klicken.
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ─── App ──────────────────────────────────────────────────────
 function App() {
   const client = useSync();
@@ -3146,6 +3141,7 @@ function App() {
   const [showMembers, setShowMembers] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [showProjSettings, setShowProjSettings] = useState(false);
+  const [hubTab, setHubTab] = useState(null); // null | "team" | "sync" | "general"
   const [confirmDelete, setConfirmDelete] = useState(null);
   const [toast, setToast] = useState(null);
 
@@ -3291,7 +3287,10 @@ function App() {
         <div className={"side-wrapper" + (sidebarOpen ? " open-mobile" : "")}>
           <Sidebar projects={projects}
                  activeId={client.activeProjectId}
-                 onSelect={(id) => { client.setActiveProject(id); client.setActiveTab("overview"); setSidebarOpen(false); }}
+                 onSelect={(id) => { client.setActiveProject(id); client.setActiveTab("tasks"); setSidebarOpen(false); }}
+                 activeTab={client.activeTab}
+                 onTab={(id) => client.setActiveTab(id)}
+                 onOpenSettings={() => setHubTab("team")}
                  onNew={() => { setShowNew(true); setSidebarOpen(false); }}
                  ccRunning={client.ccRunning} />
         </div>
@@ -3352,27 +3351,27 @@ function App() {
           </div>
           );
         })()}
-        {project && (
+        {project && (() => {
+          // Redirect alte tab-ids (overview/preview/team/sync) auf tasks —
+          // persistierter state aus alter UI-version würde sonst leere
+          // main-body anzeigen.
+          const rawTab = client.activeTab;
+          const effectiveTab = OLD_TAB_IDS.has(rawTab) || !TABS.find(t => t.id === rawTab)
+            ? "tasks"
+            : rawTab;
+          if (effectiveTab !== rawTab) {
+            queueMicrotask(() => client.setActiveTab(effectiveTab));
+          }
+          return (
           <div className="main">
             <MainHead project={project}
-                      activeTab={client.activeTab}
-                      onTab={(id) => client.setActiveTab(id)}
                       onAction={headerAction}
                       onDelete={() => setConfirmDelete(project.id)} />
-            <div className="main-body" data-tab={client.activeTab}>
-              {client.activeTab === "overview" && (
-                <ScreenOverview project={project}
-                                onOpenMembers={() => setShowMembers(true)}
-                                onOpenPair={() => setShowPair(true)}
-                                onSetTab={(id) => client.setActiveTab(id)} />
-              )}
-              {client.activeTab === "tasks" && <ScreenTasks project={project} onCcRun={(taskId) => onCcRun({ taskId })} />}
-              {client.activeTab === "rules" && <ScreenRules project={project} />}
-              {client.activeTab === "ideas" && <ScreenIdeas project={project} />}
-              {client.activeTab === "team" && window.TeamPanel && (
-                <window.TeamPanel project={project} sync={client} myEmail={client.deviceName} />
-              )}
-              {client.activeTab === "cloud" && (
+            <div className="main-body" data-tab={effectiveTab}>
+              {effectiveTab === "tasks" && <ScreenTasks project={project} onCcRun={(taskId) => onCcRun({ taskId })} />}
+              {effectiveTab === "rules" && <ScreenRules project={project} />}
+              {effectiveTab === "ideas" && <ScreenIdeas project={project} />}
+              {effectiveTab === "cloud" && (
                 <ScreenCloud project={project}
                              onCcRun={onCcRun}
                              onCcStop={onCcStop}
@@ -3381,17 +3380,10 @@ function App() {
                              ccRunning={client.ccRunning}
                              setCcRunning={(v) => client.mutate("TOGGLE_CC", { running: v })} />
               )}
-              {client.activeTab === "preview" && <ScreenPreview project={project} />}
-              {client.activeTab === "sync" && (
-                <ScreenSync project={project}
-                            allSyncLog={client.syncLog}
-                            lastFullSync={client.lastFullSync}
-                            onSync={() => headerAction("syncNow")}
-                            showToast={showToast} />
-              )}
             </div>
           </div>
-        )}
+          );
+        })()}
       </div>
 
       {showNew && <NewProjectModal onClose={() => setShowNew(false)} onCreate={createProject} />}
@@ -3399,6 +3391,16 @@ function App() {
       {showAuth && window.AccountAuthModal && <window.AccountAuthModal onClose={() => setShowAuth(false)} />}
       {showMembers && project && window.MembersModal && <window.MembersModal projectId={project.id} onClose={() => setShowMembers(false)} />}
       {showSettings && window.SettingsModal && <window.SettingsModal onClose={() => setShowSettings(false)} />}
+      {hubTab && project && (
+        <ProjectHubModal project={project} client={client} initialTab={hubTab}
+                         onClose={() => setHubTab(null)}
+                         onOpenApiKeys={() => { setHubTab(null); setShowSettings(true); }}
+                         onOpenMembers={() => { setHubTab(null); setShowMembers(true); }}
+                         allSyncLog={client.syncLog}
+                         lastFullSync={client.lastFullSync}
+                         onSync={() => headerAction("syncNow")}
+                         showToast={showToast} />
+      )}
       {showProjSettings && project && window.ProjectSettingsModal && (
         <window.ProjectSettingsModal project={project} onClose={() => setShowProjSettings(false)} />
       )}

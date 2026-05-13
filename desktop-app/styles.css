@@ -1627,3 +1627,192 @@ html[data-theme="dim"] .statcard-row .ico {
 }
 .pg-donut-legend-row .lbl { flex: 1; color: var(--ink-soft); }
 .pg-donut-legend-row .num { color: var(--ink); font-weight: 600; }
+
+/* ──────────────────────────────────────────────────────────────
+   Nav-Cleanup (2026-05-13): 8 top-tabs → 4 sidebar-nav-items.
+   - .side-nav lebt unter projects-liste in .side
+   - .nav-item ähnlich .proj-item, aber mit icon+label+badge
+   - .hub-modal: tab-modal für team/sync/general
+   ────────────────────────────────────────────────────────────── */
+.side-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 6px;
+}
+.side-nav .eyebrow {
+  padding: 0 8px 8px;
+}
+.nav-item {
+  display: flex; align-items: center; gap: 10px;
+  padding: 9px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+  border: 1px solid transparent;
+  background: transparent;
+  font-size: 13px;
+  font-family: inherit;
+  color: var(--ink-soft);
+  text-align: left;
+  transition: background 0.12s, border-color 0.12s, color 0.12s;
+}
+.nav-item:hover {
+  background: rgba(0,0,0,0.04);
+  color: var(--ink);
+}
+.nav-item.active {
+  background: var(--paper);
+  border-color: var(--line);
+  color: var(--ink);
+  font-weight: 500;
+}
+html[data-theme="dim"] .nav-item:hover { background: rgba(255,255,255,0.05); }
+.nav-item .nav-icon {
+  width: 18px;
+  text-align: center;
+  flex-shrink: 0;
+  font-size: 14px;
+}
+.nav-item .nav-label { flex: 1; }
+.nav-item .nav-badge {
+  font-size: 11px;
+  padding: 1px 7px;
+  border-radius: 10px;
+  background: var(--line);
+  color: var(--ink-soft);
+  font-family: "JetBrains Mono", monospace;
+  font-weight: 500;
+}
+.nav-item.active .nav-badge { background: var(--ink-faint); color: var(--paper); }
+.nav-item.cc-pending {
+  color: #cc8800;
+  border-color: #cc8800;
+  animation: pg-cc-pulse 1.6s ease-in-out infinite;
+}
+.nav-settings {
+  margin-top: 10px;
+  border-top: 1px dashed var(--line);
+  padding-top: 12px !important;
+  color: var(--ink-faint) !important;
+}
+.nav-settings:hover { color: var(--ink) !important; }
+
+/* Hub-Modal (settings: team / sync / general) */
+.modal.hub-modal {
+  width: 720px;
+  max-width: 96vw;
+  max-height: 86vh;
+  padding: 20px 24px;
+}
+.modal.hub-modal .modal-head { margin-bottom: 4px; }
+.modal.hub-modal .modal-head h2 { font-size: 18px; }
+.modal.hub-modal .modal-close {
+  background: transparent;
+  border: 0;
+  font-size: 18px;
+  color: var(--ink-faint);
+  cursor: pointer;
+  padding: 4px 8px;
+}
+.modal.hub-modal .modal-close:hover { color: var(--ink); }
+.hub-tabs {
+  display: flex;
+  gap: 0;
+  border-bottom: 1px solid var(--line);
+  margin: 4px 0 14px;
+}
+.hub-tab {
+  padding: 8px 14px;
+  background: transparent;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  font-size: 13px;
+  font-family: inherit;
+  color: var(--ink-faint);
+  cursor: pointer;
+  margin-bottom: -1px;
+}
+.hub-tab:hover { color: var(--ink-soft); }
+.hub-tab.active {
+  color: var(--ink);
+  border-bottom-color: var(--ink);
+  font-weight: 500;
+}
+.hub-body {
+  overflow-y: auto;
+  max-height: calc(86vh - 130px);
+  padding-right: 4px;
+}
+
+/* ──────────────────────────────────────────────────────────────
+   Maximal-clean header (2026-05-13): nur 1 zeile, ★ + name + ✎ +
+   primary-action. Beschreibung/ziele/pfad/tech ziehen in ProjectSettings.
+   ────────────────────────────────────────────────────────────── */
+.main-head.clean {
+  padding: 14px 24px 12px;
+  gap: 0;
+  border-bottom: 1px solid var(--line);
+}
+.main-head.clean .head-top {
+  align-items: center;
+}
+.main-head.clean .clean-h1 {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 24px;
+  margin: 0;
+  line-height: 1;
+}
+.main-head.clean .clean-h1 .star-toggle {
+  cursor: pointer;
+  color: var(--ink-soft);
+  font-size: 22px;
+}
+.main-head.clean .clean-h1 .star-toggle:hover { color: var(--ok); }
+.main-head.clean .clean-h1 .head-edit-hint {
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  color: var(--ink-faint);
+  font-size: 13px;
+  padding: 4px 6px;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+.main-head.clean:hover .clean-h1 .head-edit-hint,
+.main-head.clean .clean-h1:focus-within .head-edit-hint {
+  opacity: 1;
+}
+.main-head.clean .clean-h1 .head-edit-hint:hover { color: var(--ink); }
+
+/* Hub-modal: back-button + sauberer title-row */
+.modal.hub-modal .hub-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  border-bottom: 1px dashed var(--line);
+  padding-bottom: 12px;
+}
+.hub-back {
+  background: transparent;
+  border: 1px solid var(--line);
+  padding: 6px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+  font-family: inherit;
+  color: var(--ink-soft);
+}
+.hub-back:hover {
+  background: var(--paper-soft, rgba(0,0,0,0.04));
+  color: var(--ink);
+  border-color: var(--ink-soft);
+}
+.hub-title {
+  flex: 1;
+  margin: 0;
+  font-size: 17px;
+  font-family: "Caveat", cursive;
+  color: var(--ink);
+}
