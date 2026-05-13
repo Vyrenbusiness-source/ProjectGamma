@@ -1709,9 +1709,11 @@ app.post("/api/mutate", authMw, (req, res) => {
   if (!access.ok) return res.status(access.status || 403).json({ error: access.reason });
   try {
     applyMutation(type, payload, { session: req.session });
-    // ADD_PROJECT: anlegenden user automatisch als owner zum projekt hinzufügen
+    // ADD_PROJECT: anlegenden user automatisch als owner zum projekt hinzufügen.
+    // Analog WS-handler: payload.project ist dieselbe object-ref wie in s.projects
+    // gepusht (MUT.ADD_PROJECT setzt id inline). Robuster als length-1-zugriff.
     if (type === "ADD_PROJECT" && req.session && req.session.userId && memberships) {
-      const created = state.projects[state.projects.length - 1];
+      const created = payload && payload.project;
       if (created && created.id) {
         try {
           memberships.addMember({
@@ -4010,9 +4012,13 @@ wss.on("connection", (ws, req) => {
           return;
         }
         applyMutation(msg.mutation.type, msg.mutation.payload, { session: liveSess });
-        // ADD_PROJECT via WS: anlegenden user als owner setzen
+        // ADD_PROJECT via WS: anlegenden user als owner setzen.
+        // Bugfix: state.projects[length-1] war fragil — bei parallelen ADD_PROJECT
+        // (oder künftigem async-refactor) könnte ein anderes projekt erwischt
+        // werden. MUT.ADD_PROJECT pusht dieselbe object-ref aus payload.project
+        // und setzt id inline → direkter payload-zugriff ist eindeutig.
         if (msg.mutation.type === "ADD_PROJECT" && liveSess.userId && memberships) {
-          const created = state.projects[state.projects.length - 1];
+          const created = msg.mutation.payload && msg.mutation.payload.project;
           if (created && created.id) {
             try {
               memberships.addMember({
