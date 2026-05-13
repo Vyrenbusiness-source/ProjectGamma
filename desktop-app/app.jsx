@@ -2563,29 +2563,63 @@ function App() {
                  onNew={() => { setShowNew(true); setSidebarOpen(false); }}
                  ccRunning={client.ccRunning} />
         </div>
-        {!project && (
-          /* Welcome-state: keine projekte oder noch keins ausgewählt. Buttons
-             (handy/mitglieder/login/settings) sind hier nicht relevant — sie kommen
-             erst wenn ein projekt aktiv ist. Stattdessen ein freundlicher CTA. */
+        {!project && (() => {
+          // Welcome-state differenziert nach kontext:
+          // - Account-eingeloggter user mit zero projekten → wartet auf invite
+          //   (collab-fall: kollege auf team-server, owner muss einladen).
+          // - Sonst → erstes-projekt-anlegen CTA (eigener server).
+          const myEmail = (client.deviceName && /@/.test(client.deviceName)) ? client.deviceName : null;
+          const isInviteeWaiting = myEmail && projects.length === 0;
+          return (
           <div className="main" style={{ display: "flex", alignItems: "center", justifyContent: "center", padding: 40 }}>
             <div style={{ maxWidth: 480, textAlign: "center" }}>
               <div className="eyebrow" style={{ marginBottom: 8 }}>// willkommen</div>
               <h1 className="h1" style={{ marginBottom: 12 }}>★ ProjectGamma</h1>
-              <p style={{ color: "var(--ink-soft)", lineHeight: 1.5, marginBottom: 24 }}>
-                Projekt-Manager mit Cloud-Code-Integration. Lege dein erstes Projekt an —
-                Aufgaben, Ideen + Regeln auf desktop und handy synchron.
-              </p>
-              <button className="btn primary" onClick={() => setShowNew(true)}
-                      style={{ fontSize: 14, padding: "10px 20px" }}>
-                + erstes projekt anlegen
-              </button>
-              <div style={{ marginTop: 24, display: "flex", gap: 10, justifyContent: "center", flexWrap: "wrap" }}>
-                <button className="btn tiny" onClick={() => setShowAuth(true)}>🔐 login / registrieren</button>
-                <button className="btn tiny" onClick={() => setShowSettings(true)}>⚙ settings (API-keys)</button>
-              </div>
+              {isInviteeWaiting ? (
+                <>
+                  <p style={{ color: "var(--ink-soft)", lineHeight: 1.5, marginBottom: 14 }}>
+                    eingeloggt als <strong>{myEmail}</strong>.
+                    <br />du bist auf einem team-server — der owner muss dich noch zu projekten einladen.
+                  </p>
+                  <div style={{
+                    background: "var(--paper-soft, #f5f1e8)",
+                    border: "1.5px solid var(--ink-faint, #ccc)",
+                    borderRadius: 8, padding: 14, marginBottom: 16,
+                    fontSize: 13, lineHeight: 1.6, textAlign: "left",
+                  }}>
+                    <strong>so geht's:</strong>
+                    <ol style={{ margin: "8px 0 0 18px", padding: 0 }}>
+                      <li>schick dem owner deine email: <code style={{ background: "#0001", padding: "2px 6px", borderRadius: 4 }}>{myEmail}</code></li>
+                      <li>der owner klickt „👥 mitglieder verwalten" → „+ mitglied einladen"</li>
+                      <li>sobald du eingeladen bist, erscheint sein projekt hier automatisch</li>
+                    </ol>
+                  </div>
+                  <button className="btn tiny"
+                          onClick={() => { navigator.clipboard?.writeText(myEmail); }}
+                          title="email in zwischenablage kopieren">
+                    📋 email kopieren
+                  </button>
+                </>
+              ) : (
+                <>
+                  <p style={{ color: "var(--ink-soft)", lineHeight: 1.5, marginBottom: 24 }}>
+                    Projekt-Manager mit Cloud-Code-Integration. Lege dein erstes Projekt an —
+                    Aufgaben, Ideen + Regeln auf desktop und handy synchron.
+                  </p>
+                  <button className="btn primary" onClick={() => setShowNew(true)}
+                          style={{ fontSize: 14, padding: "10px 20px" }}>
+                    + erstes projekt anlegen
+                  </button>
+                  <div style={{ marginTop: 24, display: "flex", gap: 10, justifyContent: "center", flexWrap: "wrap" }}>
+                    <button className="btn tiny" onClick={() => setShowAuth(true)}>🔐 login / registrieren</button>
+                    <button className="btn tiny" onClick={() => setShowSettings(true)}>⚙ settings (API-keys)</button>
+                  </div>
+                </>
+              )}
             </div>
           </div>
-        )}
+          );
+        })()}
         {project && (
           <div className="main">
             <MainHead project={project}
