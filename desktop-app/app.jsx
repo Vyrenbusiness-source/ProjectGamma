@@ -1600,8 +1600,21 @@ function ScreenTasks({ project, onCcRun }) {
     { id: "done",        label: "erledigt" },
   ];
 
+  // Task die gerade von cc bearbeitet wird → temporär in „in arbeit" gruppe
+  // anzeigen, egal welche group das task-record hat. Server liefert dafür
+  // project.currentCcTaskId aus dem in-memory ccJobs-state.
+  const ccTaskId = project.currentCcTaskId || null;
   const filtered = (group) => {
-    let ts = tasks.filter(t => t.group === group);
+    let ts = tasks.filter(t => {
+      if (group === "in_progress") {
+        // „in arbeit" zeigt: alle die explizit in dieser gruppe sind + die
+        // aktuell von cc bearbeitete task (egal woher).
+        return t.group === "in_progress" || t.id === ccTaskId;
+      }
+      // andere gruppen: zeige den eigenen group-eintrag, ABER nicht die task
+      // die gerade cc-bearbeitet wird (die wandert hoch in „in arbeit").
+      return t.group === group && t.id !== ccTaskId;
+    });
     if (filter === "open") ts = ts.filter(t => !t.done);
     if (filter === "done") ts = ts.filter(t => t.done);
     // Search-filter (title + meta)
@@ -1709,8 +1722,13 @@ function ScreenTasks({ project, onCcRun }) {
               ? <div className="empty"><div>nichts hier.</div></div>
               : list.map(t => {
                 const prio = typeof t.priority === "number" ? t.priority : 3;
+                const isCcOnThis = t.id === ccTaskId;
+                const ccElapsed = isCcOnThis && project.currentCcStartedAt
+                  ? Math.max(0, Math.round((Date.now() - project.currentCcStartedAt) / 1000)) : 0;
                 return (
-                  <div className="task" key={t.id} data-prio={prio}>
+                  <div className={"task" + (isCcOnThis ? " cc-busy" : "")}
+                       key={t.id} data-prio={prio}
+                       style={isCcOnThis ? { borderLeft: "3px solid #6ab1ff" } : undefined}>
                     <div className="check-wrap">
                       <span className={"check" + (t.done ? " done" : "")} onClick={() => toggle(t.id)} />
                     </div>
@@ -1719,6 +1737,15 @@ function ScreenTasks({ project, onCcRun }) {
                         <span className={"prio-badge prio-" + prio} title={"priorität " + prio + "/5"}>
                           {"●".repeat(prio) + "○".repeat(5 - prio)}
                         </span>
+                        {isCcOnThis && (
+                          <span style={{
+                            marginLeft: 6, padding: "1px 6px", borderRadius: 4,
+                            background: "rgba(106,177,255,0.15)", color: "#6ab1ff",
+                            fontSize: 10, fontWeight: 600, letterSpacing: 0.3,
+                          }} title="claude-code bearbeitet diese aufgabe gerade">
+                            🔄 cc · {ccElapsed}s
+                          </span>
+                        )}
                         <Editable value={t.title} onChange={v => editTask(t.id, { title: v.trim() || t.title })} />
                       </div>
                       {((t.subtasks || []).length > 0 || subDraft.taskId === t.id) && (

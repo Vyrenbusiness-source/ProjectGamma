@@ -4407,6 +4407,10 @@ function publicState(session) {
       pathValid: projectPathValid(p),
       // Live-preview-runtime-status (in-memory, nicht persistiert)
       previewState: previewStatus(p.id),
+      // cc-runtime: welche task gerade von cc bearbeitet wird (in-memory).
+      // UI zeigt diese task als „🔄 cc bearbeitet" + group-override „in arbeit".
+      currentCcTaskId: ccJobs.get(p.id)?.taskId || null,
+      currentCcStartedAt: ccJobs.get(p.id)?.startedAt || null,
     })),
     // Transient: auto-pump-pause-flag. Wenn _ccApiLimitedUntil in der zukunft
     // liegt, war kurz vorher ein API-limit. UI zeigt warnung + resume-button.
