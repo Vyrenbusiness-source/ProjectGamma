@@ -30,9 +30,16 @@ const MCP_TIERS = {
   minimal: new Set(["filesystem", "sequential-thinking", "memory"]),
   // standard fügt context7 (lib-docs) hinzu — viele tasks brauchen das
   standard: new Set(["filesystem", "sequential-thinking", "memory", "context7"]),
-  // full = alles aus mcp.json
+  // full = alles aus mcp.json, modulo MCP_BLOCK
   full: null,
 };
+
+// Hard-Blocklist: server die NIE aktiviert werden, egal welcher tier.
+// fetch wurde gestrichen weil das modell darüber localhost:7892/api/state
+// abfragen kann (sync-server-introspection statt task-fokus). für externe
+// HTTP-fetches reicht Bash mit curl — auf das wird per FOKUS-GUARDRAIL und
+// pretooluse-hook geprüft.
+const MCP_BLOCK = new Set(["fetch"]);
 
 /**
  * Lädt mcp.json, filtert tote server (env-vars fehlen) und schreibt eine
@@ -56,6 +63,7 @@ function resolveMcpConfig({ baseDir, env = process.env, tmpDir, tier = "full" })
   const out = {};
   for (const [name, def] of Object.entries(servers)) {
     if (!def || typeof def !== "object") continue;
+    if (MCP_BLOCK.has(name)) continue; // hard-block, tier-unabhängig
     if (allow && !allow.has(name)) continue; // tier-filter
     const envIn = def.env || {};
     let skip = false;

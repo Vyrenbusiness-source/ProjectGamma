@@ -2730,8 +2730,12 @@ function _startCcJob(project, taskId, prompt) {
     "⚠️ FOKUS-GUARDRAIL (das ist die wichtigste regel hier):",
     "- mach NUR den AUFGABE-text oben. NICHTS sonst.",
     "- KEIN ungebetenes `git status`, `git diff`, `git log`, `npm test`,",
-    "  `flutter analyze`, `curl http://localhost:...`, `Get-Process`, `tail logs`",
-    "  außer wenn die aufgabe das EXPLIZIT verlangt.",
+    "  `flutter analyze`, `Get-Process`, `tail logs` außer wenn die aufgabe",
+    "  das EXPLIZIT verlangt.",
+    "- KEINE HTTP-requests gegen `localhost`/`127.0.0.1`/`::1` (auch nicht",
+    "  via `curl`, `wget`, `Invoke-RestMethod`/`iwr`, `Invoke-WebRequest`,",
+    "  `fetch`, `http.get`, `requests.get` etc.) — der sync-server ist NICHT",
+    "  dein context-store, lies files direkt mit Read/Glob/Grep.",
     "- KEIN aufräumen, KEIN refactor neben dem task, KEIN test-runner.",
     "- bei TRIVIAL-task (1 datei, < 50 LOC, klare anweisung):",
     "  → direkt schreiben + TASK_STATUS done=true. KEINE selbst-verifikation.",
@@ -2744,8 +2748,10 @@ function _startCcJob(project, taskId, prompt) {
     "  `git checkout -- <file>`, `git stash` — der SERVER commitet selber nach",
     "  deinem done=true. du darfst NIEMALS selber commiten oder history",
     "  manipulieren — auch nicht wenn es 'aufräumend' wirkt.",
-    "- chrome-devtools-mcp / puppeteer / fetch URLs auf localhost:* —",
-    "  außer wenn die aufgabe EXPLIZIT ein page-test verlangt.",
+    "- chrome-devtools-mcp / puppeteer / mcp-fetch / shell-fetcher (curl,",
+    "  wget, Invoke-RestMethod, iwr, Invoke-WebRequest) auf localhost:*,",
+    "  127.0.0.1:*, [::1]:* — außer wenn die aufgabe EXPLIZIT ein page-test",
+    "  verlangt. synonym-tricks zählen als verstoß.",
     "- `tail`/`Get-Content` auf logs außerhalb des project-paths.",
     "- modifikation von dateien die NICHT in der AUFGABE genannt sind.",
     "- starten/stoppen von dev-servern, prozessen, ports.",
@@ -2903,7 +2909,10 @@ function _startCcJob(project, taskId, prompt) {
   const selectedModel = selectModelForTask({
     task,
     retryAttempt: retryContext?.attempt || 0,
-    prompt: fullPrompt,
+    // user-prompt (nicht fullPrompt). fullPrompt enthält ~2500 zeichen
+    // guardrail-text und würde jeden manual-/api/cc/run auf opus eskalieren,
+    // auch für trivial-writes wie "erstelle RUN3.md mit fertig".
+    prompt,
   });
   // MCP-Konfig dynamisch auflösen: tier-basierte allowlist (kleine tasks
   // brauchen nicht puppeteer+github+code-runner+fetch — spart 6-8 server
@@ -2915,8 +2924,14 @@ function _startCcJob(project, taskId, prompt) {
   // file-operations beschränkt. selbst-verifikation läuft server-seitig.
   const _descShort = (task?.description || "").trim();
   const _titleLower = (task?.title || "").toLowerCase();
-  const isTrivialWriteTask = _descShort.length < 300 &&
-    /^\s*(erstelle|schreibe|lege an|create|write|f[uü]ge|add)\b/i.test(_descShort + " " + _titleLower);
+  // bei freiem /api/cc/run (kein task) auf prompt-text zurückfallen — sonst
+  // bleibt trivial-detection bei manual-runs immer leer und fetcht-MCP/full-
+  // tool-set wird unnötig aktiv.
+  const _trivialBlob = task ? (_descShort + " " + _titleLower)
+                            : (typeof prompt === "string" ? prompt.trim() : "");
+  const isTrivialWriteTask = _trivialBlob.length > 0 &&
+    _trivialBlob.length < 300 &&
+    /^\s*(erstelle|schreibe|lege an|create|write|f[uü]ge|add)\b/i.test(_trivialBlob);
 
   const mcpTier = isTrivialWriteTask ? "minimal" :
                   (selectedModel === "claude-opus-4-7" ? "full" : "standard");
@@ -2938,12 +2953,11 @@ function _startCcJob(project, taskId, prompt) {
     "--max-budget-usd", String(state.ccBudget?.perTaskUsd ?? 2.0),
   ];
   if (isTrivialWriteTask) {
-    // Trivial-write: explizit Bash + WebFetch + WebSearch verbieten via
-    // --disallowedTools. cc kann file-operations nutzen (Read/Edit/Write/
-    // Glob/Grep) aber NICHT git commit, npm test, curl loops fahren.
-    args.push("--disallowedTools",
-      "Bash,WebFetch,WebSearch,NotebookEdit,Task");
-    console.log("[cc] trivial-write-mode: kein Bash/WebFetch/WebSearch/Task — nur file-ops");
+    // Trivial-write: NUR WebFetch/WebSearch sperren (Bash + Task brauchen wir
+    // sehr wohl, sonst hängt cc in analyse statt write). chrome-devtools/
+    // puppeteer-spam ist sowieso schon weg dank --strict-mcp-config.
+    args.push("--disallowedTools", "WebFetch,WebSearch");
+    console.log("[cc] trivial-write-mode: WebFetch/WebSearch blocked, rest ok");
   }
   // --continue: resume die LETZTE conversation im cwd, statt jedes mal
   // ne frische zu starten. effekt: API-prompt-cache (5min TTL) hits beim
