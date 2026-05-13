@@ -425,17 +425,23 @@ function selectModelForTask({ task, retryAttempt, prompt }) {
     if (prompt && prompt.length > 600) return "claude-opus-4-7";
     return "claude-sonnet-4-6";
   }
-  // Hohe priority (5+) → opus.
-  if ((task.priority || 3) >= 5) return "claude-opus-4-7";
-  // Lange titel = vermutlich epic. >120 chars heuristik.
-  if ((task.title || "").length > 120) return "claude-opus-4-7";
-  // Keywords erkennen.
-  const haystack = (task.title || "") + " " + (task.meta || "");
-  if (BIG_KEYWORDS.test(haystack)) return "claude-opus-4-7";
-  // Decomposed parent task (hat subtasks → planning): opus für die zerlegung
-  // selbst wäre teuer; tatsächlich rufen wir decompose separat. Hier: wenn
-  // dieser task SCHON subtasks hat, ist es ein parent → wir bearbeiten nur
-  // einen subtask, nicht den parent → sonnet ok.
+  // Trivial-task-detection: kurze description + write-verb am anfang →
+  // IMMER sonnet, egal wie hoch die priority. opus für „erstelle X.md mit ok"
+  // ist $0.87-verbrennung mit free-form-exploration.
+  const desc = (task.description || "").trim();
+  const titleLower = (task.title || "").toLowerCase();
+  const isTrivialWrite = desc.length < 300 &&
+    /^\s*(erstelle|schreibe|lege an|create|write|f[uü]ge|add)\b/i.test(desc + " " + titleLower);
+  if (isTrivialWrite) return "claude-sonnet-4-6";
+  // Hohe priority (5+) → opus — ABER nur wenn die task auch wirklich
+  // komplex ist (long title oder big-keywords). priority allein ist nicht
+  // genug — user setzt das auch für „dringend, aber simpel" tasks.
+  const haystack = (task.title || "") + " " + (task.meta || "") + " " + desc;
+  const isBigByKeyword = BIG_KEYWORDS.test(haystack);
+  const isBigByTitle = (task.title || "").length > 120;
+  if ((task.priority || 3) >= 5 && (isBigByKeyword || isBigByTitle)) return "claude-opus-4-7";
+  if (isBigByTitle) return "claude-opus-4-7";
+  if (isBigByKeyword) return "claude-opus-4-7";
   return "claude-sonnet-4-6";
 }
 
@@ -1025,6 +1031,25 @@ const MUT = {
   },
   TOGGLE_CC(s, { running }) {
     s.ccRunning = !!running;
+  },
+
+  // budget-caps direkt am ccBudget-state setzen. wert null oder 0 = unbegrenzt
+  // (der check oben in budget-guard nimmt 'value || 2.0' default — daher 0
+  // wirkt wie unbegrenzt via null-coalescing kette).
+  SET_CC_BUDGET_CAPS(s, { hourlyCapUsd, dailyCapUsd, perTaskUsd }) {
+    if (!s.ccBudget) s.ccBudget = { totalTokensIn: 0, totalTokensOut: 0, totalCostUsd: 0, jobs: [] };
+    if (hourlyCapUsd !== undefined) {
+      const v = Number(hourlyCapUsd);
+      s.ccBudget.hourlyCapUsd = Number.isFinite(v) && v > 0 ? v : 999999;
+    }
+    if (dailyCapUsd !== undefined) {
+      const v = Number(dailyCapUsd);
+      s.ccBudget.dailyCapUsd = Number.isFinite(v) && v > 0 ? v : 999999;
+    }
+    if (perTaskUsd !== undefined) {
+      const v = Number(perTaskUsd);
+      s.ccBudget.perTaskUsd = Number.isFinite(v) && v > 0 ? v : 999;
+    }
   },
 
   // ─── Vorschläge ─────────────────────────────────────────
@@ -2701,6 +2726,30 @@ function _startCcJob(project, taskId, prompt) {
     task ? task.title : (prompt || "Was wäre als nächstes sinnvoll? Gib einen kurzen Plan in 3-5 Punkten."),
     task?.description ? "BESCHREIBUNG:\n" + task.description.slice(0, 1500) : "",
     task && prompt ? "\nZUSATZ: " + prompt : "",
+    "",
+    "⚠️ FOKUS-GUARDRAIL (das ist die wichtigste regel hier):",
+    "- mach NUR den AUFGABE-text oben. NICHTS sonst.",
+    "- KEIN ungebetenes `git status`, `git diff`, `git log`, `npm test`,",
+    "  `flutter analyze`, `curl http://localhost:...`, `Get-Process`, `tail logs`",
+    "  außer wenn die aufgabe das EXPLIZIT verlangt.",
+    "- KEIN aufräumen, KEIN refactor neben dem task, KEIN test-runner.",
+    "- bei TRIVIAL-task (1 datei, < 50 LOC, klare anweisung):",
+    "  → direkt schreiben + TASK_STATUS done=true. KEINE selbst-verifikation.",
+    "  (build-gate läuft server-seitig nach deinem done=true.)",
+    "- wenn 60s vergangen sind ohne dass die file geschrieben ist:",
+    "  STOP, schreibe sie jetzt, dann TASK_STATUS — du bist abgedriftet.",
+    "",
+    "🚫 HARTE VERBOTE (sofort done=false + summary 'verboten: ...'):",
+    "- `git commit`, `git push`, `git tag`, `git rebase`, `git reset --hard`,",
+    "  `git checkout -- <file>`, `git stash` — der SERVER commitet selber nach",
+    "  deinem done=true. du darfst NIEMALS selber commiten oder history",
+    "  manipulieren — auch nicht wenn es 'aufräumend' wirkt.",
+    "- chrome-devtools-mcp / puppeteer / fetch URLs auf localhost:* —",
+    "  außer wenn die aufgabe EXPLIZIT ein page-test verlangt.",
+    "- `tail`/`Get-Content` auf logs außerhalb des project-paths.",
+    "- modifikation von dateien die NICHT in der AUFGABE genannt sind.",
+    "- starten/stoppen von dev-servern, prozessen, ports.",
+    "- änderungen die nicht im task-text stehen — auch nicht 'als bonus'.",
     retryContext ? "\n⚠️ DIES IST EIN RETRY (versuch " + retryContext.attempt + "/" + MAX_CC_RETRIES + "). VORHERIGER VERSUCH FEHLGESCHLAGEN:\n" +
       "Gate: " + retryContext.kind + " (exit " + (retryContext.exitCode ?? "?") + ")\n" +
       "Fehlerausgabe (letzte zeilen):\n```\n" + retryContext.output.split(/\r?\n/).slice(-30).join("\n") + "\n```\n" +
@@ -2860,7 +2909,17 @@ function _startCcJob(project, taskId, prompt) {
   // brauchen nicht puppeteer+github+code-runner+fetch — spart 6-8 server
   // × ~1s startup + ~7000 schema-tokens pro spawn). standard für sonnet-4.6,
   // full für opus-4.7.
-  const mcpTier = selectedModel === "claude-opus-4-7" ? "full" : "standard";
+  // Trivial-write-detection: kurze write-task → restricted tool-set
+  // (KEIN Bash/PowerShell). cc kann sich dann nicht in seitenarbeit
+  // (git, curl, Get-Process, start-server) verlieren — es BLEIBT auf
+  // file-operations beschränkt. selbst-verifikation läuft server-seitig.
+  const _descShort = (task?.description || "").trim();
+  const _titleLower = (task?.title || "").toLowerCase();
+  const isTrivialWriteTask = _descShort.length < 300 &&
+    /^\s*(erstelle|schreibe|lege an|create|write|f[uü]ge|add)\b/i.test(_descShort + " " + _titleLower);
+
+  const mcpTier = isTrivialWriteTask ? "minimal" :
+                  (selectedModel === "claude-opus-4-7" ? "full" : "standard");
   const mcpConfigPath = resolveMcpConfig({ baseDir: __dirname, tier: mcpTier });
   const args = [
     "--print",
@@ -2868,12 +2927,24 @@ function _startCcJob(project, taskId, prompt) {
     "--verbose",
     "--permission-mode", "bypassPermissions",
     "--dangerously-skip-permissions",
-    "--tools", "default",
+    // --strict-mcp-config: ignoriere user-level MCP-config (~/.claude/plugins/),
+    // verwende NUR unser --mcp-config. verhindert dass chrome-devtools-mcp,
+    // puppeteer-plugin etc cc auto-injizieren und mit fremdtools in seiten-
+    // arbeit verfallen.
+    "--strict-mcp-config",
     "--model", selectedModel,
     "--add-dir", cwd,
     // Hard-Budget pro Task (Sicherung gegen Runaway)
     "--max-budget-usd", String(state.ccBudget?.perTaskUsd ?? 2.0),
   ];
+  if (isTrivialWriteTask) {
+    // Trivial-write: explizit Bash + WebFetch + WebSearch verbieten via
+    // --disallowedTools. cc kann file-operations nutzen (Read/Edit/Write/
+    // Glob/Grep) aber NICHT git commit, npm test, curl loops fahren.
+    args.push("--disallowedTools",
+      "Bash,WebFetch,WebSearch,NotebookEdit,Task");
+    console.log("[cc] trivial-write-mode: kein Bash/WebFetch/WebSearch/Task — nur file-ops");
+  }
   // --continue: resume die LETZTE conversation im cwd, statt jedes mal
   // ne frische zu starten. effekt: API-prompt-cache (5min TTL) hits beim
   // 2.,3.,4. task derselben projekt-cwd → massive token-ersparnis bei
