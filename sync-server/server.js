@@ -4130,6 +4130,9 @@ async function runAutoPlanFromGoals(project) {
 
 async function runBugHunt(project) {
   const projectId = project.id;
+  // Mark scan-start, damit der auto-hunt-watchdog nicht parallel doppelt
+  // einen scan startet während dieser noch läuft.
+  applyMutation("PATCH_PROJECT", { projectId, patch: { lastBugHuntAt: NOW(), bugHuntRunning: true } });
   applyMutation("ADD_ACTIVITY", { projectId, event: { type: "info", text: "bug-hunt gestartet…" }});
   broadcastState();
 
@@ -4207,12 +4210,38 @@ async function runBugHunt(project) {
     if (opened) {
       applyMutation("ADD_ACTIVITY", { projectId, event: {
         type: "info",
-        text: `auto-fix: ${opened} bug-tasks angelegt`,
+        text: `auto-fix: ${opened} bug-tasks angelegt — cloud-code arbeitet sie automatisch ab`,
       }});
     }
   }
+  // Run komplett, hunt-flag zurücksetzen damit auto-scan den nächsten cycle macht.
+  applyMutation("PATCH_PROJECT", { projectId, patch: { bugHuntRunning: false } });
   broadcastState();
 }
+
+// Auto-Bug-Hunt-Watchdog: scannt projekte mit bugAutoFix=on periodisch,
+// damit der user nicht jedes mal manuell '🐞 hunt' klicken muss.
+// Intervall 30min, skipped wenn bugHuntRunning oder cc gerade busy ist
+// auf diesem projekt.
+const BUG_AUTOSCAN_INTERVAL_MS = 30 * 60 * 1000; // 30min zwischen scans
+setInterval(() => {
+  if (!state.ccRunning) return; // cc paused → nicht autoscanen
+  if (NOW() < _ccApiLimitedUntil) return; // api-limit aktiv
+  const now = NOW();
+  for (const project of state.projects) {
+    if (!project.bugAutoFix) continue;
+    if (project.bugHuntRunning) continue; // bereits am scannen
+    if (_isProjectBusy(project.id)) continue; // cc arbeitet gerade
+    if (!project.path || !fs.existsSync(project.path)) continue;
+    const last = project.lastBugHuntAt || 0;
+    if (now - last < BUG_AUTOSCAN_INTERVAL_MS) continue;
+    console.log("[auto-bughunt] starte für", project.name, "(letzter scan:", last ? new Date(last).toLocaleString() : "nie", ")");
+    runBugHunt(project).catch(e => {
+      console.log("[auto-bughunt] error:", e.message);
+      applyMutation("PATCH_PROJECT", { projectId: project.id, patch: { bugHuntRunning: false } });
+    });
+  }
+}, 5 * 60 * 1000); // alle 5min checken, gescant wird aber nur alle 30min
 
 // ─── Self-Review ────────────────────────────────────────────
 // Zweiter claude-Pass: lässt den eigenen Output kritisch prüfen. Liefert

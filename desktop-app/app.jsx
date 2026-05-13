@@ -950,7 +950,8 @@ function SuggestionsAndBugs({ project }) {
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
             <span className="eyebrow">// bugs {pendingBugs.length > 0 && <span className="chip" style={{ marginLeft: 6, color: "#c33", borderColor: "#c33" }}>{pendingBugs.length}</span>}</span>
             <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
-              <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 11, color: "var(--ink-soft)", cursor: "pointer" }}>
+              <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 11, color: "var(--ink-soft)", cursor: "pointer" }}
+                     title="alle 30min auto-scan + neue bugs werden automatisch zu cc-tasks">
                 <input type="checkbox" checked={!!project.bugAutoFix} onChange={toggleAutoFix} />
                 auto-fix
               </label>
@@ -1417,7 +1418,8 @@ function BugsBlock({ project }) {
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
         <span className="eyebrow">// bugs {pending.length > 0 && <span className="chip" style={{ marginLeft: 6, color: "#c33", borderColor: "#c33" }}>{pending.length}</span>}</span>
         <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
-          <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 11, color: "var(--ink-soft)", cursor: "pointer" }}>
+          <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 11, color: "var(--ink-soft)", cursor: "pointer" }}
+                 title="alle 30min auto-scan + neue bugs werden automatisch zu cc-tasks">
             <input type="checkbox" checked={!!project.bugAutoFix} onChange={toggleAuto} />
             auto-fix
           </label>
