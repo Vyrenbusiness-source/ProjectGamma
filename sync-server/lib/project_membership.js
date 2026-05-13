@@ -28,10 +28,18 @@ function assertValidRole(role) {
   }
 }
 
-function createProjectMembershipStore({ db }) {
+function createProjectMembershipStore({ db, projectExists }) {
   if (!db || typeof db.exec !== "function") {
     throw new Error("createProjectMembershipStore: 'db' (DatabaseSync) erforderlich");
   }
+  // projectExists(projectId) -> boolean: optionaler dep vom server-wiring.
+  // projects leben im kv_store/state (kein sqlite-FK auf project_id möglich),
+  // daher kann ein gelöschtes projekt nicht via SQLITE_CONSTRAINT erkannt werden.
+  // Wenn die dep injected ist, prüft claimPendingForEmail VOR addMember → orphan
+  // cleanup + log. Sonst greift nur die FK-detection (defense-in-depth für
+  // user_id-FK-violations).
+  const checkProject =
+    typeof projectExists === "function" ? projectExists : null;
 
   db.exec("PRAGMA foreign_keys = ON;");
   db.exec(
@@ -113,8 +121,18 @@ function createProjectMembershipStore({ db }) {
     try {
       upsert.run(projectId, userId, role, addedAt, addedBy || null);
     } catch (err) {
-      if (/FOREIGN KEY|foreign key/i.test(String(err && err.message))) {
-        throw new Error("addMember: unknown user " + userId);
+      const isFk =
+        (err && err.code === "SQLITE_CONSTRAINT_FOREIGNKEY") ||
+        /FOREIGN KEY|foreign key/i.test(String(err && err.message));
+      if (isFk) {
+        // .code + 'FOREIGN KEY' in message bewahren, damit claimPendingForEmail
+        // den orphan-cleanup-pfad triggern kann.
+        const wrapped = new Error(
+          "addMember: FOREIGN KEY violation — unknown user " + userId
+        );
+        wrapped.code = (err && err.code) || "SQLITE_CONSTRAINT_FOREIGNKEY";
+        wrapped.cause = err;
+        throw wrapped;
       }
       throw err;
     }
@@ -189,6 +207,23 @@ function createProjectMembershipStore({ db }) {
     const rows = select_pending_by_email.all(normalized);
     const claimed = [];
     for (const row of rows) {
+      // Pre-check: projekt weg → orphan invite cleanup + log. Verhindert
+      // phantom-memberships (project_members hat keinen FK auf projects).
+      if (checkProject) {
+        let exists = true;
+        try { exists = !!checkProject(row.projectId); }
+        catch (peErr) {
+          console.warn("[project_membership] projectExists check failed, treating as exists:",
+            { projectId: row.projectId, error: peErr.message });
+        }
+        if (!exists) {
+          console.warn("[project_membership] orphaned pending invite — projekt weg, lösche invite:",
+            { email: normalized, projectId: row.projectId, role: row.role });
+          try { delete_pending.run(normalized, String(row.projectId)); }
+          catch (delErr) { console.warn("[project_membership] cleanup-delete failed:", delErr.message); }
+          continue;
+        }
+      }
       try {
         const m = addMember({
           projectId: row.projectId, userId, role: row.role, addedBy: row.addedBy,
@@ -198,7 +233,22 @@ function createProjectMembershipStore({ db }) {
         // als pending stehen.
         delete_pending.run(normalized, String(row.projectId));
       } catch (e) {
-        // FK-fehler etc. — skip, pending bleibt für späteren retry
+        // FK-violation → projekt wurde gelöscht. orphan-invite aufräumen
+        // (sonst bleibt er ewig pending). Andere errors: loggen + pending
+        // lassen für späteren retry.
+        const isFkOrphan = e && (
+          e.code === "SQLITE_CONSTRAINT_FOREIGNKEY" ||
+          /FOREIGN KEY/i.test(e.message || "")
+        );
+        if (isFkOrphan) {
+          console.warn("[project_membership] orphaned pending invite — projekt weg, lösche invite:",
+            { email: normalized, projectId: row.projectId, role: row.role });
+          try { delete_pending.run(normalized, String(row.projectId)); }
+          catch (delErr) { console.warn("[project_membership] cleanup-delete failed:", delErr.message); }
+        } else {
+          console.warn("[project_membership] claim-pending failed (pending bleibt):",
+            { email: normalized, projectId: row.projectId, error: e.message });
+        }
         continue;
       }
     }
