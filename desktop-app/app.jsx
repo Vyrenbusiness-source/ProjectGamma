@@ -1725,6 +1725,10 @@ function ScreenTasks({ project, onCcRun }) {
                 const isCcOnThis = t.id === ccTaskId;
                 const ccElapsed = isCcOnThis && project.currentCcStartedAt
                   ? Math.max(0, Math.round((Date.now() - project.currentCcStartedAt) / 1000)) : 0;
+                // Letzten cc-job für diese task aus budget.jobs finden (zeit + kosten)
+                const ccJob = (sync.state?.ccBudget?.jobs || []).find(j => j.taskId === t.id);
+                const ccDur = ccJob ? Math.round((ccJob.durationMs || 0) / 1000) : null;
+                const ccCost = ccJob ? +(ccJob.costUsd || 0).toFixed(3) : null;
                 return (
                   <div className={"task" + (isCcOnThis ? " cc-busy" : "")}
                        key={t.id} data-prio={prio}
@@ -1744,6 +1748,15 @@ function ScreenTasks({ project, onCcRun }) {
                             fontSize: 10, fontWeight: 600, letterSpacing: 0.3,
                           }} title="claude-code bearbeitet diese aufgabe gerade">
                             🔄 cc · {ccElapsed}s
+                          </span>
+                        )}
+                        {!isCcOnThis && t.done && ccDur !== null && (
+                          <span style={{
+                            marginLeft: 6, padding: "1px 5px", borderRadius: 4,
+                            background: "rgba(120,120,130,0.12)", color: "var(--ink-faint)",
+                            fontSize: 10, fontFamily: "monospace",
+                          }} title={"cc dauer · kosten · model"}>
+                            cc {ccDur}s · ${ccCost}
                           </span>
                         )}
                         <Editable value={t.title} onChange={v => editTask(t.id, { title: v.trim() || t.title })} />
