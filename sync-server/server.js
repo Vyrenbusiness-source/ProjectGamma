@@ -3837,7 +3837,15 @@ function broadcastForProject(msg, projectId) {
 // Pro-client gefilterter STATE-broadcast. Pair-clients bekommen full state,
 // user-clients nur projekte, in denen sie member sind. Wird statt
 // `broadcast({type:"STATE",state:publicState()})` aufgerufen.
-function broadcastState() {
+// Fix A · broadcastState 50ms-debounce + coalesce:
+// Bei cc-runs werden ~50 broadcastState() pro stream-job ausgelöst.
+// Mit debounce wird daraus EIN broadcast pro 50ms-fenster → 10-20× weniger
+// WS-traffic + react/flutter-renders. Final-events sind sync (immediate)
+// damit der user kein lag bei task-completion fühlt.
+let _broadcastTimer = null;
+let _broadcastQueued = false;
+function _doBroadcastState() {
+  _broadcastQueued = false;
   for (const client of wss.clients) {
     if (client.readyState !== 1) continue;
     try {
@@ -3846,6 +3854,20 @@ function broadcastState() {
       }));
     } catch (_) {}
   }
+}
+function broadcastState(opts) {
+  // opts.immediate: für final-events (task-complete, login etc.) ohne lag
+  if (opts && opts.immediate) {
+    if (_broadcastTimer) { clearTimeout(_broadcastTimer); _broadcastTimer = null; }
+    _doBroadcastState();
+    return;
+  }
+  _broadcastQueued = true;
+  if (_broadcastTimer) return; // schon im flight
+  _broadcastTimer = setTimeout(() => {
+    _broadcastTimer = null;
+    if (_broadcastQueued) _doBroadcastState();
+  }, 50);
 }
 
 // ─── Boot ──────────────────────────────────────────────────
