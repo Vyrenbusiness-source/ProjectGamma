@@ -130,8 +130,11 @@
             <button className="btn tiny" onClick={onClose}>×</button>
           </div>
           {/* TEAM-URL teilen — wichtig für cross-network collab. Damit andere
-              kollegen sich auf DIESEN server registrieren können. */}
-          <TeamUrlPanel serverUrl={client.serverUrl} />
+              kollegen sich auf DIESEN server registrieren können.
+              FIX: client komplett übergeben (nicht nur serverUrl) — onClick-handler
+              brauchen .token für authorization-header, useSync() funktioniert NICHT
+              im onClick (hook-rule-violation, fetch lief unauth → 401 silent). */}
+          <TeamUrlPanel client={client} />
 
           <div style={{
             display: "flex", gap: 8, alignItems: "center",
@@ -242,9 +245,11 @@
   // TeamUrlPanel · zeigt die URLs unter denen DIESER server für team-mitglieder
   // erreichbar ist. Lädt /api/network-info (öffentlich) → routes[]: lan + public-ip + tunnel.
   // Copy-button für jede route. Auto-start cloudflared tunnel auf knopfdruck.
-  function TeamUrlPanel({ serverUrl }) {
+  function TeamUrlPanel({ client }) {
+    const serverUrl = client?.serverUrl || "";
     const [info, setInfo] = useState(null);
     const [tunnelBusy, setTunnelBusy] = useState(false);
+    const [tunnelError, setTunnelError] = useState(null);
     const [copied, setCopied] = useState(null);
 
     useEffect(() => {
@@ -265,26 +270,47 @@
     const tunnel = info.tunnel || {};
     const hasPublicTunnel = tunnel.status === "active" && tunnel.url;
 
+    // FIX: token via client-prop. useSync() im onClick wäre invalid hook call —
+    // fetch lief vorher ohne auth-header → 401 silent geschluckt im catch(_).
+    const authHdr = () => client?.token
+      ? { authorization: "Bearer " + client.token }
+      : {};
+
     const startTunnel = async () => {
       setTunnelBusy(true);
+      setTunnelError(null);
       try {
-        const client = window.useSync ? window.useSync() : null;
-        await fetch(serverUrl + "/api/tunnel/start", {
+        const r = await fetch(serverUrl + "/api/tunnel/start", {
           method: "POST",
-          headers: client && client.token ? { authorization: "Bearer " + client.token } : {},
+          headers: authHdr(),
         });
-      } catch (_) {}
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          setTunnelError(data.error || ("HTTP " + r.status));
+        }
+        // Info aktualisiert sich beim nächsten 5s-tick — oder direkt fetchen
+        const ni = await fetch(serverUrl + "/api/network-info");
+        if (ni.ok) setInfo(await ni.json());
+      } catch (e) {
+        setTunnelError(String(e && e.message || e));
+      }
       setTunnelBusy(false);
     };
     const stopTunnel = async () => {
       setTunnelBusy(true);
+      setTunnelError(null);
       try {
-        const client = window.useSync ? window.useSync() : null;
-        await fetch(serverUrl + "/api/tunnel/stop", {
+        const r = await fetch(serverUrl + "/api/tunnel/stop", {
           method: "POST",
-          headers: client && client.token ? { authorization: "Bearer " + client.token } : {},
+          headers: authHdr(),
         });
-      } catch (_) {}
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) setTunnelError(data.error || ("HTTP " + r.status));
+        const ni = await fetch(serverUrl + "/api/network-info");
+        if (ni.ok) setInfo(await ni.json());
+      } catch (e) {
+        setTunnelError(String(e && e.message || e));
+      }
       setTunnelBusy(false);
     };
     const copy = async (url) => {
@@ -339,8 +365,18 @@
             <button className="btn tiny"
                     onClick={startTunnel} disabled={tunnelBusy}
                     style={{ marginTop: 4, alignSelf: "flex-start" }}>
-              {tunnelBusy ? "starte tunnel…" : "🚀 cloudflared-tunnel starten (öffentliche URL)"}
+              {tunnelBusy ? "starte tunnel… (kann 10-30s dauern)" : "🚀 cloudflared-tunnel starten (öffentliche URL)"}
             </button>
+          )}
+          {tunnelError && (
+            <div style={{
+              marginTop: 6, padding: "6px 8px",
+              background: "rgba(204,51,51,0.08)",
+              border: "1.5px solid #c33", borderRadius: 4,
+              fontSize: 11.5, color: "#c33", fontFamily: "JetBrains Mono, monospace",
+            }}>
+              tunnel-fehler: {tunnelError}
+            </div>
           )}
         </div>
         <div style={{
