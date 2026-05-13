@@ -1059,10 +1059,17 @@ function recordAndBroadcastOp(type, payload, ctx) {
   // dann nur loggen, kein broadcast.
   if (typeof wss === "undefined" || !wss || !wss.clients) return;
   const data = JSON.stringify(frame);
+  // Fix C · membership-filter: pair-tokens (kein userId) sehen alles (legacy).
+  // user-tokens sehen OP_APPEND nur wenn sie membership im projekt haben.
+  // Vorher: jeder client kriegte ALLE ops aller projekte → spam.
   for (const client of wss.clients) {
-    if (client.readyState === 1) {
-      try { client.send(data); } catch (_) {}
+    if (client.readyState !== 1) continue;
+    const sess = client._session;
+    if (sess && sess.userId && memberships) {
+      const role = memberships.getRole(projectId, sess.userId);
+      if (!role) continue; // kein zugriff, kein broadcast
     }
+    try { client.send(data); } catch (_) {}
   }
 }
 
