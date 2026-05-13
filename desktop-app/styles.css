@@ -53,11 +53,15 @@ html[data-theme="dim"] .app::before {
 html, body, #root {
   margin: 0; padding: 0;
   height: 100%;
-  font-family: "Architects Daughter", "Caveat", system-ui, sans-serif;
+  /* clean sans-serif als default für ui-text (mockup-style).
+     "Architects Daughter" + "Caveat" werden nur noch für headings
+     verwendet (siehe .squig / h1.brand). */
+  font-family: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   font-size: 14px;
   color: var(--ink);
   background: var(--bg);
   -webkit-font-smoothing: antialiased;
+  letter-spacing: -0.005em;
 }
 
 button { font-family: inherit; font-size: inherit; cursor: pointer; }
@@ -302,44 +306,48 @@ input, textarea { font-family: inherit; font-size: inherit; }
 .main-head.collapsed .head-top .title-block .goals-preview { display: none; }
 
 .tabs {
-  display: flex; gap: 0;
+  display: flex;
+  gap: 0;
   padding: 0;
-  margin-bottom: -2px;
+  margin-bottom: 16px;
+  border-bottom: 1px solid var(--line);
 }
 .tab {
-  padding: 8px 14px;
-  border: 2px solid var(--line);
-  border-bottom: none;
-  border-radius: 6px 6px 0 0;
-  background: rgba(0,0,0,0.04);
-  margin-right: 4px;
+  padding: 10px 16px 12px;
+  border: none;
+  background: transparent;
+  margin: 0;
   cursor: pointer;
-  font-size: 13.5px;
+  font-size: 14px;
   font-family: inherit;
-  color: var(--ink-soft);
+  color: var(--ink-faint);
   position: relative;
-  border-top-color: transparent;
-  border-left-color: transparent;
-  border-right-color: transparent;
-  border-radius: 0;
-  border-bottom: 2px solid transparent;
+  font-weight: 500;
+  transition: color 0.15s ease;
 }
+.tab:hover { color: var(--ink-soft); }
 .tab.active {
-  background: var(--paper);
   color: var(--ink);
-  border-bottom: 2px solid var(--paper);
-  z-index: 1;
+  background: transparent;
+}
+.tab.active::after {
+  content: "";
+  position: absolute;
+  left: 0; right: 0; bottom: -1px;
+  height: 2px;
+  background: var(--ink);
+  border-radius: 1px;
 }
 .tab .count {
-  font-family: "JetBrains Mono", monospace;
-  font-size: 10px;
+  font-family: inherit;
+  font-size: 11px;
   color: var(--ink-faint);
   margin-left: 6px;
-  background: rgba(0,0,0,0.06);
-  padding: 1px 6px;
-  border-radius: 8px;
+  background: transparent;
+  padding: 0;
+  font-weight: 600;
 }
-.tab.active .count { background: var(--ink); color: var(--paper); }
+.tab.active .count { color: var(--ink-soft); background: transparent; }
 
 .main-body {
   flex: 1;
