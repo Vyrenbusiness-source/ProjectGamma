@@ -2008,14 +2008,22 @@ function ScreenCloud({ project, onCcRun, onCcStop, ccStatus, ccOutput, ccRunning
   const fileInputRef = useRef(null);
   const client = useSync();
 
+  // Bug-fix: vorher zählten alle metriken nur activity-events vom jeweiligen
+  // type — d.h. 'rules' war NICHT die anzahl aktiver regeln, sondern die
+  // anzahl der activity-events vom typ='rule' (wann eine regel hinzugefügt
+  // wurde). user-erwartung: zähle ECHTE entities, nicht events.
   const metrics = useMemo(() => ({
     events:   activity.length,
-    checks:   activity.filter(x => x.type === "check").length,
+    checks:   (project.tasks || []).filter(t => t.done).length,
     writes:   activity.filter(x => x.type === "write").length,
     reads:    activity.filter(x => x.type === "read").length,
-    warnings: activity.filter(x => x.type === "warn").length,
-    rules:    activity.filter(x => x.type === "rule").length,
-  }), [activity]);
+    warnings: ((project.bugs || []).filter(b => b.status === "pending").length) +
+              activity.filter(x => x.type === "warn").length,
+    rules:    (project.rules || []).filter(r => r.active).length,
+    ideas:    (project.ideas || []).filter(i => i.status === "unprocessed").length,
+    bugs:     (project.bugs || []).filter(b => b.status === "pending").length,
+    openTasks:(project.tasks || []).filter(t => !t.done).length,
+  }), [activity, project.tasks, project.rules, project.ideas, project.bugs]);
 
   const inProgress = (project.tasks || []).filter(t => t.group === "in_progress" && !t.done);
   const status = ccStatus[project.id] || { state: "idle" };
@@ -2313,11 +2321,14 @@ function ScreenCloud({ project, onCcRun, onCcStop, ccStatus, ccOutput, ccRunning
       <aside className="pg-aside">
         <div className="pg-side-panel">
           <div className="panel-title">Metriken</div>
-          <div className="pg-metric-row"><span className="ico">📈</span><span className="label">events</span><span className="value">{metrics.events}</span></div>
+          <div className="pg-metric-row"><span className="ico">📈</span><span className="label">cc-events</span><span className="value">{metrics.events}</span></div>
           <div className="pg-metric-row"><span className="ico">✎</span><span className="label">writes</span><span className="value">{metrics.writes}</span></div>
           <div className="pg-metric-row"><span className="ico">👁</span><span className="label">reads</span><span className="value">{metrics.reads}</span></div>
-          <div className="pg-metric-row"><span className="ico">✓</span><span className="label">checks</span><span className="value">{metrics.checks}</span></div>
-          <div className="pg-metric-row"><span className="ico">§</span><span className="label">regeln</span><span className="value">{metrics.rules}</span></div>
+          <div className="pg-metric-row"><span className="ico">✓</span><span className="label">tasks erledigt</span><span className="value">{metrics.checks}</span></div>
+          <div className="pg-metric-row"><span className="ico">⊙</span><span className="label">tasks offen</span><span className="value">{metrics.openTasks}</span></div>
+          <div className="pg-metric-row"><span className="ico">§</span><span className="label">regeln aktiv</span><span className="value">{metrics.rules}</span></div>
+          <div className="pg-metric-row"><span className="ico">💡</span><span className="label">ideen offen</span><span className="value">{metrics.ideas}</span></div>
+          <div className="pg-metric-row"><span className="ico">🐞</span><span className="label">bugs pending</span><span className="value">{metrics.bugs}</span></div>
           <div className="pg-metric-row"><span className="ico">⚠</span><span className="label">warnings</span><span className="value">{metrics.warnings}</span></div>
         </div>
         <div className="pg-side-panel">
