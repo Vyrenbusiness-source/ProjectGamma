@@ -138,14 +138,18 @@ function BootPairing({ onReady }) {
       const r = await fetch(serverUrl + "/health").then(r => r.json()).catch(() => null);
       if (!r || !r.ok) throw new Error("server nicht erreichbar unter " + serverUrl);
       // Wenn server meldet isLocal=false (wir kommen über tunnel/FQDN rein),
-      // KEIN selfInit versuchen — der gibt 403 zurück und gibt nem fremden
-      // pair-token aus wäre eh nicht gewollt. Stattdessen: auto-mode-switch
-      // auf "team" + hinweis. Schützt zusätzlich gegen tunnel-fremdzugriff.
+      // KEIN selfInit versuchen — der gibt 403 und ein fremder pair-token
+      // wäre eh ein security-leak. Stattdessen: AUTO direkt account-register
+      // öffnen mit der server-URL vorbefüllt. So muss der team-kollege nur
+      // die geteilte tunnel-URL öffnen und sich registrieren — keine
+      // zwischenklicks nötig.
       if (r.isLocal === false) {
         setMode("team");
         setTeamUrl(serverUrl);
+        sync.serverUrl = serverUrl;
+        localStorage.setItem("projectgamma.sync.url", serverUrl);
         setStatus("idle");
-        setError("du erreichst diesen server über tunnel/internet — nutze \"team beitreten\" mit account-login statt direkt-pairing.");
+        setShowAccountForTeam(true);
         return;
       }
       sync.serverUrl = serverUrl;
@@ -265,7 +269,11 @@ function BootPairing({ onReady }) {
 
       {/* AccountAuthModal nach erfolgreichem team-server-check */}
       {showAccountForTeam && window.AccountAuthModal && (
-        <window.AccountAuthModal onClose={checkSessionReady} />
+        <window.AccountAuthModal
+          onClose={checkSessionReady}
+          initialMode="register"
+          contextHint={`du verbindest dich mit einem team-server (${sync.serverUrl}). registriere einen account, danach kann dich der team-owner zu projekten einladen.`}
+        />
       )}
     </div>
   );

@@ -9,9 +9,9 @@
   const { useState, useEffect } = React;
   if (!React) return;
 
-  function AccountAuthModal({ onClose }) {
+  function AccountAuthModal({ onClose, initialMode, contextHint }) {
     const client = window.useSync ? window.useSync() : null;
-    const [mode, setMode] = useState("login"); // 'login' | 'register'
+    const [mode, setMode] = useState(initialMode === "register" ? "register" : "login"); // 'login' | 'register'
     const [email, setEmail] = useState("");
     const [password, setPassword] = useState("");
     const [me, setMe] = useState(null);
@@ -86,6 +86,14 @@
             </div>
           ) : (
             <>
+              {contextHint && (
+                <div style={{
+                  marginBottom: 12, padding: 10,
+                  background: "var(--paper-soft, #f5f1e8)",
+                  border: "1.5px solid var(--ink-faint, #ccc)",
+                  borderRadius: 6, fontSize: 12, color: "var(--ink-soft)",
+                }}>{contextHint}</div>
+              )}
               <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
                 <button
                   className={"btn tiny" + (mode === "login" ? " primary" : "")}
