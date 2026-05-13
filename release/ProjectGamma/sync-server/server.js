@@ -2540,6 +2540,27 @@ const ccJobs = new Map(); // projectId -> { proc, startedAt, taskId, prompt, lin
 // cache-miss, danach wieder hits.
 const ccProjectsWithSession = new Set();
 
+// Filesystem-check: claude-CLI legt pro cwd einen ordner in
+// ~/.claude/projects/<encoded>/ an. wenn der existiert, gibt es schon
+// frühere conversations und --continue ist safe — auch beim allerersten
+// cc-spawn nach server-restart. Spart 1× cache-cold-start pro restart.
+function _hasClaudeHistoryFor(cwd) {
+  try {
+    const pathMod = require("node:path");
+    const fsMod = require("node:fs");
+    const os = require("node:os");
+    if (!cwd) return false;
+    // Encoding: : → -, / → -, \ → -, mehrere - bleiben (entspricht CLI-format)
+    const abs = pathMod.resolve(cwd);
+    const encoded = abs.replace(/[:\/\\]/g, "-");
+    const dir = pathMod.join(os.homedir(), ".claude", "projects", encoded);
+    if (!fsMod.existsSync(dir)) return false;
+    // mindestens eine .jsonl-conversation muss drin sein
+    const list = fsMod.readdirSync(dir);
+    return list.some(f => f.endsWith(".jsonl"));
+  } catch (_) { return false; }
+}
+
 function ccStatus(projectId) {
   const j = ccJobs.get(projectId);
   if (!j) return { state: "idle" };
@@ -2648,26 +2669,9 @@ function _startCcJob(project, taskId, prompt) {
   }).map(r => "- " + String(r.text || "").slice(0, 80));
   const goals = project.goals || [];
 
-  // Activity: BM25 über letzte 30 events (long-term memory), top-3 relevante.
-  // Bugs: BM25 über alle pending bugs (project memory), top-3 relevante.
-  const recentActivity = _pickContextTopK({
-    query: _query,
-    corpus: (project.activity || [])
-      .filter(a => ["check","write","warn","edit","rule"].includes(a.type))
-      .slice(0, 30)
-      .map((a, i) => ({ id: a.id || "_a" + i, text: stripHtml(a.text || "") })),
-    k: 3, idKey: "id", textKey: "text",
-  }).map(a => "- " + String(a.text).slice(0, 100));
-  const openBugs = _pickContextTopK({
-    query: _query,
-    corpus: (project.bugs || [])
-      .filter(b => b.status === "pending")
-      .map(b => ({ id: b.id, text: b.description || "", severity: b.severity })),
-    k: 3, idKey: "id", textKey: "text",
-  }).map(b => "- [" + (b.severity || "?") + "] " + String(b.text).slice(0, 80));
-  const lastCcCheck = (project.activity || [])
-    .find(a => a.type === "check" && /cc auto-checkmark/.test(a.text || ""));
-  const lastCcSummary = lastCcCheck ? stripHtml(lastCcCheck.text).slice(0, 200) : null;
+  // recentActivity/openBugs/lastCcCheck wurden entfernt — sie lenkten cc
+  // vom konkreten task ab. wenn cc kontext braucht, soll er gezielt via
+  // Read den state lesen. spart auch BM25-cycles pro spawn.
 
   // Failure-context: wenn dieser run ein retry ist (vorheriger build/test
   // fehlgeschlagen), fügen wir die fehlerausgabe in den prompt ein, damit
@@ -2683,14 +2687,19 @@ function _startCcJob(project, taskId, prompt) {
     "",
     goals.length ? "PROJEKTZIELE:\n" + goals.map(g => "- " + g).join("\n") : "",
     activeRules.length ? "AKTIVE REGELN (immer einhalten):\n" + activeRules.join("\n") : "",
-    inactiveRules.length ? "INAKTIVE REGELN (zur info):\n" + inactiveRules.join("\n") : "",
-    removedRules.length ? "KÜRZLICH ENTFERNTE REGELN (NICHT erneut vorschlagen):\n" + removedRules.join("\n") : "",
-    recentActivity.length ? "LETZTE PROJEKT-AKTIVITÄT (kontext, was kürzlich passierte):\n" + recentActivity.join("\n") : "",
-    openBugs.length ? "OFFENE BUGS (höhere prio falls passt):\n" + openBugs.join("\n") : "",
-    lastCcSummary ? "LETZTER CC-CHECKMARK: " + lastCcSummary : "",
+    // entfernt (lenkten cc ab — er hat task ignoriert und stattdessen
+    // git-status/curl-localhost/aufräum-arbeit gemacht):
+    //   - INAKTIVE REGELN
+    //   - KÜRZLICH ENTFERNTE REGELN
+    //   - LETZTE PROJEKT-AKTIVITÄT
+    //   - OFFENE BUGS
+    //   - LETZTER CC-CHECKMARK
+    // wenn cc kontext braucht kann er via Read selber lesen. weniger
+    // prompt = weniger distraction + weniger tokens.
     "",
-    "AUFGABE:",
+    "AUFGABE (das und NUR das — keine seiten-arbeit, kein freilauf):",
     task ? task.title : (prompt || "Was wäre als nächstes sinnvoll? Gib einen kurzen Plan in 3-5 Punkten."),
+    task?.description ? "BESCHREIBUNG:\n" + task.description.slice(0, 1500) : "",
     task && prompt ? "\nZUSATZ: " + prompt : "",
     retryContext ? "\n⚠️ DIES IST EIN RETRY (versuch " + retryContext.attempt + "/" + MAX_CC_RETRIES + "). VORHERIGER VERSUCH FEHLGESCHLAGEN:\n" +
       "Gate: " + retryContext.kind + " (exit " + (retryContext.exitCode ?? "?") + ")\n" +
@@ -2875,7 +2884,10 @@ function _startCcJob(project, taskId, prompt) {
   // --continue NUR wenn wir schon mal ne session im selben cwd hatten.
   // sonst: claude CLI "no conversations found" → cc bricht stumm ab und
   // der task hängt für immer in 'running'.
-  if (!isRetry && task && !prompt && ccProjectsWithSession.has(cwd)) {
+  // --continue: in-memory-set (gleicher server-run) ODER persistierte
+  // claude-history auf platte (server-restart-tolerant).
+  if (!isRetry && task && !prompt &&
+      (ccProjectsWithSession.has(cwd) || _hasClaudeHistoryFor(cwd))) {
     args.push("--continue");
   }
   if (mcpConfigPath) {
@@ -3353,6 +3365,9 @@ function _startCcJob(project, taskId, prompt) {
                   (parsedStatus.summary ? " · " + parsedStatus.summary.slice(0, 80) : ""),
                 authorName: "cloud-code",
                 authorEmail: "cc@projectgamma.local",
+                // nur die files die cc selbst gemeldet hat — verhindert dass
+                // user-in-progress-edits in den cc-commit reingezogen werden.
+                filesChanged: Array.isArray(parsedStatus.filesChanged) ? parsedStatus.filesChanged : [],
               }).then((g) => {
                 if (g.committed) {
                   applyMutation("ADD_ACTIVITY", { projectId, event: {
@@ -5172,6 +5187,65 @@ function broadcastState(opts) {
   }, 50);
 }
 
+// MCP-warmup: beim server-boot 1× im hintergrund alle MCP-server-packages
+// via `npx -y` antippen. das primt den npm-cache → nächste cc-spawns starten
+// sofort statt 30-60s npm-download zu warten. read-only, kein server-listen
+// (kommando bricht nach 2s ab, package ist dann gecached).
+function _warmupMcpCache() {
+  let mcp;
+  try { mcp = JSON.parse(require("node:fs").readFileSync(require("node:path").join(__dirname, "mcp.json"), "utf8")); }
+  catch (_) { return; }
+  const servers = (mcp && mcp.mcpServers) || {};
+  const seen = new Set();
+  const pkgs = [];
+  for (const [name, def] of Object.entries(servers)) {
+    // env-var-gated server überspringen (REF_API_KEY, GITHUB_PAT)
+    const env = def?.env || {};
+    if (Object.values(env).some(v => typeof v === "string" && /^\$\{[A-Z_]+\}$/.test(v))) continue;
+    const args = def?.args || [];
+    // pkgname extrahieren: erstes arg das nicht mit - beginnt
+    const pkg = args.find(a => typeof a === "string" && !a.startsWith("-"));
+    if (pkg && !seen.has(pkg)) { seen.add(pkg); pkgs.push({ name, pkg }); }
+  }
+  if (pkgs.length === 0) return;
+  console.log("[mcp-warmup] prime cache für", pkgs.length, "MCP-pakete (~5-30s im hintergrund) ...");
+  const { spawn } = require("node:child_process");
+  let done = 0;
+  for (const { name, pkg } of pkgs) {
+    // Wir benutzen `npm view <pkg>` statt `npx -y <pkg>` weil:
+    //   - npm view triggert keinen package-execute (sicherer)
+    //   - aber npm view triggert auch keinen DOWNLOAD ins cache.
+    //   - daher: `npm install --no-save --silent <pkg>@latest` würde den
+    //     cache füllen, ist aber slow.
+    //   - simpelste lösung: `npx -y --no-install <pkg> --help` schlägt
+    //     fehl wenn nicht gecached → wir nutzen `npx -y <pkg> --version`
+    //     mit kurzem timeout. wenn timeout: trotzdem ist package nach
+    //     download im cache.
+    let proc;
+    try {
+      proc = spawn("npx", ["-y", pkg, "--version"], {
+        // Node 24 verlangt shell:true für .cmd/.bat auf Windows.
+        shell: true, windowsHide: true, stdio: "ignore",
+        env: process.env,
+      });
+    } catch (e) {
+      console.warn("[mcp-warmup] spawn fehler für", pkg, ":", e.message);
+      done++;
+      continue;
+    }
+    const killTimer = setTimeout(() => { try { proc.kill(); } catch (_) {} }, 60_000);
+    proc.on("exit", () => {
+      clearTimeout(killTimer);
+      done++;
+      if (done === pkgs.length) console.log("[mcp-warmup] cache primed (" + done + "/" + pkgs.length + ")");
+    });
+    proc.on("error", () => {
+      clearTimeout(killTimer);
+      done++;
+    });
+  }
+}
+
 // ─── Boot ──────────────────────────────────────────────────
 server.listen(PORT, "0.0.0.0", () => {
   const ifaces = require("os").networkInterfaces();
@@ -5190,4 +5264,7 @@ server.listen(PORT, "0.0.0.0", () => {
   console.log("│  projects:", state.projects.length, " sessions:", sessions.size);
   console.log("└──────────────────────────────────────────────────");
   console.log("");
+  // MCP-cache async warmup — verhindert dass der erste cc-spawn 30-60s
+  // auf npm-downloads von context7/sequential-thinking/etc wartet.
+  setTimeout(_warmupMcpCache, 2000);
 });
