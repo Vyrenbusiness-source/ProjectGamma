@@ -1269,7 +1269,18 @@ app.use(express.json({ limit: "8mb" }));
 const DESKTOP_APP_DIR = path.join(__dirname, "..", "desktop-app");
 const desktopUiAvailable = fs.existsSync(path.join(DESKTOP_APP_DIR, "index.html"));
 if (desktopUiAvailable) {
-  app.use(express.static(DESKTOP_APP_DIR, { index: "index.html", extensions: ["html"] }));
+  // no-cache headers — sonst zeigt browser nach update.bat noch alte JS/CSS
+  // weil chrome ohne expliziten cache-bust JS-files aggressiv cached.
+  // mit 'no-cache' lädt browser bei jedem reload neu (revalidation per
+  // ETag) — bandwidth-overhead ist minimal weil 304 zurückkommt wenn
+  // sich nichts geändert hat. team-clients sehen update beim nächsten F5.
+  app.use(express.static(DESKTOP_APP_DIR, {
+    index: "index.html",
+    extensions: ["html"],
+    setHeaders: (res, p) => {
+      res.setHeader("Cache-Control", "no-cache, must-revalidate");
+    },
+  }));
   console.log("[ui] desktop-app static serving von", DESKTOP_APP_DIR);
 } else {
   console.log("[ui] desktop-app folder nicht gefunden — static serving deaktiviert");
@@ -3854,6 +3865,13 @@ function projectPathValid(project) {
   return valid;
 }
 
+// Boot-ts: bei jedem server-start neu. Clients merken sich den ts und
+// vergleichen mit dem neuen. Wenn neuer (= server wurde neu gestartet,
+// vermutlich via update.bat), zeigen wir banner "neue version — F5".
+// Keine force-reload, damit user-drafts (chat-eingabe, task-titel im
+// editor) erhalten bleiben.
+const SERVER_BOOT_TS = NOW();
+
 function publicState(session) {
   const base = (!session || !memberships)
     ? state
@@ -3867,6 +3885,7 @@ function publicState(session) {
     // Transient: auto-pump-pause-flag. Wenn _ccApiLimitedUntil in der zukunft
     // liegt, war kurz vorher ein API-limit. UI zeigt warnung + resume-button.
     ccApiLimitedUntil: _ccApiLimitedUntil > NOW() ? _ccApiLimitedUntil : 0,
+    serverBootTs: SERVER_BOOT_TS,
   };
 }
 

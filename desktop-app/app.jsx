@@ -29,6 +29,33 @@ function applyTheme(theme) {
     document.documentElement.setAttribute("data-theme", "dim");
   }
 })();
+// Server-restart-banner: server.publicState liefert serverBootTs. Wenn
+// der wert sich seit erstem connect ändert → server wurde neu gestartet
+// (vermutlich nach owner-update via update.bat). Wir zeigen einen banner
+// mit reload-button. KEIN auto-reload — würde user-drafts vernichten.
+function UpdateAvailableBanner({ state }) {
+  const [firstBoot, setFirstBoot] = useState(null);
+  const currentBoot = state && state.serverBootTs;
+  useEffect(() => {
+    if (currentBoot && firstBoot == null) setFirstBoot(currentBoot);
+  }, [currentBoot]);
+  if (!currentBoot || firstBoot == null) return null;
+  if (currentBoot === firstBoot) return null;
+  return (
+    <button
+      onClick={() => window.location.reload()}
+      title="server wurde neu gestartet — wahrscheinlich nach update.bat. neu laden um die aktuelle UI zu sehen."
+      style={{
+        background: "var(--accent, #2a8a3a)", color: "var(--paper)",
+        border: "none", borderRadius: 4, padding: "3px 10px",
+        fontFamily: "inherit", fontSize: 12, cursor: "pointer",
+        animation: "pulse 1.8s ease-in-out infinite",
+      }}>
+      🔄 update verfügbar · neu laden
+    </button>
+  );
+}
+
 function ThemeToggle() {
   const [theme, setTheme] = useState(() => {
     try { return localStorage.getItem("pg-theme") || "dim"; }
@@ -2720,6 +2747,7 @@ function App() {
           <span className={"cc-dot" + (client.connected ? " live" : "")}>
             {client.connected ? `server · ${client.serverUrl.replace(/^https?:\/\//, "")}` : "server getrennt"}
           </span>
+          <UpdateAvailableBanner state={client.state} />
           <ThemeToggle />
           {window.OfflineQueuePanel ? <window.OfflineQueuePanel client={client} /> : null}
         </div>
