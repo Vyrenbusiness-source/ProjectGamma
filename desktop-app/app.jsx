@@ -1083,26 +1083,21 @@ function OnboardStep({ n, title, body, cta, onClick, done }) {
   );
 }
 
-// Stat-Chip: groß zahl + label, klick wechselt tab.
-function StatChip({ label, value, accent, onClick }) {
+// Stat-Chip: icon-left layout (redesign nach mockup) + klick wechselt tab.
+function StatChip({ label, value, icon, accent, onClick }) {
   return (
     <button onClick={onClick}
-            className="stat-chip"
+            className={"statcard-row" + (accent ? " accent" : "")}
             style={{
-              flex: 1, padding: "14px 8px",
-              background: accent ? "var(--ink)" : "var(--paper)",
-              color: accent ? "var(--paper)" : "var(--ink)",
-              border: "2px solid var(--ink)", borderRadius: 10,
               cursor: onClick ? "pointer" : "default",
-              display: "flex", flexDirection: "column", alignItems: "center", gap: 2,
               fontFamily: "inherit",
+              textAlign: "left",
             }}>
-      <span style={{ fontFamily: "JetBrains Mono, monospace", fontSize: 22, fontWeight: 700, lineHeight: 1 }}>
-        {value}
-      </span>
-      <span style={{ fontSize: 10.5, opacity: 0.75, fontFamily: "JetBrains Mono, monospace" }}>
-        {label}
-      </span>
+      <div className="ico">{icon || "·"}</div>
+      <div className="body">
+        <div className="label">{label.toUpperCase()}</div>
+        <div className="value">{value}</div>
+      </div>
     </button>
   );
 }
@@ -1474,15 +1469,16 @@ function ScreenOverview({ project, onOpenMembers, onOpenPair, onSetTab }) {
       <OnboardingBlock project={project} myEmail={myEmail}
                        onSetTab={onSetTab} onOpenMembers={onOpenMembers} />
 
-      {/* Block 2 — Stat-chips */}
-      <div style={{ display: "flex", gap: 12, marginTop: 14 }}>
-        <StatChip label="aufgaben" value={stats.open} accent={stats.open > 0}
+      {/* Block 2 — Stat-cards (icon-left, klick wechselt tab) */}
+      <div className="statcard-grid cols-4" style={{ marginTop: 14 }}>
+        <StatChip label="aufgaben" value={stats.open} icon="✓" accent={stats.open > 0}
                   onClick={() => onSetTab && onSetTab("tasks")} />
-        <StatChip label="regeln" value={stats.rules}
+        <StatChip label="regeln" value={stats.rules} icon="§"
                   onClick={() => onSetTab && onSetTab("rules")} />
-        <StatChip label="ideen" value={stats.ideas} accent={stats.ideas > 0}
+        <StatChip label="ideen" value={stats.ideas} icon="💡" accent={stats.ideas > 0}
                   onClick={() => onSetTab && onSetTab("ideas")} />
-        <StatChip label={ccRunning ? "aktiv" : "pause"} value={ccRunning ? "⚡" : "○"}
+        <StatChip label={ccRunning ? "cloud-code aktiv" : "cloud-code pause"}
+                  value={ccRunning ? "⚡" : "○"} icon="☁"
                   onClick={() => onSetTab && onSetTab("cloud")} />
       </div>
 
@@ -2140,27 +2136,39 @@ function ScreenCloud({ project, onCcRun, onCcStop, ccStatus, ccOutput, ccRunning
         </div>
       </div>
 
-      {/* Stats-cards: 4 chips mit klaren zahlen */}
-      <div className="cc-stats">
-        <div className={"cc-stat-card" + (metrics.checks > 0 ? " accent" : "")}>
-          <div className="label">checks</div>
-          <div className="value">{metrics.checks}</div>
-          <div className="sub">tasks abgehakt</div>
+      {/* Stats-cards: 4 chips mit icon-left layout (mockup-style) */}
+      <div className="statcard-grid cols-4">
+        <div className={"statcard-row" + (metrics.checks > 0 ? " success" : "")}>
+          <div className="ico">✓</div>
+          <div className="body">
+            <div className="label">CHECKS</div>
+            <div className="value">{metrics.checks}</div>
+            <div className="sub">tasks abgehakt</div>
+          </div>
         </div>
-        <div className="cc-stat-card">
-          <div className="label">writes</div>
-          <div className="value">{metrics.writes}</div>
-          <div className="sub">files berührt</div>
+        <div className="statcard-row">
+          <div className="ico">✎</div>
+          <div className="body">
+            <div className="label">WRITES</div>
+            <div className="value">{metrics.writes}</div>
+            <div className="sub">files berührt</div>
+          </div>
         </div>
-        <div className={"cc-stat-card" + (metrics.warnings > 0 ? " warning" : "")}>
-          <div className="label">warnings</div>
-          <div className="value">{metrics.warnings}</div>
-          <div className="sub">{metrics.warnings > 0 ? "blocker offen" : "alles klar"}</div>
+        <div className={"statcard-row" + (metrics.warnings > 0 ? " warning" : "")}>
+          <div className="ico">⚠</div>
+          <div className="body">
+            <div className="label">WARNINGS</div>
+            <div className="value">{metrics.warnings}</div>
+            <div className="sub">{metrics.warnings > 0 ? "blocker offen" : "alles klar"}</div>
+          </div>
         </div>
-        <div className="cc-stat-card">
-          <div className="label">kosten · {recentBudget.jobs} runs</div>
-          <div className="value">${recentBudget.costUsd.toFixed(3)}</div>
-          <div className="sub">{(recentBudget.tokensIn/1000).toFixed(1)}k in · {(recentBudget.tokensOut/1000).toFixed(1)}k out</div>
+        <div className="statcard-row">
+          <div className="ico">$</div>
+          <div className="body">
+            <div className="label">KOSTEN · {recentBudget.jobs} RUNS</div>
+            <div className="value">${recentBudget.costUsd.toFixed(3)}</div>
+            <div className="sub">{(recentBudget.tokensIn/1000).toFixed(1)}k in · {(recentBudget.tokensOut/1000).toFixed(1)}k out</div>
+          </div>
         </div>
       </div>
 
@@ -2276,11 +2284,11 @@ function ScreenCloud({ project, onCcRun, onCcStop, ccStatus, ccOutput, ccRunning
         </div>
         {activity.length === 0
           ? <div className="empty"><div className="big">stille.</div><div>cloud code wartet auf input.</div></div>
-          : <div className="cc-feed-wrap">
+          : <div className="cc-feed-wrap" style={{ padding: 0 }}>
               {activity.slice(0, 60).map(e => (
-                <div className="feed-row" key={e.id}>
-                  <span className="glyph">{ACT_GLYPHS[e.type] || "·"}</span>
-                  <span dangerouslySetInnerHTML={{ __html: e.text }} />
+                <div className="pg-feed-row" key={e.id}>
+                  <span className="ico">{ACT_GLYPHS[e.type] || "·"}</span>
+                  <span className="text" dangerouslySetInnerHTML={{ __html: e.text }} />
                   <span className="ts">{relTime(e.ts)}</span>
                 </div>
               ))}
@@ -2289,21 +2297,19 @@ function ScreenCloud({ project, onCcRun, onCcStop, ccStatus, ccOutput, ccRunning
       </div>
 
       <div className="two-col">
-        <div className="box">
-          <div className="eyebrow">// metriken</div>
-          <div className="stat">
-            ▸ events &nbsp;&nbsp;&nbsp;<strong>{metrics.events}</strong><br/>
-            ▸ writes &nbsp;&nbsp;<strong>{metrics.writes}</strong><br/>
-            ▸ reads &nbsp;&nbsp;&nbsp;<strong>{metrics.reads}</strong><br/>
-            ▸ checks &nbsp;&nbsp;<strong>{metrics.checks}</strong><br/>
-            ▸ regeln &nbsp;&nbsp;<strong>{metrics.rules}</strong><br/>
-            ▸ warnings <strong>{metrics.warnings}</strong>
-          </div>
+        <div className="pg-side-panel">
+          <div className="panel-title">// metriken</div>
+          <div className="pg-metric-row"><span className="ico">📈</span><span className="label">events</span><span className="value">{metrics.events}</span></div>
+          <div className="pg-metric-row"><span className="ico">✎</span><span className="label">writes</span><span className="value">{metrics.writes}</span></div>
+          <div className="pg-metric-row"><span className="ico">👁</span><span className="label">reads</span><span className="value">{metrics.reads}</span></div>
+          <div className="pg-metric-row"><span className="ico">✓</span><span className="label">checks</span><span className="value">{metrics.checks}</span></div>
+          <div className="pg-metric-row"><span className="ico">§</span><span className="label">regeln</span><span className="value">{metrics.rules}</span></div>
+          <div className="pg-metric-row"><span className="ico">⚠</span><span className="label">warnings</span><span className="value">{metrics.warnings}</span></div>
         </div>
-        <div className="box">
-          <div className="eyebrow">// nächster schritt</div>
-          <div className="squig" style={{ fontSize: 18 }}>{inProgress[0]?.title || "warten auf neuen task"}</div>
-          <div style={{ color: "var(--ink-soft)", fontSize: 12, marginTop: 6 }}>
+        <div className="pg-side-panel">
+          <div className="panel-title">// nächster schritt</div>
+          <div style={{ fontSize: 14, color: "var(--ink)", fontWeight: 600 }}>{inProgress[0]?.title || "warten auf neuen task"}</div>
+          <div style={{ color: "var(--ink-soft)", fontSize: 12, marginTop: 8, lineHeight: 1.5 }}>
             cloud-code arbeitet an <strong>{inProgress.length}</strong> offenen tasks · {(project.rules || []).filter(r => r.active).length} regeln aktiv
           </div>
         </div>
