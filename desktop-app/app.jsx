@@ -8,6 +8,41 @@ const { useState, useEffect, useMemo, useRef, useCallback, useSyncExternalStore 
 
 const RULE_CATS    = ["code-stil", "architektur", "workflow"];
 
+// Theme-toggle: light (default) ↔ "dim" (soft-dark). Persistiert in
+// localStorage und wird sofort beim mount auf <html data-theme> appliziert.
+// Spec aus user: ähnlich wie dark-mode aber besser aussehend — daher
+// warm-gray statt knall-schwarz (siehe styles.css [data-theme="dim"]).
+function applyTheme(theme) {
+  try {
+    document.documentElement.setAttribute("data-theme", theme === "dim" ? "dim" : "");
+    localStorage.setItem("pg-theme", theme);
+  } catch (_) {}
+}
+// Initial apply NOCH BEVOR React mountet, damit kein flash.
+(function() {
+  try {
+    const t = localStorage.getItem("pg-theme") || "light";
+    if (t === "dim") document.documentElement.setAttribute("data-theme", "dim");
+  } catch (_) {}
+})();
+function ThemeToggle() {
+  const [theme, setTheme] = useState(() => {
+    try { return localStorage.getItem("pg-theme") || "light"; }
+    catch (_) { return "light"; }
+  });
+  const toggle = () => {
+    const next = theme === "dim" ? "light" : "dim";
+    setTheme(next);
+    applyTheme(next);
+  };
+  return (
+    <button className="theme-toggle" onClick={toggle}
+            title={theme === "dim" ? "auf hell wechseln" : "auf dim (soft-dark) wechseln"}>
+      {theme === "dim" ? "☀ hell" : "🌙 dim"}
+    </button>
+  );
+}
+
 // Empfohlene Best-Practice-Regeln, die der User per Klick aktivieren kann.
 // Werden nicht doppelt angelegt (nach lowercase-trim Vergleich).
 const SUGGESTED_RULES = [
@@ -2681,6 +2716,7 @@ function App() {
           <span className={"cc-dot" + (client.connected ? " live" : "")}>
             {client.connected ? `server · ${client.serverUrl.replace(/^https?:\/\//, "")}` : "server getrennt"}
           </span>
+          <ThemeToggle />
           {window.OfflineQueuePanel ? <window.OfflineQueuePanel client={client} /> : null}
         </div>
       </div>

@@ -194,4 +194,6 @@ echo     - kein gleiches WLAN? -^> "internet-tunnel start" im pair-dialog
 echo.
 echo   beenden: das server-fenster schliessen ^(oder STRG+C druecken^).
 echo.
-pause
+echo   launcher schliesst sich in 5s automatisch...
+timeout /t 5 /nobreak >nul
+exit /b 0

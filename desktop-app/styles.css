@@ -3,6 +3,7 @@
 :root {
   --paper: #faf8f3;
   --paper-2: #f4f1e9;
+  --paper-soft: #f5f1e8;
   --ink: #1a1a1a;
   --ink-soft: #555;
   --ink-faint: #999;
@@ -10,7 +11,42 @@
   --pad: 14px;
   --radius: 6px;
   --bg: #efece4;
+  --accent: #2a8a3a;
+  --danger: #c33;
+  --ok: #2a8a3a;
+  --dot-color: rgba(0,0,0,0.04);
+  --dot-color-2: rgba(0,0,0,0.025);
 }
+
+/* ────────────────────────────────────────────────────────────
+   SOFT-DARK ("dim") theme — sketchy aesthetic erhalten,
+   aber augenfreundliche warm-gray-palette statt knall-schwarz.
+   Aktiviert via <html data-theme="dim">.
+   ──────────────────────────────────────────────────────────── */
+html[data-theme="dim"] {
+  --paper: #1f1c18;        /* warm dark-gray für card-bg */
+  --paper-2: #28241f;       /* etwas heller für titlebar/zebra */
+  --paper-soft: #2c2823;
+  --ink: #e8e0d2;          /* warm off-white text — kein knall-weiß */
+  --ink-soft: #a8a094;     /* warmer gray für sekundär-text */
+  --ink-faint: #6c6660;    /* gedimmter für hint-text */
+  --line: #4a443c;         /* warmer border statt schwarz */
+  --bg: #161310;           /* tiefster warmer bg */
+  --accent: #6abf78;
+  --danger: #e07070;
+  --ok: #6abf78;
+  --dot-color: rgba(255,255,255,0.04);
+  --dot-color-2: rgba(255,255,255,0.025);
+  color-scheme: dark;
+}
+/* Dot-pattern (sketchy texture) muss im dark-mode hell statt dunkel sein. */
+html[data-theme="dim"] .app::before {
+  background-image:
+    radial-gradient(var(--dot-color) 1px, transparent 1px),
+    radial-gradient(var(--dot-color-2) 1px, transparent 1px);
+  mix-blend-mode: screen;
+}
+/* Default-dot-pattern referenziert die vars (siehe .app::before unten). */
 
 * { box-sizing: border-box; }
 
@@ -37,8 +73,8 @@ input, textarea { font-family: inherit; font-size: inherit; }
 .app::before {
   content: ""; position: absolute; inset: 0; pointer-events: none; opacity: 0.4;
   background-image:
-    radial-gradient(rgba(0,0,0,0.04) 1px, transparent 1px),
-    radial-gradient(rgba(0,0,0,0.025) 1px, transparent 1px);
+    radial-gradient(var(--dot-color) 1px, transparent 1px),
+    radial-gradient(var(--dot-color-2) 1px, transparent 1px);
   background-size: 18px 18px, 22px 22px;
   background-position: 0 0, 9px 11px;
   mix-blend-mode: multiply;
@@ -1185,3 +1221,66 @@ textarea.editable-input { min-height: 60px; resize: vertical; }
   border-radius: 6px;
   padding: 4px 12px;
 }
+
+/* ────────────────────────────────────────────────────────────
+   SOFT-DARK overrides — die meisten dunklen tints in der light-
+   version (rgba(0,0,0,X)) sind im dim-mode zu intransparent →
+   hier flippen wir sie auf white-tints.
+   Reihenfolge: vom subtilen zum starken tint.
+   ──────────────────────────────────────────────────────────── */
+html[data-theme="dim"] .titlebar { background: rgba(255,255,255,0.04); }
+html[data-theme="dim"] .proj-item:hover,
+html[data-theme="dim"] .side .new-btn:hover,
+html[data-theme="dim"] .btn:hover { background: rgba(255,255,255,0.06); }
+html[data-theme="dim"] .btn.primary:hover { background: var(--accent); color: var(--paper); }
+html[data-theme="dim"] .device.this { background: rgba(255,255,255,0.04); }
+html[data-theme="dim"] .tech-select:hover { border-color: rgba(255,255,255,0.18); }
+
+/* Hairline-borders (--line ist warm-gray, aber rgba(0,0,0,0.18)
+   dashed-border bleibt schwarz auf dunklem grund → flippen) */
+html[data-theme="dim"] .activity li,
+html[data-theme="dim"] .subtasks {
+  border-color: rgba(255,255,255,0.12);
+}
+
+/* Scrollbar im dim-mode hell */
+html[data-theme="dim"] .main-body::-webkit-scrollbar-thumb,
+html[data-theme="dim"] .side::-webkit-scrollbar-thumb {
+  background: rgba(255,255,255,0.18);
+}
+html[data-theme="dim"] .main-body::-webkit-scrollbar-thumb:hover,
+html[data-theme="dim"] .side::-webkit-scrollbar-thumb:hover {
+  background: rgba(255,255,255,0.32);
+}
+
+/* Modal-bg overlay: standardmäßig black-dim, im dim-mode bleibts dunkel
+   (modaler kontrast bleibt) — keine änderung nötig. */
+
+/* Inputs in dim-mode brauchen sichtbaren bg */
+html[data-theme="dim"] .input,
+html[data-theme="dim"] input.input,
+html[data-theme="dim"] textarea.input,
+html[data-theme="dim"] select.input {
+  background: var(--paper-2);
+  color: var(--ink);
+  border-color: var(--line);
+}
+html[data-theme="dim"] .input::placeholder,
+html[data-theme="dim"] input::placeholder,
+html[data-theme="dim"] textarea::placeholder {
+  color: var(--ink-faint);
+}
+
+/* Theme-toggle button — passt sich an */
+.theme-toggle {
+  background: transparent;
+  border: 1.5px solid var(--ink);
+  color: var(--ink);
+  border-radius: 4px;
+  padding: 2px 8px;
+  font-size: 12px;
+  cursor: pointer;
+  font-family: inherit;
+}
+.theme-toggle:hover { background: rgba(0,0,0,0.06); }
+html[data-theme="dim"] .theme-toggle:hover { background: rgba(255,255,255,0.08); }
