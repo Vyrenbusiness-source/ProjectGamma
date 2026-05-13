@@ -79,14 +79,11 @@ class SyncClient {
       body: body ? JSON.stringify(body) : undefined,
     });
     const text = await res.text();
-    let data;
-    try { data = text ? JSON.parse(text) : {}; } catch (e) { data = { raw: text }; }
-    if (!res.ok) {
-      const err = new Error(data.error || ("http " + res.status));
-      err.status = res.status; err.data = data;
-      throw err;
-    }
-    return data;
+    // parseHttpResponse wirft bei !ok ODER bei nicht-JSON body — beides mit
+    // klarem err.message + err.status. Frühere version hat parse-fehler in
+    // ein stilles {raw: text} verwandelt; das UI bekam dann ein objekt mit
+    // unbekanntem feld statt einer echten fehlermeldung.
+    return window.parseHttpResponse({ text, status: res.status, ok: res.ok });
   }
 
   /// Desktop-Self-Init (lokal, ohne Code) — bekommt Token zurück.
