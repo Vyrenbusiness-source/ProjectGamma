@@ -1525,9 +1525,49 @@ function ScreenTasks({ project, onCcRun }) {
   const [adding, setAdding] = useState(false);
   const [draft, setDraft] = useState({ title: "", group: "next", meta: "" });
   const [subDraft, setSubDraft] = useState({ taskId: null, title: "" });
+  const [specBusy, setSpecBusy] = useState(false);
+  const [specMsg, setSpecMsg] = useState(null);
   const inputRef = useRef(null);
+  const specInputRef = useRef(null);
 
   useEffect(() => { if (adding) inputRef.current?.focus(); }, [adding]);
+
+  // Spec-upload: user wählt .md (oder andere text-datei), inhalt geht als
+  // expliziter prompt an /api/cc/run mit instruktion "implementiere ALLES".
+  // cc spawnt einen einzigen großen run der durch die ganze spec arbeitet
+  // (autopump arbeitet danach die offenen tasks ab, falls cc neue anlegt).
+  const onSpecFileChange = async (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = ""; // reset, damit gleiche file nochmal triggern kann
+    if (!file) return;
+    if (file.size > 200_000) {
+      setSpecMsg("spec zu groß (" + Math.round(file.size/1024) + "kb · max 200kb)");
+      setTimeout(() => setSpecMsg(null), 6000);
+      return;
+    }
+    const content = await file.text();
+    if (!content.trim()) { setSpecMsg("datei leer"); setTimeout(() => setSpecMsg(null), 4000); return; }
+    if (!confirm(`spec "${file.name}" (${Math.round(file.size/1024)}kb) an cloud-code übergeben?\n\ncc wird versuchen ALLES daraus zu implementieren — kann einige minuten + tokens kosten.`)) return;
+    setSpecBusy(true); setSpecMsg("spec wird an cloud-code übergeben…");
+    try {
+      const wrapper =
+        "📄 SPEC-FILE: " + file.name + "\n\n" +
+        "Implementiere ALLES was in der folgenden spec steht. Lege echte files an,\n" +
+        "schreibe echten code. Wenn die spec zu groß für einen run ist, mach den\n" +
+        "kleinstmöglichen ersten schritt (z.B. directory-struktur + erste files)\n" +
+        "und melde im TASK_STATUS welche teile noch offen sind. KEIN plan-only-\n" +
+        "output, schreibe von anfang an files.\n\n" +
+        "==== SPEC ====\n" + content + "\n==== END SPEC ====";
+      const r = await sync._http("POST", "/api/cc/run", { projectId: project.id, prompt: wrapper });
+      setSpecMsg("✓ cc-job gestartet — schau im cloud-agent tab den live-output");
+      setTimeout(() => setSpecMsg(null), 8000);
+    } catch (err) {
+      setSpecMsg("✗ fehler: " + (err.message || "unbekannt"));
+      setTimeout(() => setSpecMsg(null), 8000);
+    } finally {
+      setSpecBusy(false);
+    }
+  };
 
   const tasks = project.tasks || [];
   const groups = [
@@ -1613,8 +1653,20 @@ function ScreenTasks({ project, onCcRun }) {
         <input className="input" placeholder="suchen…" value={search}
                onChange={(e) => setSearch(e.target.value)}
                style={{ maxWidth: 200, fontSize: 12, padding: "4px 10px" }} />
+        <input ref={specInputRef} type="file" accept=".md,.txt,.markdown,text/markdown,text/plain"
+               style={{ display: "none" }} onChange={onSpecFileChange} />
+        <button className="btn tiny" disabled={specBusy}
+                onClick={() => specInputRef.current?.click()}
+                title="lädt eine .md-spec hoch, cc bekommt sie als prompt und versucht alles umzusetzen">
+          {specBusy ? "…" : "📄 spec laden"}
+        </button>
         <button className="btn primary tiny" onClick={() => setAdding(s => !s)}>+ aufgabe</button>
       </div>
+      {specMsg && (
+        <div className="box" style={{ marginBottom: 10, padding: "8px 12px", fontSize: 12, background: specMsg.startsWith("✗") ? "#fee" : specMsg.startsWith("✓") ? "#efe" : undefined }}>
+          {specMsg}
+        </div>
+      )}
       {isEmpty && !adding && (
         <div className="box" style={{ textAlign: "center", padding: 32, color: "var(--ink-soft)" }}>
           {search.trim()
@@ -1697,6 +1749,31 @@ function ScreenTasks({ project, onCcRun }) {
                         )}
                         <Editable value={t.title} onChange={v => editTask(t.id, { title: v.trim() || t.title })} />
                       </div>
+                      {(() => {
+                        // Progress-bar: subtasks done/total · cc-busy = animated ·
+                        // task.done = 100%. ohne subtasks + nicht busy + nicht done:
+                        // kein bar (verschwendet platz für tasks die noch nicht
+                        // angefangen sind).
+                        const subs = t.subtasks || [];
+                        const subDone = subs.filter(s => s.done).length;
+                        let pct = null;
+                        if (t.done) pct = 100;
+                        else if (subs.length > 0) pct = Math.round((subDone / subs.length) * 100);
+                        else if (isCcOnThis) pct = -1; // indeterminate (animated)
+                        if (pct === null) return null;
+                        return (
+                          <div className="task-progress"
+                               title={pct === -1 ? "cloud-code arbeitet daran"
+                                                 : subs.length > 0 ? `${subDone}/${subs.length} subtasks erledigt`
+                                                 : t.done ? "abgeschlossen" : ""}>
+                            <div className={"task-progress-bar" + (pct === -1 ? " indeterminate" : "") + (t.done ? " done" : "")}
+                                 style={pct >= 0 ? { width: pct + "%" } : undefined} />
+                            {pct >= 0 && subs.length > 0 && (
+                              <span className="task-progress-label">{subDone}/{subs.length}</span>
+                            )}
+                          </div>
+                        );
+                      })()}
                       {((t.subtasks || []).length > 0 || subDraft.taskId === t.id) && (
                         <div className="subtasks">
                           {(t.subtasks || []).map(s => (

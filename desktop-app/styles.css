@@ -1816,3 +1816,57 @@ html[data-theme="dim"] .nav-item:hover { background: rgba(255,255,255,0.05); }
   font-family: "Caveat", cursive;
   color: var(--ink);
 }
+
+/* ──────────────────────────────────────────────────────────────
+   Task-Progress-Bar (2026-05-14): grüner balken pro task.
+   - subtasks done/total: filled-bar in %
+   - cc-busy: indeterminate (animated)
+   - done: 100% grün
+   ────────────────────────────────────────────────────────────── */
+.task-progress {
+  position: relative;
+  height: 4px;
+  background: rgba(0, 0, 0, 0.06);
+  border-radius: 2px;
+  margin-top: 6px;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+}
+html[data-theme="dim"] .task-progress { background: rgba(255, 255, 255, 0.06); }
+
+.task-progress-bar {
+  height: 100%;
+  background: linear-gradient(90deg, #4caf50, #66bb6a);
+  border-radius: 2px;
+  transition: width 0.3s ease;
+  box-shadow: 0 0 4px rgba(76, 175, 80, 0.3);
+}
+.task-progress-bar.done {
+  background: linear-gradient(90deg, #43a047, #2e7d32);
+}
+
+/* Indeterminate (cc arbeitet): animated stripe in laufrichtung */
+.task-progress-bar.indeterminate {
+  width: 40% !important;
+  background: linear-gradient(90deg, transparent, #4caf50, transparent);
+  animation: pg-progress-slide 1.4s ease-in-out infinite;
+}
+@keyframes pg-progress-slide {
+  0%   { transform: translateX(-150%); }
+  100% { transform: translateX(350%); }
+}
+
+.task-progress-label {
+  position: absolute;
+  right: 4px;
+  top: -1px;
+  font-size: 9px;
+  font-family: "JetBrains Mono", monospace;
+  color: var(--ink-faint);
+  background: var(--paper);
+  padding: 0 3px;
+  border-radius: 2px;
+  pointer-events: none;
+  line-height: 1;
+}
