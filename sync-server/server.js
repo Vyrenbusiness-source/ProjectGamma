@@ -1459,10 +1459,25 @@ app.post("/api/auth/register", async (req, res) => {
         } catch (e) { /* foreign-key falls user nicht gefunden — unwahrscheinlich */ }
       }
       console.log("[auth] bootstrap: erster user → owner aller bestehenden projekte");
+    } else {
+      // Kein bootstrap: prüfe ob es pre-invite gibt (owner hat vor register
+      // schon eingeladen). Übernehmen + cleanup.
+      try {
+        const claimed = memberships.claimPendingForEmail(user.email, user.id);
+        if (claimed.length > 0) {
+          console.log("[auth] register:", user.email, "claimed", claimed.length, "pending invite(s)");
+        }
+      } catch (e) {
+        console.log("[auth] claim-pending failed for", user.email, "-", e.message);
+      }
     }
   }
   const sess = usersStore.createSession({ userId: user.id, ttlMs: USER_SESSION_TTL_MS });
   console.log("[auth] register:", user.email);
+  // Nach claim: broadcast neuen state, damit owner-tabs die neue
+  // membership in /api/projects/:id/members sehen + invitee bei WS-connect
+  // direkt seine projekte bekommt.
+  broadcastState();
   res.status(201).json({
     token: sess.token,
     user: { id: user.id, email: user.email, createdAt: user.createdAt },
@@ -1973,7 +1988,14 @@ app.get("/api/projects/:id/members", authMw, (req, res) => {
     const u = usersStore && usersStore.findUserById(m.userId);
     return { userId: m.userId, email: u ? u.email : null, role: m.role, addedAt: m.addedAt };
   });
-  res.json({ projectId: project.id, members: out });
+  // Pending invites (vor-eingeladene emails ohne registrierten user) ebenfalls
+  // ausgeben — UI kann sie als "wartet auf registrierung" anzeigen.
+  const pending = memberships.listPendingForProject
+    ? memberships.listPendingForProject(project.id).map(p => ({
+        email: p.email, role: p.role, addedAt: p.addedAt, pending: true,
+      }))
+    : [];
+  res.json({ projectId: project.id, members: out, pending });
 });
 
 app.post("/api/projects/:id/members", authMw, (req, res) => {
@@ -1983,9 +2005,29 @@ app.post("/api/projects/:id/members", authMw, (req, res) => {
   if (!_requireProjectAccess(req, res, project, ROLES.OWNER)) return;
   const { email, role } = req.body || {};
   if (!email || typeof email !== "string") return res.status(400).json({ error: "email fehlt" });
-  const target = usersStore.findUserByEmail(email);
-  if (!target) return res.status(404).json({ error: "user nicht gefunden" });
   const r = (role && [ROLES.OWNER, ROLES.MEMBER, ROLES.VIEWER].includes(role)) ? role : ROLES.MEMBER;
+  const target = usersStore.findUserByEmail(email);
+
+  // Pending-invite-flow: wenn user noch nicht registriert ist, speichern wir
+  // die einladung. Beim register wird sie automatisch als membership übernommen.
+  // Behebt das "user nicht gefunden"-friction wenn owner einlädt, bevor der
+  // kollege auf der tunnel-URL einen account angelegt hat.
+  if (!target) {
+    try {
+      const inv = memberships.addPendingInvite({
+        projectId: project.id, email, role: r,
+        addedBy: req.session?.userId || null,
+      });
+      console.log("[membership] pending invite:", inv.email, "->", project.id, r);
+      broadcastState();
+      return res.status(202).json({
+        pending: true, email: inv.email, projectId: project.id, role: r,
+        message: "einladung gespeichert — wird aktiv sobald sich der user mit dieser email registriert.",
+      });
+    } catch (e) {
+      return res.status(400).json({ error: e.message });
+    }
+  }
   try {
     const m = memberships.addMember({
       projectId: project.id, userId: target.id, role: r,
@@ -2008,6 +2050,23 @@ app.post("/api/projects/:id/members", authMw, (req, res) => {
       inviter: req.session?.deviceName || "owner",
     });
     res.status(201).json({ ...m, email: target.email });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+// Pending-invite entfernen: owner kann seine wartende einladung zurücknehmen.
+// userId-prefix "pending:<email>" damit der existierende DELETE-handler die
+// zwei fälle (echter user vs pending) unterscheidet.
+app.delete("/api/projects/:id/pending/:email", authMw, (req, res) => {
+  if (!memberships) return res.status(503).json({ error: "multi-user nicht aktiv" });
+  const project = state.projects.find(p => p.id === req.params.id);
+  if (!project) return res.status(404).json({ error: "projekt nicht gefunden" });
+  if (!_requireProjectAccess(req, res, project, ROLES.OWNER)) return;
+  try {
+    memberships.removePendingInvite(project.id, decodeURIComponent(req.params.email));
+    broadcastState();
+    res.json({ ok: true });
   } catch (e) {
     res.status(400).json({ error: e.message });
   }

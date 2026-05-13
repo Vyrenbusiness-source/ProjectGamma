@@ -13,6 +13,7 @@
   function MembersModal({ projectId, onClose }) {
     const client = window.useSync ? window.useSync() : null;
     const [members, setMembers] = useState(null);
+    const [pending, setPending] = useState([]);
     const [myUserId, setMyUserId] = useState(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
@@ -48,9 +49,11 @@
         const data = await r.json().catch(() => ({}));
         if (!r.ok) throw new Error(data.error || ("fehler " + r.status));
         setMembers(data.members || []);
+        setPending(data.pending || []);
       } catch (e) {
         setError((e && e.message) || "fehler");
         setMembers(null);
+        setPending([]);
       } finally {
         setLoading(false);
       }
@@ -80,6 +83,11 @@
         const data = await r.json().catch(() => ({}));
         if (!r.ok) throw new Error(data.error || ("fehler " + r.status));
         setInviteEmail(""); setInviteOpen(false);
+        // Status 202 = pending invite (user noch nicht registriert).
+        // 201 = direkt als member zugewiesen.
+        if (data.pending) {
+          alert("✓ einladung für " + email + " gespeichert.\n\nsobald sich der user mit dieser email registriert, bekommt er automatisch zugriff.");
+        }
         refresh();
       } catch (e) {
         alert(e.message);
@@ -198,6 +206,37 @@
                   </div>
                 );
               })}
+              {pending.length > 0 && pending.map((p) => (
+                <div key={"pending-" + p.email} style={{
+                  display: "flex", alignItems: "center", gap: 10,
+                  padding: "8px 10px",
+                  border: "2px dashed var(--ink-faint, #aaa)", borderRadius: 6,
+                  background: "var(--paper-soft, #fafaf7)", opacity: 0.85,
+                }}>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontFamily: "monospace", fontSize: 13, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis" }}>
+                      {p.email}
+                      <span className="chip" style={{ marginLeft: 6 }}>einladung gesendet</span>
+                    </div>
+                    <div style={{ marginTop: 3, fontSize: 11, color: "var(--ink-soft)" }}>
+                      rolle: <strong>{p.role}</strong> · wartet auf registrierung mit dieser email
+                    </div>
+                  </div>
+                  {canInvite && (
+                    <button className="btn tiny danger"
+                            onClick={async () => {
+                              try {
+                                await fetch(client.serverUrl + "/api/projects/" + encodeURIComponent(projectId) + "/pending/" + encodeURIComponent(p.email), {
+                                  method: "DELETE",
+                                  headers: { authorization: "Bearer " + client.token },
+                                });
+                                setPending(pending.filter(x => x.email !== p.email));
+                              } catch (_) {}
+                            }}
+                            title="einladung zurückziehen">×</button>
+                  )}
+                </div>
+              ))}
             </div>
           )}
 

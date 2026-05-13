@@ -48,6 +48,21 @@ function createProjectMembershipStore({ db }) {
   db.exec(
     "CREATE INDEX IF NOT EXISTS idx_project_members_user ON project_members(user_id);"
   );
+  // Pending-invites: owner kann auf vorrat einladen, bevor der user
+  // registriert ist. Bei /api/auth/register wird claimPendingForEmail
+  // aufgerufen → invites werden als memberships übernommen + gelöscht.
+  // Löst das "user nicht gefunden"-problem im invite-flow.
+  db.exec(
+    "CREATE TABLE IF NOT EXISTS pending_invites (" +
+      "  email TEXT NOT NULL," +
+      "  project_id TEXT NOT NULL," +
+      "  role TEXT NOT NULL," +
+      "  added_at INTEGER NOT NULL," +
+      "  added_by TEXT," +
+      "  PRIMARY KEY(email, project_id)" +
+      ");"
+  );
+  db.exec("CREATE INDEX IF NOT EXISTS idx_pending_invites_email ON pending_invites(email);");
 
   const upsert = db.prepare(
     "INSERT INTO project_members (project_id, user_id, role, added_at, added_by) " +
@@ -68,6 +83,23 @@ function createProjectMembershipStore({ db }) {
   const select_role = db.prepare(
     "SELECT role FROM project_members WHERE project_id = ? AND user_id = ?"
   );
+  const upsert_pending = db.prepare(
+    "INSERT INTO pending_invites (email, project_id, role, added_at, added_by) " +
+      "VALUES (?, ?, ?, ?, ?) " +
+      "ON CONFLICT(email, project_id) DO UPDATE SET role = excluded.role"
+  );
+  const select_pending_by_project = db.prepare(
+    "SELECT email, role, added_at AS addedAt, added_by AS addedBy " +
+      "FROM pending_invites WHERE project_id = ? ORDER BY added_at ASC"
+  );
+  const select_pending_by_email = db.prepare(
+    "SELECT email, project_id AS projectId, role, added_at AS addedAt, added_by AS addedBy " +
+      "FROM pending_invites WHERE email = ?"
+  );
+  const delete_pending = db.prepare(
+    "DELETE FROM pending_invites WHERE email = ? AND project_id = ?"
+  );
+  const delete_pending_email = db.prepare("DELETE FROM pending_invites WHERE email = ?");
 
   function addMember({ projectId, userId, role, addedBy }) {
     if (!projectId || typeof projectId !== "string") {
@@ -117,7 +149,59 @@ function createProjectMembershipStore({ db }) {
     return ROLE_RANK[role] >= ROLE_RANK[minRole];
   }
 
-  return { addMember, removeMember, listMembers, listProjectsForUser, getRole, hasRole };
+  function _normalizeEmail(email) {
+    return String(email || "").trim().toLowerCase();
+  }
+
+  function addPendingInvite({ projectId, email, role, addedBy }) {
+    if (!projectId) throw new Error("addPendingInvite: 'projectId' erforderlich");
+    const normalized = _normalizeEmail(email);
+    if (!normalized || !/@/.test(normalized)) {
+      throw new Error("addPendingInvite: 'email' erforderlich");
+    }
+    assertValidRole(role);
+    const addedAt = Date.now();
+    upsert_pending.run(normalized, projectId, role, addedAt, addedBy || null);
+    return { email: normalized, projectId, role, addedAt, addedBy: addedBy || null };
+  }
+
+  function listPendingForProject(projectId) {
+    if (!projectId) return [];
+    return select_pending_by_project.all(String(projectId));
+  }
+
+  function removePendingInvite(projectId, email) {
+    if (!projectId || !email) return;
+    delete_pending.run(_normalizeEmail(email), String(projectId));
+  }
+
+  // Wird beim register() aufgerufen — alle pending-invites für diese email
+  // werden zu memberships, dann gelöscht. Idempotent: doppelte addMember per
+  // upsert ist no-op.
+  function claimPendingForEmail(email, userId) {
+    const normalized = _normalizeEmail(email);
+    if (!normalized || !userId) return [];
+    const rows = select_pending_by_email.all(normalized);
+    const claimed = [];
+    for (const row of rows) {
+      try {
+        const m = addMember({
+          projectId: row.projectId, userId, role: row.role, addedBy: row.addedBy,
+        });
+        claimed.push(m);
+      } catch (e) {
+        // FK-fehler etc. — skip, weiter mit nächstem
+        continue;
+      }
+    }
+    if (claimed.length > 0) delete_pending_email.run(normalized);
+    return claimed;
+  }
+
+  return {
+    addMember, removeMember, listMembers, listProjectsForUser, getRole, hasRole,
+    addPendingInvite, listPendingForProject, removePendingInvite, claimPendingForEmail,
+  };
 }
 
 module.exports = { createProjectMembershipStore, ROLES };
