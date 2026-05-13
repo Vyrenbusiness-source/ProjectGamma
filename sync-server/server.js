@@ -1584,9 +1584,11 @@ app.post("/api/auth/register", async (req, res) => {
   // bestehenden projekte. Damit ein angreifer auf einem öffentlich
   // erreichbaren server nicht den account klauen kann: erste registrierung
   // muss von localhost kommen.
-  const isLocal =
-    ip === "127.0.0.1" || ip === "::1" || ip === "::ffff:127.0.0.1" ||
-    ip.startsWith("127.") || req.hostname === "localhost";
+  // SECURITY-FIX: vorher inline-check mit ||-or-logik konnte über
+  // cloudflare-tunnel umgangen werden (req.ip = 127.0.0.1 via cloudflared
+  // → isLocal=true trotz fremdem origin). Jetzt zentraler helper der
+  // ip+host BEIDES prüft.
+  const isLocal = isLocalRequest(req);
   let anyMembership = false;
   if (memberships) {
     for (const p of (state.projects || [])) {

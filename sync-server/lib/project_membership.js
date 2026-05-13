@@ -178,6 +178,11 @@ function createProjectMembershipStore({ db }) {
   // Wird beim register() aufgerufen — alle pending-invites für diese email
   // werden zu memberships, dann gelöscht. Idempotent: doppelte addMember per
   // upsert ist no-op.
+  // Bug-fix: vorher wurden ALLE pending mit delete_pending_email gelöscht
+  // sobald mind. 1 claim erfolgreich war. Wenn 3 pending vorhanden und 1
+  // failed (z.b. weil projekt gelöscht wurde), wurde das fehlgeschlagene
+  // auch gelöscht und damit unwiederbringlich verloren. Jetzt: nur die
+  // erfolgreich übernommenen werden per (email, projectId) gelöscht.
   function claimPendingForEmail(email, userId) {
     const normalized = _normalizeEmail(email);
     if (!normalized || !userId) return [];
@@ -189,12 +194,14 @@ function createProjectMembershipStore({ db }) {
           projectId: row.projectId, userId, role: row.role, addedBy: row.addedBy,
         });
         claimed.push(m);
+        // einzeln pro (email, projectId) löschen — failed-claims bleiben
+        // als pending stehen.
+        delete_pending.run(normalized, String(row.projectId));
       } catch (e) {
-        // FK-fehler etc. — skip, weiter mit nächstem
+        // FK-fehler etc. — skip, pending bleibt für späteren retry
         continue;
       }
     }
-    if (claimed.length > 0) delete_pending_email.run(normalized);
     return claimed;
   }
 
