@@ -129,6 +129,23 @@ function createUsersStore({ db }) {
     return Number(info.changes || 0);
   }
 
+  // Admin: passwort eines users zurücksetzen. Owner-flow: nur via localhost
+  // erreichbar (server.js gated). Existing sessions des users werden NICHT
+  // automatisch revoked — beim nächsten /api/auth/me-call würden alte tokens
+  // weiter funktionieren bis TTL. Wer hartes logout will: separate
+  // revoke-all-sessions-funktion.
+  const update_password = db.prepare(
+    "UPDATE users SET password_hash = ? WHERE email = ?"
+  );
+  function adminResetPassword({ email, passwordHash }) {
+    const normalized = normalizeEmail(email);
+    if (!passwordHash || typeof passwordHash !== "string") {
+      throw new Error("adminResetPassword: 'passwordHash' erforderlich");
+    }
+    const info = update_password.run(passwordHash, normalized);
+    return Number(info.changes || 0) > 0;
+  }
+
   return {
     registerUser,
     findUserByEmail,
@@ -137,6 +154,7 @@ function createUsersStore({ db }) {
     resolveSession,
     revokeSession,
     purgeExpired,
+    adminResetPassword,
   };
 }
 

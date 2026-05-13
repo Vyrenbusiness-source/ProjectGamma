@@ -58,9 +58,12 @@ function emitPush(event) {
 // Rate-Limit für /api/pair/claim: schützt den 6-stelligen Code vor Brute-Force.
 const claimRateLimiter = createClaimRateLimiter();
 // Rate-Limit für /api/auth/login: schützt user-passwörter vor brute-force.
+// 20 fails / 5min ist genug schutz gegen brute, lässt aber owner+team
+// ausreichend platz für vertipper. Lokale requests umgehen den limiter
+// komplett (kein anti-brute-force gegen sich selbst nötig).
 // Strenger als pair-claim (kürzeres window, weniger fails) — login ist deutlich
 // schwerer zu erraten als ein 6-stelliger code, also wirkt das limit härter.
-const loginRateLimiter = createClaimRateLimiter({ windowMs: 5 * 60 * 1000, maxFails: 5 });
+const loginRateLimiter = createClaimRateLimiter({ windowMs: 5 * 60 * 1000, maxFails: 20 });
 
 const PORT = Number(process.env.PORT) || 7892;
 // TLS bootstrap (default off; aktiv via TLS=1). Self-signed cert in ./tls/.
@@ -1640,25 +1643,37 @@ app.post("/api/auth/register", async (req, res) => {
 app.post("/api/auth/login", async (req, res) => {
   if (!usersStore) return res.status(503).json({ error: "multi-user nicht aktiv" });
   const ip = req.ip || req.connection?.remoteAddress || "unknown";
-  const gate = loginRateLimiter.check(ip);
-  if (!gate.allowed) {
-    res.set("Retry-After", String(gate.retryAfterSec));
-    return res.status(429).json({
-      error: "zu viele fehlversuche, später erneut probieren",
-      retryAfterSec: gate.retryAfterSec,
-    });
+  // Owner auf localhost umgeht den rate-limiter — sonst sperrt er sich
+  // selbst aus bei vertippern. Nur fremde IPs (über tunnel/LAN) sind
+  // limit-relevant (brute-force-schutz).
+  const isLocal = isLocalRequest(req);
+  if (!isLocal) {
+    const gate = loginRateLimiter.check(ip);
+    if (!gate.allowed) {
+      res.set("Retry-After", String(gate.retryAfterSec));
+      return res.status(429).json({
+        error: "zu viele fehlversuche, später erneut probieren",
+        retryAfterSec: gate.retryAfterSec,
+      });
+    }
   }
   const { email, password } = req.body || {};
   if (!_emailValid(email) || !password || typeof password !== "string") {
-    loginRateLimiter.recordFailure(ip);
+    if (!isLocal) loginRateLimiter.recordFailure(ip);
     return res.status(400).json({ error: "email + passwort erforderlich" });
   }
   const user = usersStore.findUserByEmail(email);
-  // timing-anfällige antwort vermeiden: bei unbekanntem user trotzdem hash-cost
-  // simulieren wäre overkill; wir geben einfach „ungültige zugangsdaten".
-  if (!user || !verifyPassword(password, user.passwordHash)) {
-    loginRateLimiter.recordFailure(ip);
-    return res.status(401).json({ error: "ungültige zugangsdaten" });
+  // Bessere fehler-unterscheidung: wenn die email nicht registriert ist,
+  // sagen wir das. Sonst sagen wir 'passwort falsch'. Auf einem öffentlichen
+  // server wäre das email-enumeration risiko — auf einem personal-server
+  // mit single-digit users ist die klarheit für den user wichtiger.
+  if (!user) {
+    if (!isLocal) loginRateLimiter.recordFailure(ip);
+    return res.status(404).json({ error: "email nicht registriert — erst auf 'registrieren' klicken oder vertippt?" });
+  }
+  if (!verifyPassword(password, user.passwordHash)) {
+    if (!isLocal) loginRateLimiter.recordFailure(ip);
+    return res.status(401).json({ error: "passwort falsch" });
   }
   const sess = usersStore.createSession({ userId: user.id, ttlMs: USER_SESSION_TTL_MS });
   console.log("[auth] login:", user.email);
@@ -1667,6 +1682,35 @@ app.post("/api/auth/login", async (req, res) => {
     user: { id: user.id, email: user.email, createdAt: user.createdAt },
     expiresAt: sess.expiresAt,
   });
+});
+
+// Admin-reset-password — localhost-only. Owner kann am desktop einen
+// vergessenen account-password zurücksetzen (eigenen oder eingeladenen).
+// Schutz: nur von 127.0.0.1 + localhost-hostname (isLocalRequest).
+app.post("/api/auth/admin-reset-password", async (req, res) => {
+  if (!usersStore) return res.status(503).json({ error: "multi-user nicht aktiv" });
+  if (!isLocalRequest(req)) {
+    return res.status(403).json({ error: "passwort-reset nur vom desktop/localhost — auf deinem rechner einloggen, dort resetten" });
+  }
+  const { email, newPassword } = req.body || {};
+  if (!_emailValid(email)) return res.status(400).json({ error: "email ungültig" });
+  if (!newPassword || typeof newPassword !== "string" || newPassword.length < 8) {
+    return res.status(400).json({ error: "neues passwort muss mind. 8 zeichen sein" });
+  }
+  if (!usersStore.findUserByEmail(email)) {
+    return res.status(404).json({ error: "email nicht registriert" });
+  }
+  let hash;
+  try { hash = hashPassword(newPassword); }
+  catch (e) { return res.status(400).json({ error: e.message }); }
+  try {
+    const ok = usersStore.adminResetPassword({ email, passwordHash: hash });
+    if (!ok) return res.status(404).json({ error: "reset fehlgeschlagen" });
+    console.log("[auth] admin-reset password:", email);
+    res.json({ ok: true, email: String(email).trim().toLowerCase() });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.post("/api/auth/logout", (req, res) => {
