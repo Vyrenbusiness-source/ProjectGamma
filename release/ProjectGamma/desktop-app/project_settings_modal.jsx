@@ -91,6 +91,17 @@
                          const v = e.target.value.trim();
                          if (v !== (project.path || "")) patch({ path: v });
                        }} />
+                {project.path && project.pathValid === false && (
+                  <div style={{ marginTop: 4, fontSize: 11, color: "var(--danger, #c33)" }}>
+                    ⚠ pfad existiert nicht auf diesem rechner — cloud-code kann hier nicht arbeiten.
+                    {" "}bei team-collab: pfad pro rechner anpassen.
+                  </div>
+                )}
+                {project.path && project.pathValid === true && (
+                  <div style={{ marginTop: 4, fontSize: 11, color: "var(--ok, #2a8)" }}>
+                    ✓ pfad gefunden
+                  </div>
+                )}
               </div>
             </section>
 
@@ -130,6 +141,31 @@
                     </li>
                   ))}
                 </ul>
+              )}
+              {goals.length > 0 && (
+                <button className="btn tiny"
+                  style={{ marginTop: 8 }}
+                  title="cc generiert milestones + tasks aus den zielen"
+                  onClick={async () => {
+                    if (!confirm("aus den " + goals.length + " zielen einen task-plan generieren? (1× claude-call, ~$0.20)")) return;
+                    try {
+                      const t = window.sync?.token || "";
+                      const r = await fetch(window.sync.serverUrl + "/api/projects/" + encodeURIComponent(project.id) + "/plan-from-goals", {
+                        method: "POST",
+                        headers: { "content-type": "application/json", authorization: "Bearer " + t },
+                      });
+                      const data = await r.json().catch(() => ({}));
+                      if (r.ok) {
+                        alert("✓ auto-plan gestartet. tasks erscheinen gleich im aufgaben-tab.");
+                      } else {
+                        alert("⚠ " + (data.error || ("fehler " + r.status)));
+                      }
+                    } catch (e) {
+                      alert("⚠ " + (e.message || "fehler"));
+                    }
+                  }}>
+                  ✨ aus zielen tasks generieren (auto-plan)
+                </button>
               )}
             </section>
 

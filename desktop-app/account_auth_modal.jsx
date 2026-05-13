@@ -165,7 +165,7 @@
               <div style={{ marginTop: 14, fontSize: 11, color: "var(--ink-faint)", lineHeight: 1.5 }}>
                 {mode === "reset"
                   ? "passwort-reset funktioniert NUR auf dem desktop-rechner des team-owners (localhost). über tunnel/team-server geht es absichtlich nicht — sicherheit. falls du gast bist: frag den owner."
-                  : "hinweis: der allererste registrierte user wird automatisch owner aller bestehenden projekte. weitere user müssen vom owner eingeladen werden („👥 mitglieder")."}
+                  : 'hinweis: der allererste registrierte user wird automatisch owner aller bestehenden projekte. weitere user müssen vom owner eingeladen werden („👥 mitglieder").'}
               </div>
               <div className="footer">
                 <button className="btn" onClick={onClose} disabled={busy}>abbrechen</button>

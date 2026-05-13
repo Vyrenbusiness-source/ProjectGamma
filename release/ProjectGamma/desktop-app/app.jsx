@@ -8,6 +8,72 @@ const { useState, useEffect, useMemo, useRef, useCallback, useSyncExternalStore 
 
 const RULE_CATS    = ["code-stil", "architektur", "workflow"];
 
+// Theme-toggle: light (default) ↔ "dim" (soft-dark). Persistiert in
+// localStorage und wird sofort beim mount auf <html data-theme> appliziert.
+// Spec aus user: ähnlich wie dark-mode aber besser aussehend — daher
+// warm-gray statt knall-schwarz (siehe styles.css [data-theme="dim"]).
+function applyTheme(theme) {
+  try {
+    document.documentElement.setAttribute("data-theme", theme === "dim" ? "dim" : "");
+    localStorage.setItem("pg-theme", theme);
+  } catch (_) {}
+}
+// Initial apply NOCH BEVOR React mountet, damit kein flash.
+// Default: "dim" (soft-dark) — user-request: dark als standard.
+(function() {
+  try {
+    const t = localStorage.getItem("pg-theme") || "dim";
+    if (t === "dim") document.documentElement.setAttribute("data-theme", "dim");
+  } catch (_) {
+    // localStorage nicht verfügbar → trotzdem dim als default
+    document.documentElement.setAttribute("data-theme", "dim");
+  }
+})();
+// Server-restart-banner: server.publicState liefert serverBootTs. Wenn
+// der wert sich seit erstem connect ändert → server wurde neu gestartet
+// (vermutlich nach owner-update via update.bat). Wir zeigen einen banner
+// mit reload-button. KEIN auto-reload — würde user-drafts vernichten.
+function UpdateAvailableBanner({ state }) {
+  const [firstBoot, setFirstBoot] = useState(null);
+  const currentBoot = state && state.serverBootTs;
+  useEffect(() => {
+    if (currentBoot && firstBoot == null) setFirstBoot(currentBoot);
+  }, [currentBoot]);
+  if (!currentBoot || firstBoot == null) return null;
+  if (currentBoot === firstBoot) return null;
+  return (
+    <button
+      onClick={() => window.location.reload()}
+      title="server wurde neu gestartet — wahrscheinlich nach update.bat. neu laden um die aktuelle UI zu sehen."
+      style={{
+        background: "var(--accent, #2a8a3a)", color: "var(--paper)",
+        border: "none", borderRadius: 4, padding: "3px 10px",
+        fontFamily: "inherit", fontSize: 12, cursor: "pointer",
+        animation: "pulse 1.8s ease-in-out infinite",
+      }}>
+      🔄 update verfügbar · neu laden
+    </button>
+  );
+}
+
+function ThemeToggle() {
+  const [theme, setTheme] = useState(() => {
+    try { return localStorage.getItem("pg-theme") || "dim"; }
+    catch (_) { return "dim"; }
+  });
+  const toggle = () => {
+    const next = theme === "dim" ? "light" : "dim";
+    setTheme(next);
+    applyTheme(next);
+  };
+  return (
+    <button className="theme-toggle" onClick={toggle}
+            title={theme === "dim" ? "auf hell wechseln" : "auf dim (soft-dark) wechseln"}>
+      {theme === "dim" ? "☀ hell" : "🌙 dim"}
+    </button>
+  );
+}
+
 // Empfohlene Best-Practice-Regeln, die der User per Klick aktivieren kann.
 // Werden nicht doppelt angelegt (nach lowercase-trim Vergleich).
 const SUGGESTED_RULES = [
@@ -118,18 +184,40 @@ function Editable({ value, onChange, multiline = false, placeholder, className =
 // Wird gezeigt wenn keine Desktop-Session existiert (also beim allerersten Start
 // oder wenn Server unerreichbar). Versucht zuerst self-init mit Default-URL.
 function BootPairing({ onReady }) {
+  // ZWEI MODI:
+  // (a) "self" — default. Lokaler server, selfInit() = pair-token via /api/pair/desktop-init
+  //     (localhost-only-gated server-seitig). Klappt nur wenn du dein eigenes
+  //     start.bat gestartet hast.
+  // (b) "team" — wenn du auf einem TEAM-server eines anderen kollegen mitarbeitest.
+  //     Kein selfInit (würde 403 geben), sondern direkt zum AccountAuthModal
+  //     mit der team-URL. Du registrierst/loginst dich auf dem fremden server.
+  const [mode, setMode] = useState("self");
   const [serverUrl, setServerUrl] = useState(sync.serverUrl);
+  const [teamUrl, setTeamUrl] = useState("");
   const [status, setStatus] = useState("connecting");
   const [error, setError] = useState(null);
+  const [showAccountForTeam, setShowAccountForTeam] = useState(false);
 
-  const tryInit = useCallback(async () => {
+  const trySelfInit = useCallback(async () => {
     setStatus("connecting"); setError(null);
     try {
-      // Health-Check zuerst — sync.serverUrl wird erst NACH erfolg gesetzt,
-      // damit der client nicht mit einer kaputten URL hängenbleibt wenn der
-      // user eine falsche eingibt + nachträglich korrigiert.
       const r = await fetch(serverUrl + "/health").then(r => r.json()).catch(() => null);
       if (!r || !r.ok) throw new Error("server nicht erreichbar unter " + serverUrl);
+      // Wenn server meldet isLocal=false (wir kommen über tunnel/FQDN rein),
+      // KEIN selfInit versuchen — der gibt 403 und ein fremder pair-token
+      // wäre eh ein security-leak. Stattdessen: AUTO direkt account-register
+      // öffnen mit der server-URL vorbefüllt. So muss der team-kollege nur
+      // die geteilte tunnel-URL öffnen und sich registrieren — keine
+      // zwischenklicks nötig.
+      if (r.isLocal === false) {
+        setMode("team");
+        setTeamUrl(serverUrl);
+        sync.serverUrl = serverUrl;
+        localStorage.setItem("projectgamma.sync.url", serverUrl);
+        setStatus("idle");
+        setShowAccountForTeam(true);
+        return;
+      }
       sync.serverUrl = serverUrl;
       await sync.selfInit();
       sync.connect();
@@ -141,39 +229,118 @@ function BootPairing({ onReady }) {
     }
   }, [serverUrl, onReady]);
 
-  // Auto-Versuch beim Mount (nur). Bei manueller url-änderung klickt der user
-  // den "erneut versuchen"-button → onClick nutzt latest closure (kein stale).
+  const tryJoinTeam = useCallback(async () => {
+    setStatus("connecting"); setError(null);
+    try {
+      const url = teamUrl.trim().replace(/\/+$/, "");
+      if (!url.startsWith("http")) throw new Error("URL muss mit http(s):// beginnen");
+      const r = await fetch(url + "/health").then(r => r.json()).catch(() => null);
+      if (!r || !r.ok) throw new Error("server nicht erreichbar unter " + url);
+      // serverUrl IM CLIENT setzen, aber KEIN selfInit (würde 403 geben).
+      // Stattdessen account-modal aufrufen mit dieser url als kontext.
+      sync.serverUrl = url;
+      localStorage.setItem("projectgamma.sync.url", url);
+      setStatus("idle");
+      setShowAccountForTeam(true);
+    } catch (e) {
+      setStatus("error");
+      setError(e.message || String(e));
+    }
+  }, [teamUrl]);
+
+  // Auto-Versuch beim Mount NUR in mode=self. Bei team braucht der user erst die URL.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  useEffect(() => { tryInit(); }, []);
+  useEffect(() => { if (mode === "self") trySelfInit(); }, []);
+
+  // Wenn account-modal nach team-join geschlossen wird → onReady aufrufen wenn token jetzt da
+  const checkSessionReady = useCallback(() => {
+    setShowAccountForTeam(false);
+    if (sync.token) {
+      sync.connect();
+      setTimeout(() => onReady(), 250);
+    }
+  }, [onReady]);
 
   return (
     <div className="boot">
       <div className="boot-card">
         <div className="eyebrow">// projectgamma · desktop</div>
-        <h1 className="h1" style={{ marginTop: 6 }}>verbinde mit sync-server</h1>
-        <div style={{ color: "var(--ink-soft)", fontSize: 13, marginTop: 4 }}>
-          desktop authentifiziert sich automatisch beim lokalen server (vertrauter context).
+        <h1 className="h1" style={{ marginTop: 6 }}>willkommen</h1>
+
+        {/* Mode-toggle: eigener server vs team beitreten */}
+        <div style={{ display: "flex", gap: 6, marginTop: 14 }}>
+          <button className={"btn tiny" + (mode === "self" ? " primary" : "")}
+                  onClick={() => { setMode("self"); setError(null); setStatus("idle"); }}>
+            🏠 eigener server (lokal)
+          </button>
+          <button className={"btn tiny" + (mode === "team" ? " primary" : "")}
+                  onClick={() => { setMode("team"); setError(null); setStatus("idle"); }}>
+            👥 team beitreten (anderer server)
+          </button>
         </div>
 
         <hr className="div" style={{ margin: "18px 0" }} />
 
-        <label className="field">
-          <span className="eyebrow">server-url</span>
-          <input className="input big" value={serverUrl} onChange={e => setServerUrl(e.target.value)} />
-        </label>
+        {mode === "self" && (
+          <>
+            <div style={{ color: "var(--ink-soft)", fontSize: 13, marginBottom: 12 }}>
+              desktop authentifiziert sich automatisch beim lokalen server. nur lokal
+              erreichbar — für team-collab oben „team beitreten" wählen.
+            </div>
+            <label className="field">
+              <span className="eyebrow">server-url</span>
+              <input className="input big" value={serverUrl} onChange={e => setServerUrl(e.target.value)} />
+            </label>
+            <div className="boot-status">
+              {status === "connecting" && <span className="cc-dot live">verbinde…</span>}
+              {status === "ready"      && <span className="cc-dot live">erfolgreich verbunden</span>}
+              {status === "error"      && <span style={{ color: "#c33" }}>⚠ {error}</span>}
+            </div>
+            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 14 }}>
+              <button className="btn" onClick={trySelfInit} disabled={status === "connecting"}>
+                {status === "error" ? "erneut versuchen" : "verbinden"}
+              </button>
+            </div>
+          </>
+        )}
 
-        <div className="boot-status">
-          {status === "connecting" && <span className="cc-dot live">verbinde…</span>}
-          {status === "ready"      && <span className="cc-dot live">erfolgreich verbunden</span>}
-          {status === "error"      && <span style={{ color: "#c33" }}>⚠ {error}</span>}
-        </div>
-
-        <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 14 }}>
-          <button className="btn" onClick={tryInit} disabled={status === "connecting"}>
-            {status === "error" ? "erneut versuchen" : "verbinden"}
-          </button>
-        </div>
+        {mode === "team" && (
+          <>
+            <div style={{ color: "var(--ink-soft)", fontSize: 13, marginBottom: 12 }}>
+              du tritt einem team bei, das auf einem ANDEREN server läuft.<br />
+              dein kollege hat dir eine team-url geschickt (z.B. cloudflared tunnel
+              oder LAN-IP). du registrierst dich dort + er muss dich noch als
+              mitglied einladen.
+            </div>
+            <label className="field">
+              <span className="eyebrow">team-server-url</span>
+              <input className="input big" value={teamUrl}
+                     placeholder="https://abc.trycloudflare.com  oder  http://192.168.1.42:7892"
+                     onChange={e => setTeamUrl(e.target.value)}
+                     onKeyDown={e => { if (e.key === "Enter") tryJoinTeam(); }} />
+            </label>
+            <div className="boot-status">
+              {status === "connecting" && <span className="cc-dot live">prüfe server…</span>}
+              {status === "error"      && <span style={{ color: "#c33" }}>⚠ {error}</span>}
+            </div>
+            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 14 }}>
+              <button className="btn primary" onClick={tryJoinTeam}
+                      disabled={status === "connecting" || !teamUrl.trim()}>
+                weiter zum login →
+              </button>
+            </div>
+          </>
+        )}
       </div>
+
+      {/* AccountAuthModal nach erfolgreichem team-server-check */}
+      {showAccountForTeam && window.AccountAuthModal && (
+        <window.AccountAuthModal
+          onClose={checkSessionReady}
+          initialMode="register"
+          contextHint={`du verbindest dich mit einem team-server (${sync.serverUrl}). registriere einen account, danach kann dich der team-owner zu projekten einladen.`}
+        />
+      )}
     </div>
   );
 }
@@ -230,19 +397,24 @@ function PairCodeModal({ onClose }) {
   const sessionsBefore = useRef(null);
 
   useEffect(() => { fetchLanInfo(client.serverUrl).then(setLanInfo); }, [client.serverUrl]);
-  // Tunnel-status laden + alle 3s pollen während starting/active.
+  // Tunnel-status laden + nur pollen während starting/active.
+  // Fix: vorher pollte er auch im idle-status alle 3s → unnötige requests.
+  // Jetzt: initial-fetch + interval nur wenn status transitioning, und
+  // pause wenn tab nicht sichtbar (saves CPU im hintergrund).
   useEffect(() => {
     let alive = true;
     async function poll() {
+      if (document.hidden) return;
       try {
         const r = await fetch(client.serverUrl + "/api/tunnel/status").then(r => r.json());
         if (alive) setTunnel(r);
       } catch (_) {}
     }
     poll();
-    const iv = setInterval(poll, 3000);
-    return () => { alive = false; clearInterval(iv); };
-  }, [client.serverUrl]);
+    const shouldPoll = tunnel.status === "starting" || tunnel.status === "active";
+    const iv = shouldPoll ? setInterval(poll, 3000) : null;
+    return () => { alive = false; if (iv) clearInterval(iv); };
+  }, [client.serverUrl, tunnel.status]);
 
   const toggleTunnel = async () => {
     setTunnelBusy(true);
@@ -483,27 +655,61 @@ function Sidebar({ projects, activeId, onSelect, onNew, ccRunning }) {
     if (!!b.starred - !!a.starred) return !!b.starred - !!a.starred;
     return (a.name || "").localeCompare(b.name || "");
   });
+  // Aktueller user für die user-card unten in sidebar (mockup-style).
+  // Bevorzugt account-email (deviceName=email nach login), fallback pair-deviceName.
+  const myEmail = (sync.deviceName && /@/.test(sync.deviceName))
+    ? sync.deviceName
+    : (sync.deviceName || "desktop");
+  const initial = (myEmail.match(/^./) || ["?"])[0].toUpperCase();
+  const displayName = /@/.test(myEmail)
+    ? myEmail.split("@")[0]
+    : myEmail;
   return (
     <div className="side">
-      <div className="eyebrow">// projekte</div>
-      {sorted.map(p => (
+      <div className="eyebrow">Projekte</div>
+      {sorted.map(p => {
+        // D4 · Live-counts pro projekt — auf den ersten blick sichtbar
+        const openTasks = (p.tasks || []).filter(t => !t.done).length;
+        const unprocIdeas = (p.ideas || []).filter(i => i.status === "unprocessed").length;
+        const openBugs = (p.bugs || []).filter(b => b.status === "pending").length;
+        const pendingDiffs = (p.ruleDiffs || []).filter(d => d.status === "pending").length;
+        const hasAttention = openBugs > 0 || pendingDiffs > 0;
+        return (
         <div key={p.id}
              className={"proj-item" + (p.id === activeId ? " active" : "")}
-             onClick={() => onSelect(p.id)}>
+             onClick={() => onSelect(p.id)}
+             title={`${openTasks} offene aufgaben · ${unprocIdeas} ideen${openBugs ? ` · ${openBugs} bugs` : ""}${pendingDiffs ? ` · ${pendingDiffs} regel-diffs` : ""}`}>
           <span className="star"
                 title={p.starred ? "stern entfernen" : "favorit setzen"}
                 onClick={e => { e.stopPropagation(); sync.mutate("TOGGLE_STAR", { projectId: p.id }); }}>
             {p.starred ? "★" : "☆"}
           </span>
-          <span className="name">{p.name}</span>
+          <div className="proj-info">
+            <span className="name">{p.name}</span>
+            <span className="proj-counts">
+              {openTasks > 0 && <span className="proj-count">✓{openTasks}</span>}
+              {unprocIdeas > 0 && <span className="proj-count">💡{unprocIdeas}</span>}
+              {hasAttention && <span className="proj-count attention" title="braucht aufmerksamkeit">!{openBugs + pendingDiffs}</span>}
+            </span>
+          </div>
         </div>
-      ))}
-      <button className="new-btn" onClick={onNew}>+ neues projekt</button>
+        );
+      })}
+      <button className="new-btn" onClick={onNew}>+ Neues Projekt</button>
 
       <div className="cc-ambient">
         <span className={"cc-dot" + (ccRunning ? " live" : "")}>
           cloud-code · {ccRunning ? "arbeitet" : "pause"}
         </span>
+      </div>
+
+      {/* User-card unten (mockup-style: avatar + name + email) */}
+      <div className="side-user-card">
+        <div className="avatar">{initial}</div>
+        <div className="user-info">
+          <div className="user-name">{displayName}</div>
+          <div className="user-email">{myEmail}</div>
+        </div>
       </div>
     </div>
   );
@@ -601,21 +807,22 @@ function MainHead({ project, activeTab, onTab, onAction, onDelete }) {
             </>
           )}
         </div>
-        <div className="actions" style={{ flexShrink: 0 }}>
-          {/* Primäre actions — täglich gebraucht */}
+        <div className="actions actions-bar" style={{ flexShrink: 0 }}>
+          {/* D2 · Klare hierarchie:
+              1× PRIMARY (handy verbinden — täglich, auffälligste action)
+              2× SECONDARY-ICON (mitglieder, account — situativ)
+              Rest in OVERFLOW-MENU (⋯) — settings, openIDE, export, sync, löschen, etc. */}
           <button className="btn tiny primary" onClick={() => onAction("pairMobile")} title="QR + 6-stelliger code für mobile-gerät">+ handy verbinden</button>
-          <button className="btn tiny" onClick={() => onAction("openMembers")} title="mitglieder einladen / verwalten">👥 mitglieder</button>
-          <button className="btn tiny" onClick={() => onAction("openAuth")} title="login / registrieren / abmelden">🔐 login</button>
-          <button className="btn tiny" onClick={() => onAction("openSettings")} title="API-keys · claude CLI · globale settings">⚙ settings</button>
-          {/* Sekundär — selten gebraucht, in dropdown */}
+          <button className="btn tiny icon-only" onClick={() => onAction("openMembers")} title="mitglieder einladen / verwalten">👥</button>
+          <button className="btn tiny icon-only" onClick={() => onAction("openAuth")} title="account · login / registrieren">🔐</button>
+          {/* Overflow-Menu — inkl. settings (war primary, ist eigentlich rare) */}
           {window.MoreMenu
             ? <window.MoreMenu onAction={onAction} onDelete={onDelete} hasPath={!!project.path} />
             : (
               <button className="btn tiny" onClick={() => onAction("openSettings")} title="weitere actions">⋯</button>
             )}
-          {/* Header-einklapp toggle — versteckt beschreibung, ziele-preview, pfad
-              um vertikalen platz zu sparen wenn man viel scrollt. */}
-          <button className="btn tiny" onClick={toggleCollapsed}
+          {/* Header-collapse-toggle bleibt sichtbar */}
+          <button className="btn tiny icon-only" onClick={toggleCollapsed}
                   title={collapsed ? "header ausklappen" : "header einklappen (beschreibung+pfad verstecken)"}>
             {collapsed ? "⌄" : "⌃"}
           </button>
@@ -743,7 +950,8 @@ function SuggestionsAndBugs({ project }) {
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
             <span className="eyebrow">// bugs {pendingBugs.length > 0 && <span className="chip" style={{ marginLeft: 6, color: "#c33", borderColor: "#c33" }}>{pendingBugs.length}</span>}</span>
             <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
-              <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 11, color: "var(--ink-soft)", cursor: "pointer" }}>
+              <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 11, color: "var(--ink-soft)", cursor: "pointer" }}
+                     title="alle 30min auto-scan + neue bugs werden automatisch zu cc-tasks">
                 <input type="checkbox" checked={!!project.bugAutoFix} onChange={toggleAutoFix} />
                 auto-fix
               </label>
@@ -789,77 +997,224 @@ function SuggestionsAndBugs({ project }) {
 }
 
 // ─── Screen: Übersicht ────────────────────────────────────────
-function OnboardStep({ n, title, body, cta, onClick }) {
+// D5 · OnboardingBlock: zeigt 3-schritte-card prominent solange noch nicht
+// alle erledigt sind. Sobald alle 3 mindestens 1× erledigt sind → auto-collapse
+// auf eine kompakte "✓ onboarding fertig"-zeile. User kann manuell ausklappen.
+function OnboardingBlock({ project, myEmail, onSetTab, onOpenMembers }) {
+  const dismissKey = "pg-onboarding-dismissed-" + project.id;
+  const [manualDismissed, setManualDismissed] = useState(() => {
+    try { return localStorage.getItem(dismissKey) === "1"; }
+    catch (_) { return false; }
+  });
+
+  // Echte completion-detection aus state
+  const hasIdeas = (project.ideas || []).length > 0;
+  const memberCount = (project.members || []).length;
+  const hasTeam = memberCount > 1; // owner zählt mit, > 1 = mindestens 1 eingeladen
+  const hasMessages = (project.activity || []).some(a => a.type === "chat" || a.type === "msg");
+
+  const allDone = hasIdeas && hasTeam && hasMessages;
+  const progress = [hasIdeas, hasTeam, hasMessages].filter(Boolean).length;
+  const collapsed = allDone || manualDismissed;
+
+  // Bug-fix: vorher verschwand MiniChat wenn onboarding collapsed → user
+  // dachte chat sei weg. jetzt: kollabierte version zeigt nur kompakte
+  // bar + MiniChat darunter (full width).
+  if (collapsed) {
+    return (
+      <>
+        <div className="box" style={{
+          marginBottom: 14, padding: "8px 14px",
+          display: "flex", alignItems: "center", gap: 10,
+          fontSize: 12, color: "var(--ink-soft)",
+        }}>
+          <span style={{ fontSize: 14 }}>{allDone ? "✓" : "·"}</span>
+          <span style={{ flex: 1 }}>
+            {allDone ? "onboarding abgeschlossen · alle 3 schritte fertig" : "onboarding minimiert"}
+          </span>
+          <button className="btn tiny" onClick={() => {
+            try { localStorage.removeItem(dismissKey); } catch (_) {}
+            setManualDismissed(false);
+          }}>einblenden</button>
+        </div>
+        <MiniChat project={project} myEmail={myEmail} onSetTab={onSetTab} />
+      </>
+    );
+  }
+
   return (
-    <div style={{ padding: 10, border: "1.5px solid var(--line)", borderRadius: 6, background: "var(--paper)" }}>
+    <div className="two-col">
+      <div className="box">
+        <div style={{ display: "flex", alignItems: "center", marginBottom: 4 }}>
+          <div className="eyebrow" style={{ flex: 1 }}>// los geht's · {progress}/3 schritte</div>
+          <button className="btn tiny" title="onboarding ausblenden" onClick={() => {
+            try { localStorage.setItem(dismissKey, "1"); } catch (_) {}
+            setManualDismissed(true);
+          }}>×</button>
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 10, marginTop: 4 }}>
+          <OnboardStep n="1" title="idee erfassen"
+            body="im ideen-tab tippst du was dir gerade einfällt. später machst du daraus aufgaben."
+            cta="→ ideen-tab" onClick={() => onSetTab && onSetTab("ideas")}
+            done={hasIdeas} />
+          <OnboardStep n="2" title="team einladen"
+            body={"oben „mitglieder verwalten“ → email eintippen. ihr seht dann beide dieselben aufgaben + chat."}
+            cta="👥 mitglieder" onClick={onOpenMembers}
+            done={hasTeam} />
+          <OnboardStep n="3" title="mit team chatten"
+            body="rechts im chat oder im team-tab: nachrichten, notizen + termine teilen — live synchronisiert."
+            cta="→ team-tab" onClick={() => onSetTab && onSetTab("team")}
+            done={hasMessages} />
+        </div>
+      </div>
+      <MiniChat project={project} myEmail={myEmail} onSetTab={onSetTab} />
+    </div>
+  );
+}
+
+function OnboardStep({ n, title, body, cta, onClick, done }) {
+  return (
+    <div style={{
+      padding: 10, border: "1.5px solid " + (done ? "#2a8a3a" : "var(--line)"),
+      borderRadius: 6,
+      background: done ? "rgba(42,138,58,0.06)" : "var(--paper)",
+      opacity: done ? 0.85 : 1,
+    }}>
       <div style={{ display: "flex", alignItems: "baseline", gap: 6, marginBottom: 4 }}>
         <span style={{
           display: "inline-block", width: 22, height: 22, lineHeight: "22px", textAlign: "center",
-          background: "var(--ink)", color: "var(--paper)", borderRadius: 11,
+          background: done ? "#2a8a3a" : "var(--ink)", color: "var(--paper)", borderRadius: 11,
           fontFamily: "monospace", fontSize: 12, fontWeight: 700,
-        }}>{n}</span>
-        <strong style={{ fontSize: 13.5 }}>{title}</strong>
+        }}>{done ? "✓" : n}</span>
+        <strong style={{ fontSize: 13.5, textDecoration: done ? "line-through" : "none" }}>{title}</strong>
       </div>
       <div style={{ fontSize: 11.5, color: "var(--ink-soft)", lineHeight: 1.5, marginBottom: 8 }}>
         {body}
       </div>
-      {cta && (
+      {cta && !done && (
         <button className="btn tiny" onClick={onClick}
           style={{ fontWeight: 600 }}>{cta}</button>
+      )}
+      {done && (
+        <span style={{ fontSize: 11, color: "#2a8a3a", fontWeight: 600 }}>✓ erledigt</span>
       )}
     </div>
   );
 }
 
-// Stat-Chip: groß zahl + label, klick wechselt tab.
-function StatChip({ label, value, accent, onClick }) {
+// Stat-Chip: icon-left layout (redesign nach mockup) + klick wechselt tab.
+function StatChip({ label, value, icon, accent, onClick }) {
   return (
     <button onClick={onClick}
-            className="stat-chip"
+            className={"statcard-row" + (accent ? " accent" : "")}
             style={{
-              flex: 1, padding: "14px 8px",
-              background: accent ? "var(--ink)" : "var(--paper)",
-              color: accent ? "var(--paper)" : "var(--ink)",
-              border: "2px solid var(--ink)", borderRadius: 10,
               cursor: onClick ? "pointer" : "default",
-              display: "flex", flexDirection: "column", alignItems: "center", gap: 2,
               fontFamily: "inherit",
+              textAlign: "left",
             }}>
-      <span style={{ fontFamily: "JetBrains Mono, monospace", fontSize: 22, fontWeight: 700, lineHeight: 1 }}>
-        {value}
-      </span>
-      <span style={{ fontSize: 10.5, opacity: 0.75, fontFamily: "JetBrains Mono, monospace" }}>
-        {label}
-      </span>
+      <div className="ico">{icon || "·"}</div>
+      <div className="body">
+        <div className="label-block">
+          <div className="label">{label}</div>
+        </div>
+        <div className="value">{value}</div>
+      </div>
     </button>
   );
 }
 
-// Mini-Chat: kompakte preview der letzten 3 nachrichten + input.
+// Mini-Chat: scrollbare preview der letzten 50 nachrichten + input + upload.
 // Draft wird beim projekt-wechsel zurückgesetzt — sonst landet text im falschen projekt.
-function MiniChat({ project, myEmail }) {
+function MiniChat({ project, myEmail, onSetTab }) {
   const [draft, setDraft] = useState("");
-  useEffect(() => { setDraft(""); }, [project.id]);
+  const [authedEmail, setAuthedEmail] = useState(null); // aus /api/auth/me
+  const [uploading, setUploading] = useState(false);
+  const [pendingAttachment, setPendingAttachment] = useState(null);
+  const [uploadError, setUploadError] = useState(null);
+  const listRef = useRef(null);
+  const fileInputRef = useRef(null);
+  useEffect(() => { setDraft(""); setPendingAttachment(null); }, [project.id]);
   const messages = project.messages || [];
-  const last = messages.slice(-3);
+  const last = messages.slice(-50);
+  useEffect(() => {
+    if (listRef.current) listRef.current.scrollTop = listRef.current.scrollHeight;
+  }, [messages.length]);
+
+  // Bug-fix: sync.deviceName kann "desktop" sein (pair-token) während
+  // posts via account-login mit email gemacht wurden → mismatch, alle
+  // nachrichten landen links. Fix: /api/auth/me bei mount fetchen, dann
+  // gegen die TATSÄCHLICHE user-email matchen (preferred über deviceName).
+  useEffect(() => {
+    let cancelled = false;
+    sync.getMe?.().then(m => {
+      if (!cancelled && m && m.user && m.user.email) setAuthedEmail(m.user.email);
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
+  // Effektiver vergleichs-wert für isOwn: was IMMER der currently-authed
+  // user ist, dann fallback auf deviceName (für pair-token-session).
+  const effectiveMyEmail = authedEmail || myEmail;
 
   const send = () => {
     const t = draft.trim();
-    if (!t) return;
-    sync.mutate("ADD_MESSAGE", { projectId: project.id, message: { text: t } });
+    if (!t && !pendingAttachment) return;
+    const message = { text: t };
+    if (pendingAttachment) message.attachment = pendingAttachment;
+    sync.mutate("ADD_MESSAGE", { projectId: project.id, message });
     setDraft("");
+    setPendingAttachment(null);
+    setUploadError(null);
+  };
+
+  const onPickFile = () => { if (fileInputRef.current) fileInputRef.current.click(); };
+  const onFileSelected = async (e) => {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = "";
+    if (!file) return;
+    if (file.size > 8 * 1024 * 1024) { setUploadError("datei zu groß (max 8 MB)"); return; }
+    setUploading(true); setUploadError(null);
+    try {
+      const buf = await file.arrayBuffer();
+      const bytes = new Uint8Array(buf);
+      let bin = "";
+      const CHUNK = 0x8000;
+      for (let i = 0; i < bytes.length; i += CHUNK) {
+        bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+      }
+      const base64 = btoa(bin);
+      const r = await fetch(sync.serverUrl + "/api/projects/" + encodeURIComponent(project.id) + "/attachments", {
+        method: "POST",
+        headers: { "content-type": "application/json", "authorization": "Bearer " + sync.token },
+        body: JSON.stringify({ name: file.name, contentType: file.type || "application/octet-stream", base64 }),
+      });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(data.error || ("upload " + r.status));
+      setPendingAttachment({ fileId: data.fileId, name: data.name, kind: data.kind, url: data.url });
+    } catch (e) {
+      setUploadError(e.message || "upload fehlgeschlagen");
+    } finally {
+      setUploading(false);
+    }
   };
 
   return (
-    <div className="box" style={{ display: "flex", flexDirection: "column", minHeight: 200 }}>
-      <div className="eyebrow">// projekt-chat <span style={{ opacity: 0.5 }}>· {messages.length}</span></div>
-      <div style={{
+    <div className="box" style={{ display: "flex", flexDirection: "column", minHeight: 240 }}>
+      <div className="eyebrow" style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <span style={{ flex: 1 }}>// projekt-chat <span style={{ opacity: 0.5 }}>· {messages.length}</span></span>
+        {onSetTab && messages.length > 0 && (
+          <button className="btn tiny" onClick={() => onSetTab("team")}
+                  title="alle nachrichten · notizen · termine">
+            → team-tab
+          </button>
+        )}
+      </div>
+      <div ref={listRef} style={{
         flex: 1, marginTop: 8, marginBottom: 8,
-        minHeight: 80,
+        minHeight: 80, maxHeight: 280, overflowY: "auto",
         background: "rgba(0,0,0,0.02)",
         border: "1.5px dashed var(--line)", borderRadius: 6,
         padding: 8, display: "flex", flexDirection: "column", gap: 6,
-        justifyContent: last.length === 0 ? "center" : "flex-end",
+        justifyContent: last.length === 0 ? "center" : "flex-start",
       }}>
         {last.length === 0 ? (
           <div style={{ color: "var(--ink-faint)", fontSize: 12, fontStyle: "italic", textAlign: "center" }}>
@@ -867,7 +1222,11 @@ function MiniChat({ project, myEmail }) {
           </div>
         ) : last.map(m => {
           const author = m.authorEmail || (m.author && m.author.startsWith("device:") ? m.author.slice(7) : (m.author || "?"));
-          const isOwn = myEmail && author === myEmail;
+          // Match gegen effectiveMyEmail (priorität: /api/auth/me email)
+          // ODER pair-token-deviceName. So funktioniert auch der hybrid-fall
+          // (logged-in user-account aber sync.deviceName noch alt).
+          const isOwn = !!((effectiveMyEmail && author === effectiveMyEmail) ||
+                          (myEmail && author === myEmail));
           return (
             <div key={m.id} style={{
               display: "flex", justifyContent: isOwn ? "flex-end" : "flex-start",
@@ -883,12 +1242,46 @@ function MiniChat({ project, myEmail }) {
               }}>
                 {!isOwn && <div style={{ fontSize: 10, opacity: 0.6, marginBottom: 1 }}>{author}</div>}
                 {m.text}
+                {m.attachment && m.attachment.url && (
+                  <div style={{ marginTop: 4 }}>
+                    {m.attachment.kind === "image" ? (
+                      <img src={(sync.serverUrl || "") + m.attachment.url}
+                           alt={m.attachment.name}
+                           style={{ maxWidth: "100%", borderRadius: 4, display: "block" }} />
+                    ) : (
+                      <div style={{ fontSize: 10.5, opacity: 0.85, fontFamily: "monospace" }}>
+                        📎 {m.attachment.name}
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
             </div>
           );
         })}
       </div>
+      {pendingAttachment && (
+        <div style={{
+          marginBottom: 4, padding: "4px 8px",
+          border: "1.5px dashed var(--ink)", borderRadius: 4,
+          display: "flex", alignItems: "center", gap: 6,
+          fontSize: 11, background: "rgba(0,0,0,0.03)",
+        }}>
+          <span>{pendingAttachment.kind === "image" ? "🖼" : "📎"}</span>
+          <span style={{ flex: 1, fontFamily: "monospace", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{pendingAttachment.name}</span>
+          <button className="btn tiny" onClick={() => setPendingAttachment(null)}>×</button>
+        </div>
+      )}
+      {uploadError && (
+        <div style={{ marginBottom: 4, fontSize: 10.5, color: "var(--danger, #c33)" }}>⚠ {uploadError}</div>
+      )}
+      <input ref={fileInputRef} type="file" style={{ display: "none" }}
+        onChange={onFileSelected}
+        accept="image/*,application/pdf,application/zip,text/*,audio/*,video/*" />
       <div style={{ display: "flex", gap: 6 }}>
+        <button className="btn tiny" onClick={onPickFile} disabled={uploading} title="anhang (max 8 MB)">
+          {uploading ? "…" : "📎"}
+        </button>
         <input className="input" style={{ flex: 1 }}
                placeholder="nachricht an team…"
                value={draft}
@@ -897,10 +1290,11 @@ function MiniChat({ project, myEmail }) {
                  if ((e.metaKey || e.ctrlKey) && e.key === "Enter") send();
                  else if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
                }} />
-        <button className="btn primary tiny" onClick={send} disabled={!draft.trim()}>senden</button>
+        <button className="btn primary tiny" onClick={send}
+                disabled={(!draft.trim() && !pendingAttachment) || uploading}>senden</button>
       </div>
       <div style={{ fontSize: 10, color: "var(--ink-faint)", marginTop: 4, textAlign: "right" }}>
-        ⌘/Strg+Enter · senden
+        Enter · senden · 📎 anhang
       </div>
     </div>
   );
@@ -1024,7 +1418,8 @@ function BugsBlock({ project }) {
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
         <span className="eyebrow">// bugs {pending.length > 0 && <span className="chip" style={{ marginLeft: 6, color: "#c33", borderColor: "#c33" }}>{pending.length}</span>}</span>
         <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
-          <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 11, color: "var(--ink-soft)", cursor: "pointer" }}>
+          <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 11, color: "var(--ink-soft)", cursor: "pointer" }}
+                 title="alle 30min auto-scan + neue bugs werden automatisch zu cc-tasks">
             <input type="checkbox" checked={!!project.bugAutoFix} onChange={toggleAuto} />
             auto-fix
           </label>
@@ -1089,34 +1484,23 @@ function ScreenOverview({ project, onOpenMembers, onOpenPair, onSetTab }) {
                                                  apiBase={sync.serverUrl}
                                                  token={sync.token} /> : null}
 
-      {/* Block 1 — Onboarding + Mini-Chat */}
-      <div className="two-col">
-        <div className="box">
-          <div className="eyebrow">// los geht's · 3 schritte</div>
-          <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 10, marginTop: 8 }}>
-            <OnboardStep n="1" title="idee erfassen"
-              body="im ideen-tab tippst du was dir gerade einfällt. später machst du daraus aufgaben."
-              cta="→ ideen-tab" onClick={() => onSetTab && onSetTab("ideas")} />
-            <OnboardStep n="2" title="team einladen"
-              body={"oben „mitglieder verwalten“ → email eintippen. ihr seht dann beide dieselben aufgaben + chat."}
-              cta="👥 mitglieder" onClick={onOpenMembers} />
-            <OnboardStep n="3" title="mit team chatten"
-              body="rechts im chat oder im team-tab: nachrichten, notizen + termine teilen — live synchronisiert."
-              cta="→ team-tab" onClick={() => onSetTab && onSetTab("team")} />
-          </div>
-        </div>
-        <MiniChat project={project} myEmail={myEmail} />
-      </div>
+      {/* Block 1 — Onboarding + Mini-Chat
+          D5 · Auto-collapse wenn alle 3 schritte mind. einmal erledigt sind:
+            (1) min. 1 idee erfasst, (2) team > 1 mitglied, (3) chat > 0 msgs
+          User kann manuell wieder ausklappen via dismiss-state in localStorage. */}
+      <OnboardingBlock project={project} myEmail={myEmail}
+                       onSetTab={onSetTab} onOpenMembers={onOpenMembers} />
 
-      {/* Block 2 — Stat-chips */}
-      <div style={{ display: "flex", gap: 12, marginTop: 14 }}>
-        <StatChip label="aufgaben" value={stats.open} accent={stats.open > 0}
+      {/* Block 2 — Stat-cards (icon-left, klick wechselt tab) */}
+      <div className="statcard-grid cols-4" style={{ marginTop: 14 }}>
+        <StatChip label="aufgaben" value={stats.open} icon="✓" accent={stats.open > 0}
                   onClick={() => onSetTab && onSetTab("tasks")} />
-        <StatChip label="regeln" value={stats.rules}
+        <StatChip label="regeln" value={stats.rules} icon="§"
                   onClick={() => onSetTab && onSetTab("rules")} />
-        <StatChip label="ideen" value={stats.ideas} accent={stats.ideas > 0}
+        <StatChip label="ideen" value={stats.ideas} icon="💡" accent={stats.ideas > 0}
                   onClick={() => onSetTab && onSetTab("ideas")} />
-        <StatChip label={ccRunning ? "aktiv" : "pause"} value={ccRunning ? "⚡" : "○"}
+        <StatChip label={ccRunning ? "cloud-code aktiv" : "cloud-code pause"}
+                  value={ccRunning ? "⚡" : "○"} icon="☁"
                   onClick={() => onSetTab && onSetTab("cloud")} />
       </div>
 
@@ -1212,16 +1596,15 @@ function ScreenTasks({ project, onCcRun }) {
 
   return (
     <>
+      {/* D3 · Filter-chips zeigen DIREKT die zahlen (war doppelt: chips + counters rechts) */}
       <div className="filter-bar">
-        <span className={"fb-chip" + (filter === "all" ? " active" : "")} onClick={() => setFilter("all")}>alle</span>
-        <span className={"fb-chip" + (filter === "open" ? " active" : "")} onClick={() => setFilter("open")}>offen</span>
-        <span className={"fb-chip" + (filter === "done" ? " active" : "")} onClick={() => setFilter("done")}>erledigt</span>
+        <span className={"fb-chip" + (filter === "all" ? " active" : "")} onClick={() => setFilter("all")}>alle <strong style={{ marginLeft: 4, opacity: 0.7 }}>{tasks.length}</strong></span>
+        <span className={"fb-chip" + (filter === "open" ? " active" : "")} onClick={() => setFilter("open")}>offen <strong style={{ marginLeft: 4, opacity: 0.7 }}>{tasks.filter(t => !t.done).length}</strong></span>
+        <span className={"fb-chip" + (filter === "done" ? " active" : "")} onClick={() => setFilter("done")}>erledigt <strong style={{ marginLeft: 4, opacity: 0.7 }}>{tasks.filter(t => t.done).length}</strong></span>
         <span className="grow" />
         <input className="input" placeholder="suchen…" value={search}
                onChange={(e) => setSearch(e.target.value)}
                style={{ maxWidth: 200, fontSize: 12, padding: "4px 10px" }} />
-        <span className="chip solid">offen {tasks.filter(t => !t.done).length}</span>
-        <span className="chip">erledigt {tasks.filter(t => t.done).length}</span>
         <button className="btn primary tiny" onClick={() => setAdding(s => !s)}>+ aufgabe</button>
       </div>
       {isEmpty && !adding && (
@@ -1307,6 +1690,14 @@ function ScreenTasks({ project, onCcRun }) {
                         <div style={{ display: "flex", gap: 6, marginTop: 4 }}>
                           <button className="btn tiny ghost" onClick={() => setSubDraft({ taskId: t.id, title: "" })}>+ sub-task</button>
                           {!t.done && <button className="btn tiny ghost" onClick={() => onCcRun(t.id)}>⚡ an cloud-code</button>}
+                          {!t.done && (t.subtasks || []).length === 0 && (
+                            <button className="btn tiny ghost" title="cc zerlegt task in 3-8 subtasks (1× claude-call, ~0.20$)"
+                                    onClick={async () => {
+                                      try {
+                                        await sync._http("POST", "/api/cc/decompose", { projectId: project.id, taskId: t.id });
+                                      } catch (e) { alert("decompose: " + (e.message || "fehler")); }
+                                    }}>🪓 zerlegen</button>
+                          )}
                         </div>
                       )}
                     </div>
@@ -1426,33 +1817,165 @@ function ScreenRules({ project }) {
         <span className="squig">cloud code</span> respektiert diese regeln bei jeder änderung.
       </div>
 
-      <div className="three-col">
-        {grouped.map(g => (
-          <div className="box" key={g.name}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 6 }}>
-              <span className="eyebrow">// {g.name}</span>
-              <span className="chip">{g.items.filter(r => r.active).length}/{g.items.length}</span>
-            </div>
-            {g.items.length === 0
-              ? <div className="empty" style={{ padding: 14 }}><div>noch keine regel.</div></div>
-              : g.items.map(r => (
-                  <div className="rule-row" key={r.id}>
-                    <span className={"check" + (r.active ? " done" : "")} onClick={() => toggle(r.id)} />
-                    <div className={"text" + (r.active ? "" : " inactive")}>
-                      <Editable value={r.text} onChange={v => editRule(r.id, v.trim() || r.text)} />
-                    </div>
-                    <button className="x-btn" onClick={() => remove(r.id)}>×</button>
-                  </div>
-                ))
-            }
-            <button className="btn tiny" style={{ marginTop: 10 }}
-                    onClick={() => setAdding({ open: true, category: g.name, text: "" })}>
-              + hinzufügen
-            </button>
+      {/* 2-col layout: rules-cols main + right-sidebar mit donut + top + activity */}
+      <div className="pg-screen">
+        <div className="pg-main">
+          <div className="three-col">
+            {grouped.map(g => (
+              <div className="box" key={g.name}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 8 }}>
+                  <span className={"pg-cat pg-cat-" + g.name}>{g.name}</span>
+                  <span className="chip">{g.items.filter(r => r.active).length}/{g.items.length}</span>
+                </div>
+                {g.items.length === 0
+                  ? <div className="empty" style={{ padding: 14 }}><div>noch keine regel.</div></div>
+                  : g.items.map(r => (
+                      <div className="rule-row" key={r.id}>
+                        <span className={"check" + (r.active ? " done" : "")} onClick={() => toggle(r.id)} />
+                        <div className={"text" + (r.active ? "" : " inactive")}>
+                          <Editable value={r.text} onChange={v => editRule(r.id, v.trim() || r.text)} />
+                        </div>
+                        <button className="x-btn" onClick={() => remove(r.id)}>×</button>
+                      </div>
+                    ))
+                }
+                <button className="btn tiny" style={{ marginTop: 10 }}
+                        onClick={() => setAdding({ open: true, category: g.name, text: "" })}>
+                  + hinzufügen
+                </button>
+              </div>
+            ))}
           </div>
-        ))}
+        </div>
+        <aside className="pg-aside">
+          <RulesByCategoryPanel rules={rules} />
+          <RulesTopExecutedPanel rules={rules} activity={project.activity || []} />
+          <RulesActivityPanel activity={project.activity || []} />
+        </aside>
       </div>
     </>
+  );
+}
+
+// Donut-chart + legend für regeln nach kategorie (SVG, kein chart-lib).
+function RulesByCategoryPanel({ rules }) {
+  const COLORS = {
+    "code-stil":  "#5dd07a",
+    "architektur": "#ff8c66",
+    "workflow":    "#a78bfa",
+    "ci-cd":       "#22d3ee",
+    "sonstige":    "#6b7280",
+  };
+  const counts = {};
+  for (const r of rules) {
+    if (!r.active) continue;
+    const c = r.category || "sonstige";
+    counts[c] = (counts[c] || 0) + 1;
+  }
+  const total = Object.values(counts).reduce((a, b) => a + b, 0) || 1;
+  // SVG-donut
+  const cx = 50, cy = 50, r = 36, sw = 14;
+  let offset = -Math.PI / 2;
+  const segments = Object.entries(counts).map(([cat, count]) => {
+    const frac = count / total;
+    const angle = frac * 2 * Math.PI;
+    const x1 = cx + Math.cos(offset) * r;
+    const y1 = cy + Math.sin(offset) * r;
+    offset += angle;
+    const x2 = cx + Math.cos(offset) * r;
+    const y2 = cy + Math.sin(offset) * r;
+    const large = angle > Math.PI ? 1 : 0;
+    return {
+      cat, count,
+      path: `M ${cx} ${cy} L ${x1} ${y1} A ${r} ${r} 0 ${large} 1 ${x2} ${y2} Z`,
+      color: COLORS[cat] || COLORS.sonstige,
+    };
+  });
+  return (
+    <div className="pg-side-panel">
+      <div className="panel-title">Regeln nach Kategorie</div>
+      <div className="pg-donut-wrap">
+        <svg width="100" height="100" viewBox="0 0 100 100" style={{ flexShrink: 0 }}>
+          {segments.length === 0 ? (
+            <circle cx={cx} cy={cy} r={r} fill="none" stroke="var(--line)" strokeWidth={sw} />
+          ) : segments.map((s, i) => (
+            <path key={i} d={s.path} fill={s.color} />
+          ))}
+          <circle cx={cx} cy={cy} r={r - sw} fill="var(--paper)" />
+        </svg>
+        <div className="pg-donut-legend">
+          {Object.entries(counts).length === 0
+            ? <div style={{ fontSize: 11, color: "var(--ink-faint)" }}>keine aktiven regeln</div>
+            : Object.entries(counts).map(([cat, count]) => (
+              <div className="pg-donut-legend-row" key={cat}>
+                <span className="dot" style={{ background: COLORS[cat] || COLORS.sonstige }} />
+                <span className="lbl">{cat}</span>
+                <span className="num">{count}</span>
+              </div>
+            ))
+          }
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Top-5 regeln nach aktivity-erwähnungen (proxy für "ausführungen").
+function RulesTopExecutedPanel({ rules, activity }) {
+  // count rule.text-mentions in activity-events
+  const counts = new Map();
+  for (const a of activity) {
+    const txt = (a.text || "").toLowerCase();
+    for (const r of rules) {
+      if (!r.active) continue;
+      const key = r.text.toLowerCase().slice(0, 30);
+      if (key && txt.includes(key)) {
+        counts.set(r.id, (counts.get(r.id) || 0) + 1);
+      }
+    }
+  }
+  const top = [...rules]
+    .filter(r => r.active)
+    .map(r => ({ r, n: counts.get(r.id) || 0 }))
+    .sort((a, b) => b.n - a.n)
+    .slice(0, 5);
+  return (
+    <div className="pg-side-panel">
+      <div className="panel-title">Top Regeln nach Erwähnungen</div>
+      {top.length === 0 || top.every(t => t.n === 0)
+        ? <div style={{ fontSize: 11, color: "var(--ink-faint)" }}>noch keine cc-runs mit regel-bezug</div>
+        : top.map(({ r, n }) => (
+          <div className="pg-metric-row" key={r.id}>
+            <span className="ico">📈</span>
+            <span className="label" style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 12 }}>{r.text}</span>
+            <span className="value">{n}</span>
+          </div>
+        ))
+      }
+    </div>
+  );
+}
+
+// Letzte regel-bezogene activity (rule-type events).
+function RulesActivityPanel({ activity }) {
+  const ruleActs = (activity || []).filter(a => a.type === "rule" || /regel/i.test(a.text || "")).slice(0, 5);
+  return (
+    <div className="pg-side-panel">
+      <div className="panel-title">Letzte Aktivitäten</div>
+      {ruleActs.length === 0
+        ? <div style={{ fontSize: 11, color: "var(--ink-faint)" }}>noch keine regel-änderungen</div>
+        : ruleActs.map(a => (
+          <div className="pg-metric-row" key={a.id} style={{ alignItems: "flex-start" }}>
+            <span className="ico" style={{ color: "var(--ok)" }}>✓</span>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontSize: 12, color: "var(--ink)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+                   dangerouslySetInnerHTML={{ __html: a.text }} />
+              <div style={{ fontSize: 10.5, color: "var(--ink-faint)", marginTop: 2 }}>{relTime(a.ts)}</div>
+            </div>
+          </div>
+        ))
+      }
+    </div>
   );
 }
 
@@ -1637,14 +2160,22 @@ function ScreenCloud({ project, onCcRun, onCcStop, ccStatus, ccOutput, ccRunning
   const fileInputRef = useRef(null);
   const client = useSync();
 
+  // Bug-fix: vorher zählten alle metriken nur activity-events vom jeweiligen
+  // type — d.h. 'rules' war NICHT die anzahl aktiver regeln, sondern die
+  // anzahl der activity-events vom typ='rule' (wann eine regel hinzugefügt
+  // wurde). user-erwartung: zähle ECHTE entities, nicht events.
   const metrics = useMemo(() => ({
     events:   activity.length,
-    checks:   activity.filter(x => x.type === "check").length,
+    checks:   (project.tasks || []).filter(t => t.done).length,
     writes:   activity.filter(x => x.type === "write").length,
     reads:    activity.filter(x => x.type === "read").length,
-    warnings: activity.filter(x => x.type === "warn").length,
-    rules:    activity.filter(x => x.type === "rule").length,
-  }), [activity]);
+    warnings: ((project.bugs || []).filter(b => b.status === "pending").length) +
+              activity.filter(x => x.type === "warn").length,
+    rules:    (project.rules || []).filter(r => r.active).length,
+    ideas:    (project.ideas || []).filter(i => i.status === "unprocessed").length,
+    bugs:     (project.bugs || []).filter(b => b.status === "pending").length,
+    openTasks:(project.tasks || []).filter(t => !t.done).length,
+  }), [activity, project.tasks, project.rules, project.ideas, project.bugs]);
 
   const inProgress = (project.tasks || []).filter(t => t.group === "in_progress" && !t.done);
   const status = ccStatus[project.id] || { state: "idle" };
@@ -1705,24 +2236,109 @@ function ScreenCloud({ project, onCcRun, onCcStop, ccStatus, ccOutput, ccRunning
     sync.mutate("CLEAR_PENDING_QUESTION", { projectId: project.id });
   };
 
+  // Token-/cost-stats: kommt aus state.ccBudget (server-tracked). Für UI:
+  // letzte 20 jobs summieren statt all-time, damit zahlen aktuell wirken.
+  const recentBudget = useMemo(() => {
+    const jobs = ((client.state || {}).ccBudget || {}).jobs || [];
+    const recent = jobs.slice(0, 20).filter(j => j.projectId === project.id);
+    return recent.reduce((acc, j) => ({
+      tokensIn: acc.tokensIn + (j.inputTokens || 0),
+      tokensOut: acc.tokensOut + (j.outputTokens || 0),
+      costUsd: acc.costUsd + (j.costUsd || 0),
+      jobs: acc.jobs + 1,
+    }), { tokensIn: 0, tokensOut: 0, costUsd: 0, jobs: 0 });
+  }, [client.state, project.id]);
+
   return (
     <>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end", marginBottom: 12 }}>
+      {/* Cleaner header — klare hierarchie, controls rechts gebündelt */}
+      <div className="cc-header">
         <div>
-          <h2 className="h2">cloud-code aktivität</h2>
-          <div style={{ color: "var(--ink-soft)", fontSize: 12, marginTop: 4 }}>
+          <h2 className="cc-title">cloud-code</h2>
+          <div className="cc-subtitle">
             <span className={"cc-dot" + (ccRunning ? " live" : "")}>
-              {isRunning ? "läuft seit " + relTime(status.startedAt) : (ccRunning ? "verbunden · idle" : "pausiert")}
+              {isRunning ? "läuft seit " + relTime(status.startedAt)
+                : (ccRunning ? "verbunden · idle" : "pausiert")}
             </span>
             {" · "}{activity.length} events
-            {!project.path && <span style={{ color: "#c33", marginLeft: 12 }}>⚠ kein projekt-pfad — claude CLI startet im server-cwd</span>}
+            {!project.path && <span style={{ color: "var(--danger, #c33)", marginLeft: 10 }}>
+              ⚠ kein projekt-pfad
+            </span>}
+            {project.path && project.pathValid === false && (
+              <span style={{ color: "var(--danger, #c33)", marginLeft: 10 }}
+                    title={"pfad nicht gefunden: " + project.path}>
+                ⚠ pfad nicht auf diesem rechner: <code>{project.path}</code>
+              </span>
+            )}
           </div>
+          {client.state?.ccApiLimitedUntil && client.state.ccApiLimitedUntil > Date.now() && (
+            <div style={{
+              marginTop: 8, padding: "8px 12px",
+              border: "1.5px solid #c80", background: "#fff8e8",
+              borderRadius: 6, fontSize: 12, color: "#8a5500",
+              display: "flex", alignItems: "center", gap: 10,
+            }}>
+              <span>⏸ <strong>auto-pump pausiert</strong> bis {new Date(client.state.ccApiLimitedUntil).toLocaleTimeString()} (claude-api limit erreicht)</span>
+              <button className="btn tiny" onClick={async () => {
+                try {
+                  await fetch(client.serverUrl + "/api/cc/resume-now", {
+                    method: "POST",
+                    headers: { authorization: "Bearer " + client.token },
+                  });
+                } catch (_) {}
+              }}>fortsetzen jetzt</button>
+            </div>
+          )}
         </div>
-        <div style={{ display: "flex", gap: 6 }}>
+        <div className="cc-controls">
           {isRunning
             ? <button className="btn tiny danger" onClick={() => onCcStop()}>■ stop</button>
-            : <button className="btn tiny" onClick={() => setCcRunning(!ccRunning)}>{ccRunning ? "pause" : "fortsetzen"}</button>}
-          <button className="btn tiny danger" onClick={clearLog} disabled={!activity.length}>log leeren</button>
+            : <button className="btn tiny" onClick={() => setCcRunning(!ccRunning)}>{ccRunning ? "pause" : "▶ fortsetzen"}</button>}
+          <button className="btn tiny" onClick={clearLog} disabled={!activity.length}>log leeren</button>
+        </div>
+      </div>
+
+      {/* Stats-cards: 4 chips mit icon-left + label-block + value right */}
+      <div className="statcard-grid cols-4">
+        <div className={"statcard-row" + (metrics.checks > 0 ? " success" : "")}>
+          <div className="ico">✓</div>
+          <div className="body">
+            <div className="label-block">
+              <div className="label">Checks</div>
+              <div className="sub">tasks abgehakt</div>
+            </div>
+            <div className="value">{metrics.checks}</div>
+          </div>
+        </div>
+        <div className="statcard-row">
+          <div className="ico">✎</div>
+          <div className="body">
+            <div className="label-block">
+              <div className="label">Writes</div>
+              <div className="sub">files berührt</div>
+            </div>
+            <div className="value">{metrics.writes}</div>
+          </div>
+        </div>
+        <div className={"statcard-row" + (metrics.warnings > 0 ? " warning" : "")}>
+          <div className="ico">⚠</div>
+          <div className="body">
+            <div className="label-block">
+              <div className="label">Warnings</div>
+              <div className="sub">{metrics.warnings > 0 ? "blocker offen" : "alles klar"}</div>
+            </div>
+            <div className="value">{metrics.warnings}</div>
+          </div>
+        </div>
+        <div className="statcard-row">
+          <div className="ico">$</div>
+          <div className="body">
+            <div className="label-block">
+              <div className="label">Kosten · {recentBudget.jobs} Runs</div>
+              <div className="sub">{(recentBudget.tokensIn/1000).toFixed(1)}k in · {(recentBudget.tokensOut/1000).toFixed(1)}k out</div>
+            </div>
+            <div className="value">${recentBudget.costUsd.toFixed(3)}</div>
+          </div>
         </div>
       </div>
 
@@ -1738,8 +2354,21 @@ function ScreenCloud({ project, onCcRun, onCcStop, ccStatus, ccOutput, ccRunning
         />
       )}
 
-      <div className="box" style={{ marginBottom: 12 }}>
-        <div className="eyebrow">// freier prompt {attachments.length > 0 && <span style={{ opacity: 0.5 }}>· {attachments.length} anhänge</span>}</div>
+      {/* 2-col layout: main content links + right-sidebar 320px (mockup) */}
+      <div className="pg-screen">
+      <div className="pg-main">
+      {/* Aktuelle aufgabe sichtbar wenn run läuft oder in_progress-task vorhanden */}
+      {(isRunning || inProgress.length > 0) && (
+        <div className="cc-current-task">
+          <div className="label">{isRunning ? "läuft gerade" : "nächste aufgabe"}</div>
+          <div className="title">{isRunning && status.taskId
+            ? ((project.tasks || []).find(t => t.id === status.taskId)?.title || "freier prompt")
+            : (inProgress[0]?.title || "—")}</div>
+        </div>
+      )}
+
+      <div className="box cc-section">
+        <div className="cc-section-title">// freier prompt {attachments.length > 0 && <span style={{ opacity: 0.5 }}>· {attachments.length} anhänge</span>}</div>
         {attachments.length > 0 && (
           <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 8 }}>
             {attachments.map((a, i) => (
@@ -1775,50 +2404,94 @@ function ScreenCloud({ project, onCcRun, onCcStop, ccStatus, ccOutput, ccRunning
         )}
       </div>
 
+      {/* Task 3 · Live tool-events: was claude gerade liest/schreibt/spawnt */}
+      {(client.ccToolEvents?.[project.id] || []).length > 0 && (
+        <div className="box cc-section">
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+            <div className="cc-section-title">// tools · was claude tut</div>
+            {client.ccThinkingText?.[project.id] && (
+              <span style={{ fontFamily: "JetBrains Mono, monospace", fontSize: 10, color: "var(--ink-faint)", fontStyle: "italic" }}>
+                💭 {client.ccThinkingText[project.id].slice(0, 80)}
+              </span>
+            )}
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 3, maxHeight: 180, overflowY: "auto" }}>
+            {(client.ccToolEvents[project.id] || []).slice(-10).map((te, i) => (
+              <div key={te.id || i} style={{
+                display: "flex", gap: 8, alignItems: "center",
+                padding: "3px 8px", fontSize: 11.5, lineHeight: 1.5,
+                fontFamily: "JetBrains Mono, monospace",
+                borderRadius: 4,
+                background: te.state === "error" ? "rgba(204,51,51,0.08)" : "transparent",
+                color: te.state === "error" ? "#c33" : "var(--ink)",
+                opacity: te.state === "running" ? 0.7 : 1,
+              }}>
+                <span style={{ width: 16, textAlign: "center" }}>{te.glyph}</span>
+                <span style={{ fontWeight: 600, minWidth: 60 }}>{te.tool}</span>
+                <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{te.summary}</span>
+                <span style={{ fontSize: 10, color: "var(--ink-faint)" }}>
+                  {te.state === "running" ? "…" : (te.state === "error" ? "✗" : "✓")}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       {output && (
-        <div className="box" style={{ marginBottom: 12 }}>
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-            <div className="eyebrow">// cloud-code output</div>
+        <div className="box cc-section">
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+            <div className="cc-section-title">// cloud-code antwort</div>
             {isRunning && <span className="cc-dot live">streamt…</span>}
           </div>
           <pre className="cc-output">{output.slice(-4000)}</pre>
         </div>
       )}
 
-      <div className="box" style={{ marginBottom: 12 }}>
-        <div className="eyebrow">// live-feed</div>
+      <div className="box cc-section">
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+          <div className="cc-section-title">// live-feed</div>
+          <span style={{ fontFamily: "JetBrains Mono, monospace", fontSize: 10, color: "var(--ink-faint)" }}>
+            {Math.min(activity.length, 60)} / {activity.length}
+          </span>
+        </div>
         {activity.length === 0
           ? <div className="empty"><div className="big">stille.</div><div>cloud code wartet auf input.</div></div>
-          : activity.slice(0, 40).map(e => (
-              <div className="feed-row" key={e.id}>
-                <span className="glyph">{ACT_GLYPHS[e.type] || "·"}</span>
-                <span dangerouslySetInnerHTML={{ __html: e.text }} />
-                <span className="ts">{relTime(e.ts)}</span>
-              </div>
-            ))
+          : <div className="cc-feed-wrap" style={{ padding: 0 }}>
+              {activity.slice(0, 60).map(e => (
+                <div className="pg-feed-row" key={e.id}>
+                  <span className="ico">{ACT_GLYPHS[e.type] || "·"}</span>
+                  <span className="text" dangerouslySetInnerHTML={{ __html: e.text }} />
+                  <span className="ts">{relTime(e.ts)}</span>
+                </div>
+              ))}
+            </div>
         }
       </div>
+      </div>{/* /pg-main */}
 
-      <div className="two-col">
-        <div className="box">
-          <div className="eyebrow">// metriken</div>
-          <div className="stat">
-            ▸ events &nbsp;&nbsp;&nbsp;<strong>{metrics.events}</strong><br/>
-            ▸ writes &nbsp;&nbsp;<strong>{metrics.writes}</strong><br/>
-            ▸ reads &nbsp;&nbsp;&nbsp;<strong>{metrics.reads}</strong><br/>
-            ▸ checks &nbsp;&nbsp;<strong>{metrics.checks}</strong><br/>
-            ▸ regeln &nbsp;&nbsp;<strong>{metrics.rules}</strong><br/>
-            ▸ warnings <strong>{metrics.warnings}</strong>
-          </div>
+      <aside className="pg-aside">
+        <div className="pg-side-panel">
+          <div className="panel-title">Metriken</div>
+          <div className="pg-metric-row"><span className="ico">📈</span><span className="label">cc-events</span><span className="value">{metrics.events}</span></div>
+          <div className="pg-metric-row"><span className="ico">✎</span><span className="label">writes</span><span className="value">{metrics.writes}</span></div>
+          <div className="pg-metric-row"><span className="ico">👁</span><span className="label">reads</span><span className="value">{metrics.reads}</span></div>
+          <div className="pg-metric-row"><span className="ico">✓</span><span className="label">tasks erledigt</span><span className="value">{metrics.checks}</span></div>
+          <div className="pg-metric-row"><span className="ico">⊙</span><span className="label">tasks offen</span><span className="value">{metrics.openTasks}</span></div>
+          <div className="pg-metric-row"><span className="ico">§</span><span className="label">regeln aktiv</span><span className="value">{metrics.rules}</span></div>
+          <div className="pg-metric-row"><span className="ico">💡</span><span className="label">ideen offen</span><span className="value">{metrics.ideas}</span></div>
+          <div className="pg-metric-row"><span className="ico">🐞</span><span className="label">bugs pending</span><span className="value">{metrics.bugs}</span></div>
+          <div className="pg-metric-row"><span className="ico">⚠</span><span className="label">warnings</span><span className="value">{metrics.warnings}</span></div>
         </div>
-        <div className="box">
-          <div className="eyebrow">// nächster schritt</div>
-          <div className="squig" style={{ fontSize: 18 }}>{inProgress[0]?.title || "warten auf neuen task"}</div>
-          <div style={{ color: "var(--ink-soft)", fontSize: 12, marginTop: 6 }}>
+        <div className="pg-side-panel">
+          <div className="panel-title">Nächster Schritt</div>
+          <div style={{ fontSize: 14, color: "var(--ink)", fontWeight: 600 }}>{inProgress[0]?.title || "Warten auf neuen Task"}</div>
+          <div style={{ color: "var(--ink-soft)", fontSize: 12, marginTop: 10, lineHeight: 1.5 }}>
             cloud-code arbeitet an <strong>{inProgress.length}</strong> offenen tasks · {(project.rules || []).filter(r => r.active).length} regeln aktiv
           </div>
         </div>
-      </div>
+      </aside>
+      </div>{/* /pg-screen */}
     </>
   );
 }
@@ -2118,6 +2791,7 @@ function App() {
   const [, setTick] = useState(0);
   const [showNew, setShowNew] = useState(false);
   const [showPair, setShowPair] = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(false); // mobile hamburger
   const [showAuth, setShowAuth] = useState(false);
   const [showMembers, setShowMembers] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
@@ -2242,46 +2916,92 @@ function App() {
 
   return (
     <div className="app">
+      {/* Setup-check banner: zeigt fehlende deps für first-user — verschwindet automatisch wenn alle critical-deps da */}
+      {window.SetupBanner && <window.SetupBanner serverUrl={client.serverUrl} />}
       <div className="titlebar">
         <span className="dot" /><span className="dot" /><span className="dot" />
+        {/* D1 · Hamburger-toggle sichtbar nur auf <768px (CSS class .mobile-only) */}
+        <button className="hamburger-toggle"
+                onClick={() => setSidebarOpen(o => !o)}
+                aria-label="menu" title="projekt-liste">
+          ☰
+        </button>
         <span className="crumb"><span className="brand-anim">ProjectGamma</span> · {project?.name || "—"} · {TABS.find(t => t.id === client.activeTab)?.label || ""}</span>
         <div className="right">
           <span className={"cc-dot" + (client.connected ? " live" : "")}>
             {client.connected ? `server · ${client.serverUrl.replace(/^https?:\/\//, "")}` : "server getrennt"}
           </span>
+          <UpdateAvailableBanner state={client.state} />
+          <ThemeToggle />
           {window.OfflineQueuePanel ? <window.OfflineQueuePanel client={client} /> : null}
         </div>
       </div>
 
       <div className="body">
-        <Sidebar projects={projects}
+        <div className={"side-wrapper" + (sidebarOpen ? " open-mobile" : "")}>
+          <Sidebar projects={projects}
                  activeId={client.activeProjectId}
-                 onSelect={(id) => { client.setActiveProject(id); client.setActiveTab("overview"); }}
-                 onNew={() => setShowNew(true)}
+                 onSelect={(id) => { client.setActiveProject(id); client.setActiveTab("overview"); setSidebarOpen(false); }}
+                 onNew={() => { setShowNew(true); setSidebarOpen(false); }}
                  ccRunning={client.ccRunning} />
-        {!project && (
-          /* Welcome-state: keine projekte oder noch keins ausgewählt. Buttons
-             (handy/mitglieder/login/settings) sind hier nicht relevant — sie kommen
-             erst wenn ein projekt aktiv ist. Stattdessen ein freundlicher CTA. */
+        </div>
+        {!project && (() => {
+          // Welcome-state differenziert nach kontext:
+          // - Account-eingeloggter user mit zero projekten → wartet auf invite
+          //   (collab-fall: kollege auf team-server, owner muss einladen).
+          // - Sonst → erstes-projekt-anlegen CTA (eigener server).
+          const myEmail = (client.deviceName && /@/.test(client.deviceName)) ? client.deviceName : null;
+          const isInviteeWaiting = myEmail && projects.length === 0;
+          return (
           <div className="main" style={{ display: "flex", alignItems: "center", justifyContent: "center", padding: 40 }}>
             <div style={{ maxWidth: 480, textAlign: "center" }}>
               <div className="eyebrow" style={{ marginBottom: 8 }}>// willkommen</div>
               <h1 className="h1" style={{ marginBottom: 12 }}>★ ProjectGamma</h1>
-              <p style={{ color: "var(--ink-soft)", lineHeight: 1.5, marginBottom: 24 }}>
-                Projekt-Manager mit Cloud-Code-Integration. Lege dein erstes Projekt an —
-                Aufgaben, Ideen + Regeln auf desktop und handy synchron.
-              </p>
-              <button className="btn primary" onClick={() => setShowNew(true)}
-                      style={{ fontSize: 14, padding: "10px 20px" }}>
-                + erstes projekt anlegen
-              </button>
-              <div style={{ marginTop: 24, display: "flex", gap: 10, justifyContent: "center", flexWrap: "wrap" }}>
-                <button className="btn tiny" onClick={() => setShowAuth(true)}>🔐 login / registrieren</button>
-                <button className="btn tiny" onClick={() => setShowSettings(true)}>⚙ settings (API-keys)</button>
-              </div>
+              {isInviteeWaiting ? (
+                <>
+                  <p style={{ color: "var(--ink-soft)", lineHeight: 1.5, marginBottom: 14 }}>
+                    eingeloggt als <strong>{myEmail}</strong>.
+                    <br />du bist auf einem team-server — der owner muss dich noch zu projekten einladen.
+                  </p>
+                  <div style={{
+                    background: "var(--paper-soft, #f5f1e8)",
+                    border: "1.5px solid var(--ink-faint, #ccc)",
+                    borderRadius: 8, padding: 14, marginBottom: 16,
+                    fontSize: 13, lineHeight: 1.6, textAlign: "left",
+                  }}>
+                    <strong>so geht's:</strong>
+                    <ol style={{ margin: "8px 0 0 18px", padding: 0 }}>
+                      <li>schick dem owner deine email: <code style={{ background: "#0001", padding: "2px 6px", borderRadius: 4 }}>{myEmail}</code></li>
+                      <li>der owner klickt „👥 mitglieder verwalten" → „+ mitglied einladen"</li>
+                      <li>sobald du eingeladen bist, erscheint sein projekt hier automatisch</li>
+                    </ol>
+                  </div>
+                  <button className="btn tiny"
+                          onClick={() => { navigator.clipboard?.writeText(myEmail); }}
+                          title="email in zwischenablage kopieren">
+                    📋 email kopieren
+                  </button>
+                </>
+              ) : (
+                <>
+                  <p style={{ color: "var(--ink-soft)", lineHeight: 1.5, marginBottom: 24 }}>
+                    Projekt-Manager mit Cloud-Code-Integration. Lege dein erstes Projekt an —
+                    Aufgaben, Ideen + Regeln auf desktop und handy synchron.
+                  </p>
+                  <button className="btn primary" onClick={() => setShowNew(true)}
+                          style={{ fontSize: 14, padding: "10px 20px" }}>
+                    + erstes projekt anlegen
+                  </button>
+                  <div style={{ marginTop: 24, display: "flex", gap: 10, justifyContent: "center", flexWrap: "wrap" }}>
+                    <button className="btn tiny" onClick={() => setShowAuth(true)}>🔐 login / registrieren</button>
+                    <button className="btn tiny" onClick={() => setShowSettings(true)}>⚙ settings (API-keys)</button>
+                  </div>
+                </>
+              )}
             </div>
           </div>
-        )}
+          );
+        })()}
         {project && (
           <div className="main">
             <MainHead project={project}

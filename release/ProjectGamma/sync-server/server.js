@@ -26,12 +26,19 @@ const apkRelease = require("./lib/apk_release");
 const { lintBeforeRun: lintCcRules, formatReport: formatCcLint } = require("./lib/rule_linter");
 const { classify: classifyRuleOrIdea } = require("./lib/rule_idea_classifier");
 const { resolveMcpConfig, cleanupResolvedConfig } = require("./lib/mcp_resolver");
+const { pickTopK: _pickContextTopK } = require("./lib/context_retrieval");
 const { createUsersStore } = require("./lib/users_store");
 const { createProjectMembershipStore, ROLES } = require("./lib/project_membership");
+const { killTreeSync, killTreeGraceful } = require("./lib/process_kill");
 const { hashPassword, verifyPassword } = require("./lib/password_hash");
 const { filterStateForSession, checkMutationAccess } = require("./lib/project_access");
 const { createOpLogStore } = require("./lib/op_log_store");
 const { buildOpAppendFrame, selectRecipients } = require("./lib/op_broadcast");
+const { runBuildGate } = require("./lib/build_gate");
+const { commitChanges: gitCommitChanges, isGitRepo: gitIsRepo, listCcCommits: gitListCcCommits, rollbackLastCommit: gitRollbackLast } = require("./lib/git_commit");
+const { createStreamJsonParser } = require("./lib/stream_json_parser");
+const { runRuntimeTest } = require("./lib/runtime_test");
+const { runSetupCheck } = require("./lib/setup_check");
 const { createUserSettingsStore, KNOWN_KEYS: SETTING_KEYS } = require("./lib/user_settings");
 const { createUpnpPortmap } = require("./lib/upnp_portmap");
 const { createPublicIpResolver } = require("./lib/public_ip");
@@ -51,9 +58,12 @@ function emitPush(event) {
 // Rate-Limit für /api/pair/claim: schützt den 6-stelligen Code vor Brute-Force.
 const claimRateLimiter = createClaimRateLimiter();
 // Rate-Limit für /api/auth/login: schützt user-passwörter vor brute-force.
+// 20 fails / 5min ist genug schutz gegen brute, lässt aber owner+team
+// ausreichend platz für vertipper. Lokale requests umgehen den limiter
+// komplett (kein anti-brute-force gegen sich selbst nötig).
 // Strenger als pair-claim (kürzeres window, weniger fails) — login ist deutlich
 // schwerer zu erraten als ein 6-stelliger code, also wirkt das limit härter.
-const loginRateLimiter = createClaimRateLimiter({ windowMs: 5 * 60 * 1000, maxFails: 5 });
+const loginRateLimiter = createClaimRateLimiter({ windowMs: 5 * 60 * 1000, maxFails: 20 });
 
 const PORT = Number(process.env.PORT) || 7892;
 // TLS bootstrap (default off; aktiv via TLS=1). Self-signed cert in ./tls/.
@@ -63,6 +73,7 @@ const TLS_INFO = bootstrapTls({ enabled: TLS_ENABLED, dir: TLS_DIR });
 const STORE_FILE = path.join(__dirname, "store.json");
 const STORE_DB_FILE = path.join(__dirname, "store.sqlite");
 const { createSqliteStore } = require("./lib/sqlite_store");
+const { createIdleTracker } = require("./lib/idle_tracker");
 const PAIRING_TTL_MS = 10 * 60 * 1000;
 const TOKEN_TTL_MS = 30 * 24 * 3600 * 1000;
 
@@ -194,6 +205,43 @@ let claudeCliInfo = { installed: false, version: null, path: null, error: null }
   console.warn("[claude] " + claudeCliInfo.error);
 })();
 
+// Zentrale claude-binary-resolution für alle spawn-call-sites.
+// Nutzt das beim boot detektierte resultat (claudeCliInfo.path) — deckt
+// sowohl npm-globale (.cmd) als auch Anthropic-standalone (.exe in
+// ~/.local/bin) installation ab. Fallback bleibt die alte windows-suche
+// für den fall, dass detection beim boot fehlschlug.
+// Cache für claudeBin-resolution: bei jedem spawn fs.existsSync auf 3 paths
+// ist teuer wenn cc auto-pumpt. 5min TTL ist konservativ — wenn der user
+// claude-cli neu installiert, müsste er eh den server neustarten.
+let _claudeBinCache = null;
+let _claudeBinCacheTs = 0;
+const _CLAUDE_BIN_TTL_MS = 5 * 60 * 1000;
+function resolveClaudeBinary() {
+  if (claudeCliInfo.path && claudeCliInfo.path !== "auto-installed") return claudeCliInfo.path;
+  const now = Date.now();
+  if (_claudeBinCache && now - _claudeBinCacheTs < _CLAUDE_BIN_TTL_MS) return _claudeBinCache;
+  if (process.platform !== "win32") {
+    _claudeBinCache = "claude";
+    _claudeBinCacheTs = now;
+    return _claudeBinCache;
+  }
+  const candidates = [
+    path.join(process.env.APPDATA || "", "npm", "claude.cmd"),
+    path.join(process.env.USERPROFILE || "", ".local", "bin", "claude.exe"),
+    "claude.cmd",
+  ];
+  for (const c of candidates) {
+    if (c && (!path.isAbsolute(c) || fs.existsSync(c))) {
+      _claudeBinCache = c;
+      _claudeBinCacheTs = now;
+      return c;
+    }
+  }
+  _claudeBinCache = "claude.cmd";
+  _claudeBinCacheTs = now;
+  return _claudeBinCache;
+}
+
 // UPnP-portmap: versucht beim boot das port-mapping LAN-port → WAN-port
 // automatisch über UPnP zu setzen. Klappt mit ~70% der heimrouter, fallback
 // = LAN-only oder ngrok.
@@ -287,6 +335,34 @@ try {
   console.log("[store] loaded sessions:", sessions.size);
 } catch (e) {}
 
+// One-time security-cleanup: vor dem patch für /api/pair/desktop-init konnte
+// jeder über cloudflare-tunnel einen desktop-pair-token bekommen (isLocal-
+// check wurde umgangen). Existierende desktop-pair-sessions könnten also
+// fremde token sein → einmalig revoken. Marker liegt neben SESSIONS_FILE.
+// Owner reloadet einmal die desktop-app + bekommt frischen token via
+// localhost (jetzt strict-gated).
+const TUNNEL_SECURITY_MARKER = path.join(__dirname, ".tunnel-security-fixed-v1");
+if (!fs.existsSync(TUNNEL_SECURITY_MARKER)) {
+  let revoked = 0;
+  for (const [token, s] of sessions) {
+    if (s.deviceType === "desktop" && s.pairedWith === "self") {
+      sessions.delete(token);
+      revoked++;
+    }
+  }
+  if (revoked > 0) {
+    persistSessionsSync();
+    console.warn(`[security] tunnel-fix: revoked ${revoked} pre-patch desktop pair-session(s) — owner muss desktop einmal neu laden (localhost-pair).`);
+  }
+  try { fs.writeFileSync(TUNNEL_SECURITY_MARKER, String(NOW()), "utf8"); } catch (_) {}
+}
+
+function persistSessionsSync() {
+  const obj = {};
+  for (const [token, s] of sessions) obj[token] = s;
+  try { fs.writeFileSync(SESSIONS_FILE, JSON.stringify(obj, null, 2), "utf8"); } catch (_) {}
+}
+
 function persistSessions() {
   const obj = {};
   for (const [token, s] of sessions) obj[token] = s;
@@ -307,15 +383,124 @@ setInterval(() => {
 
 // Auto-Pump: wenn ccRunning + kein Job läuft → starte den nächsten Task
 // automatisch. Reihenfolge: in_progress (höchste prio) > next (höchste prio).
-// "done" und "ohne pfad" werden geskippt. Cool-down 90s pro Task gegen Loops.
+// "done" und "ohne pfad" werden geskippt. Cool-down 30s pro Task gegen Loops.
 const _autoPumpCooldowns = new Map(); // taskId -> ts
 const _autoPumpMissingPathWarned = new Set(); // projectId -> 1× warnen statt 25s-spam
 let _ccApiLimitedUntil = 0; // ts — wenn claude API limit reached, pause auto-pump bis dahin
+let _dailyBudgetWarned = false; // 1× warnen statt jeden tick-spam
+
+// Post-cc-checks-lock: solange build-gate / runtime-test / self-review für
+// einen task laufen, soll autopump KEINEN neuen task auf demselben projekt
+// starten. Vorher fehlte das: ccJobs.delete passierte sofort bei cc-cli-close,
+// der 25s-tick pickte den nächsten task auf, retry (3s nach build-gate-fail)
+// crashte mit "läuft bereits" — silent fail. Jetzt: lock bis tail komplett.
+const _ccPostChecks = new Set(); // projectId — currently in build/runtime/review tail
+const AUTOPUMP_COOLDOWN_MS = 30_000;
+const AUTOPUMP_TICK_MS = 10_000;
+const CC_RUNAWAY_LIMIT_MS = 10 * 60 * 1000; // 10min — danach killen wir runaway jobs
+
+function _isProjectBusy(projectId) {
+  return ccJobs.has(projectId) || _ccPostChecks.has(projectId);
+}
+
+// Model-routing nach Project-Gamma master-prompt:
+// - sonnet-4-6 (small/fast/billig) für kleine tasks, defaultmäßig
+// - opus-4-7 (groß/komplex/teuer) für architektur, refactors, große scope
+// heuristik basiert auf signalen die wir LOKAL kennen (kein extra LLM-call).
+// regeln: jede "big"-signatur reicht → opus. sonst → sonnet.
+const BIG_KEYWORDS = /\b(refactor|rewrite|migrate|migration|architecture|architektur|umstrukturieren|umbauen|umstellen|redesign|gross|großer|großes|großen|epic|epoch|monorepo|infrastructure|infrastruktur|orchestrat|consolidate|integration|cross-cutting|breaking change|major)\b/i;
+function selectModelForTask({ task, retryAttempt, prompt }) {
+  // Force opus on retries — wenn sonnet 1-2× gescheitert ist, brauchen wir
+  // mehr reasoning-power statt blind nochmal das gleiche zu probieren.
+  if (retryAttempt && retryAttempt >= 2) return "claude-opus-4-7";
+  if (!task) {
+    // Manual cc-run via prompt → schätzung über prompt-länge.
+    if (prompt && prompt.length > 600) return "claude-opus-4-7";
+    return "claude-sonnet-4-6";
+  }
+  // Hohe priority (5+) → opus.
+  if ((task.priority || 3) >= 5) return "claude-opus-4-7";
+  // Lange titel = vermutlich epic. >120 chars heuristik.
+  if ((task.title || "").length > 120) return "claude-opus-4-7";
+  // Keywords erkennen.
+  const haystack = (task.title || "") + " " + (task.meta || "");
+  if (BIG_KEYWORDS.test(haystack)) return "claude-opus-4-7";
+  // Decomposed parent task (hat subtasks → planning): opus für die zerlegung
+  // selbst wäre teuer; tatsächlich rufen wir decompose separat. Hier: wenn
+  // dieser task SCHON subtasks hat, ist es ein parent → wir bearbeiten nur
+  // einen subtask, nicht den parent → sonnet ok.
+  return "claude-sonnet-4-6";
+}
+
+// Sofort autopump triggern (kein 25s-warten), z.b. wenn ein task gerade
+// fertig wurde. Async via setTimeout(0) damit der aktuelle handler
+// erstmal sauber zuende läuft.
+function _triggerAutoPumpNow() {
+  setTimeout(() => { autoPumpTick().catch(() => {}); }, 50);
+}
+
+// Idle-tracker für user-clients: mobile meldet idle wenn screen-off > 5min,
+// desktop wenn lock/idle-event. Wenn alle bekannten clients idle melden,
+// triggern wir sofort autopump (statt 25s-tick zu warten) — der user ist
+// gerade nicht aktiv, also können wir die zeit für cc-jobs nutzen.
+const idleTracker = createIdleTracker({ onAllIdle: _triggerAutoPumpNow });
+
+// Failure-loop state: pro task tracken wir wie oft cc retried hat + den
+// letzten fehler-output, damit der retry-prompt gezielt fixen kann statt
+// blind nochmal zu versuchen.
+const MAX_CC_RETRIES = 3;
+const _ccRetryContext = new Map(); // taskId -> { attempt, kind, exitCode, output, projectId }
+
+// Pure-helper: HTML-tags + entities aus activity-event-text rausschneiden,
+// damit cc im prompt sauberen text bekommt statt "<i>foo</i>".
+function stripHtml(s) {
+  return String(s || "")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+    .replace(/\s+/g, " ").trim();
+}
 async function autoPumpTick() {
   if (!state.ccRunning) return;
   if (NOW() < _ccApiLimitedUntil) return; // claude API limit reached — warten
+
+  // SAFETY: daily-budget-cap. Wenn last-24h-cost > cap → autopump pausiert,
+  // user muss manuell entscheiden. Default $10/24h — kann via state.ccBudget
+  // .dailyCapUsd überschrieben werden. Aktivität-log einmal bei activation.
+  const cap = (state.ccBudget && state.ccBudget.dailyCapUsd) || 10.0;
+  const now24h = NOW() - 24 * 60 * 60 * 1000;
+  const last24hCost = ((state.ccBudget && state.ccBudget.jobs) || [])
+    .filter(j => j.ts >= now24h)
+    .reduce((s, j) => s + (j.costUsd || 0), 0);
+  if (last24hCost >= cap) {
+    if (!_dailyBudgetWarned) {
+      _dailyBudgetWarned = true;
+      console.warn(`[autopump] daily-budget-cap reached: $${last24hCost.toFixed(2)} >= $${cap.toFixed(2)} — autopump pausiert`);
+      for (const project of state.projects) {
+        applyMutation("ADD_ACTIVITY", { projectId: project.id, event: {
+          type: "warn",
+          text: `daily-budget-cap erreicht ($${last24hCost.toFixed(2)} / $${cap.toFixed(2)}) — autopump pausiert. Cap in settings hochsetzen oder bis morgen warten.`,
+        }});
+      }
+      broadcastState();
+    }
+    return;
+  }
+  _dailyBudgetWarned = false;
+
+  // OPTIMIERUNG: über ALLE idle projekte parallel pumpen — vorher 'break'
+  // nach dem ersten match → 1 task pro 10s-tick total. jetzt: pro projekt
+  // 1 task parallel. für multi-projekt-users massiver durchsatz-win.
+  // SAFETY: globales concurrency-limit (max 3 parallel) gegen API-burst.
+  // bei 10 projekten würde sonst gleichzeitig 10× claude-API gehämmert →
+  // rate-limit-fast-track + heftiger token-spike auf einmal. 3 ist guter
+  // kompromiss zwischen durchsatz + budget-kontrolle.
+  const MAX_CONCURRENT_CC = 3;
+  if (ccJobs.size >= MAX_CONCURRENT_CC) return;
+  let canStart = MAX_CONCURRENT_CC - ccJobs.size;
   for (const project of state.projects) {
-    if (ccJobs.has(project.id)) continue;
+    if (canStart <= 0) break;
+    if (_isProjectBusy(project.id)) continue;
     if (!project.path || !fs.existsSync(project.path)) {
       if (!_autoPumpMissingPathWarned.has(project.id)) {
         _autoPumpMissingPathWarned.add(project.id);
@@ -336,7 +521,7 @@ async function autoPumpTick() {
     // Ersten Kandidaten ohne aktiven Cool-down nehmen
     const candidate = queue.find(t => {
       const last = _autoPumpCooldowns.get(t.id) || 0;
-      return NOW() - last > 90_000;
+      return NOW() - last > AUTOPUMP_COOLDOWN_MS;
     });
     if (!candidate) continue;
     _autoPumpCooldowns.set(candidate.id, NOW());
@@ -350,15 +535,76 @@ async function autoPumpTick() {
     triggerCc(project.id, candidate.id, null).catch(e => {
       console.log("[autopump] error:", e.message);
     });
-    break;
+    canStart--;
+    // KEIN break — nächstes projekt direkt mit-pumpen (bis canStart=0).
   }
 }
-setInterval(autoPumpTick, 25 * 1000);
+setInterval(autoPumpTick, AUTOPUMP_TICK_MS);
+
+// Watchdog: kill runaway cc-jobs nach CC_RUNAWAY_LIMIT_MS (10min). Sonst
+// bleibt ccJobs für immer belegt wenn claude API hängt oder eine endlos-
+// schleife läuft, und autopump kann nichts mehr pumpen.
+setInterval(() => {
+  const now = NOW();
+  for (const [pid, job] of ccJobs) {
+    if (now - job.startedAt > CC_RUNAWAY_LIMIT_MS) {
+      console.warn("[cc-watchdog] runaway-kill projektId=" + pid + " task=" + job.taskId + " runtime=" + Math.round((now - job.startedAt)/1000) + "s");
+      // windows: claude-cli spawnt sub-prozesse (node, git, etc.) — SIGKILL
+      // an top-process killt nur cmd.exe, kinder bleiben verwaist und halten
+      // ggf. ports/locks. killTreeSync → taskkill /pid /T /F im windows-fall.
+      killTreeSync(job.proc, { signal: "SIGKILL" });
+      // ccJobs.delete passiert über on-close handler bei normalem kill
+    }
+  }
+}, 60_000);
+
+// Stale-lock cleanup: _ccPostChecks-locks die >15min alt sind werden
+// auto-released. schützt gegen hängende build-gates / runtime-tests deren
+// promise nie resolved (z.b. flutter pub get hängt, npm test deadlock).
+// Sonst bleibt autopump für diesen projekt-id für immer blockiert.
+const _ccPostCheckStartedAt = new Map(); // projectId -> startTs, parallel zu _ccPostChecks
+const STALE_LOCK_MS = 15 * 60 * 1000;
+setInterval(() => {
+  const now = NOW();
+  for (const [pid, startTs] of _ccPostCheckStartedAt) {
+    if (now - startTs > STALE_LOCK_MS) {
+      console.warn("[cc-postcheck-watchdog] stale lock release pid=" + pid + " age=" + Math.round((now - startTs)/1000) + "s");
+      _ccPostChecks.delete(pid);
+      _ccPostCheckStartedAt.delete(pid);
+      _triggerAutoPumpNow();
+    }
+  }
+}, 60_000);
 
 // Auto-answer-ticker: wenn projekt.ccAutoAnswer=true UND eine pendingQuestion
-// länger als delaySec offen ist, schicken wir automatisch ein "autonom-weiter"
-// als prompt. Alle 3s prüfen für brauchbare granularität ohne CPU-belastung.
+// länger als delaySec offen ist, schicken wir automatisch eine konkrete antwort
+// (option-pick aus a/b/c oder rotation), DAMIT cc nicht im fragenkreis hängt.
 const _autoAnsweredAt = new Map(); // projectId -> last-answered-timestamp (verhindert burst)
+const _autoAnswerRotation = new Map(); // projectId -> letzte gewählte option (rotation)
+
+// Erkennt option-listen wie "(a) X (b) Y (c) Z" oder "1. X · 2. Y · 3. Z"
+// im fragetext. Liefert array von option-labels (max 8). Pure-helper.
+function _extractOptions(questionText) {
+  if (!questionText) return [];
+  const out = [];
+  // Pattern 1: (a) ..., (b) ..., (c) ... (mit klammern)
+  const reA = /\(([a-zA-Z])\)\s*([^()]+?)(?=\([a-zA-Z]\)|$|,\s*[bcd]\))/g;
+  let m;
+  while ((m = reA.exec(questionText)) !== null && out.length < 8) {
+    const label = m[2].trim().replace(/[.,;:]+$/, "");
+    if (label && label.length < 200) out.push(label);
+  }
+  if (out.length >= 2) return out;
+  // Pattern 2: "1. X 2. Y 3. Z" — nur wenn pattern 1 nichts fand
+  out.length = 0;
+  const reN = /\b(\d+)\.\s+([^\d][^.]*?)(?=\s+\d+\.|$)/g;
+  while ((m = reN.exec(questionText)) !== null && out.length < 8) {
+    const label = m[2].trim();
+    if (label && label.length < 200) out.push(label);
+  }
+  return out;
+}
+
 async function autoAnswerTick() {
   if (!state.ccRunning) return;
   if (NOW() < _ccApiLimitedUntil) return;
@@ -374,15 +620,49 @@ async function autoAnswerTick() {
     const lastAnswered = _autoAnsweredAt.get(project.id) || 0;
     if (NOW() - lastAnswered < 10_000) continue;
     _autoAnsweredAt.set(project.id, NOW());
-    console.log(`[auto-answer] ${project.name}: pq nach ${Math.round(since / 1000)}s autonom beantworten`);
-    const prompt = `Frage von dir war: ${pq}\nKeine antwort vom user (auto-answer-mode aktiv, ${Math.round(delay/1000)}s gewartet). Mach autonom weiter mit deiner besten annahme.`;
+
+    // Option-pick: wenn cc multiple-choice gestellt hat, wähle konkret eine
+    // (rotation, damit der user nicht 5x dieselbe option sieht falls cc
+    // dieselben fragen stellt). Sonst: explizite anweisung „entscheide selbst".
+    const opts = _extractOptions(pq);
+    let chosenIdx = 0;
+    let answerPrompt;
+    if (opts.length >= 2) {
+      const lastIdx = _autoAnswerRotation.get(project.id);
+      chosenIdx = typeof lastIdx === "number" ? (lastIdx + 1) % opts.length : 0;
+      _autoAnswerRotation.set(project.id, chosenIdx);
+      const letter = String.fromCharCode("a".charCodeAt(0) + chosenIdx);
+      answerPrompt =
+        `Frage von dir war:\n${pq}\n\n` +
+        `AUTO-ANSWER (option ${letter}): ${opts[chosenIdx]}\n\n` +
+        `Setze diese option JETZT um. Stelle KEINE weitere scope-frage; ` +
+        `wenn der scope zu groß ist, zerlege ihn SELBST und arbeite am ersten ` +
+        `konkreten teilschritt (max 1-2h arbeit). Liefere code + verifikation, ` +
+        `nicht nur planung. done=true wenn dieser teilschritt fertig ist.`;
+    } else {
+      answerPrompt =
+        `Frage von dir war:\n${pq}\n\n` +
+        `AUTO-ANSWER: keine option vorhanden → ENTSCHEIDE SELBST und arbeite ` +
+        `den ersten konkreten teilschritt ab (max 1-2h arbeit). Stelle KEINE ` +
+        `weiteren rückfragen für scope-aufteilung — wenn die aufgabe groß ist, ` +
+        `dann commit dich auf eine richtung und liefere code dafür. ` +
+        `done=true sobald der teilschritt verifizierbar fertig ist.`;
+    }
+
+    console.log(`[auto-answer] ${project.name}: pq nach ${Math.round(since / 1000)}s` +
+      (opts.length >= 2 ? ` → option ${String.fromCharCode(97+chosenIdx)}` : " → entscheide-selbst"));
+
+    // task-kontext bewahren: triggerCc mit der task-id, an der cc beim
+    // question-zeitpunkt arbeitete, NICHT mit null (was free-prompt-modus wäre)
+    const taskIdForRetry = project.pendingQuestionTaskId || null;
     applyMutation("CLEAR_PENDING_QUESTION", { projectId: project.id });
     applyMutation("ADD_ACTIVITY", { projectId: project.id, event: {
       type: "info",
-      text: `auto-answer: keine antwort nach ${Math.round(delay/1000)}s → cc macht autonom weiter`,
+      text: `auto-answer (${Math.round(delay/1000)}s gewartet): ` +
+        (opts.length >= 2 ? `option ${String.fromCharCode(97+chosenIdx)}` : `cc entscheidet selbst`),
     }});
     broadcastState();
-    triggerCc(project.id, null, prompt).catch(e => console.log("[auto-answer] error:", e.message));
+    triggerCc(project.id, taskIdForRetry, answerPrompt).catch(e => console.log("[auto-answer] error:", e.message));
   }
 }
 setInterval(autoAnswerTick, 3 * 1000);
@@ -649,15 +929,16 @@ const MUT = {
   CLEAR_ACTIVITY(s, { projectId }) {
     s.projects = s.projects.map(p => p.id !== projectId ? p : ({ ...p, activity: [] }));
   },
-  SET_PENDING_QUESTION(s, { projectId, question }) {
+  SET_PENDING_QUESTION(s, { projectId, question, taskId }) {
     s.projects = s.projects.map(p => p.id !== projectId ? p : ({
       ...p, pendingQuestion: String(question || "").slice(0, 1000),
       pendingQuestionAt: NOW(),
+      pendingQuestionTaskId: taskId || null, // damit auto-answer den task-kontext kennt
     }));
   },
   CLEAR_PENDING_QUESTION(s, { projectId }) {
     s.projects = s.projects.map(p => p.id !== projectId ? p : ({
-      ...p, pendingQuestion: null, pendingQuestionAt: null,
+      ...p, pendingQuestion: null, pendingQuestionAt: null, pendingQuestionTaskId: null,
     }));
   },
   // Auto-answer-mode: wenn an, beantwortet der server pendingQuestions
@@ -711,9 +992,27 @@ const MUT = {
     bug.id = bug.id || genId();
     bug.ts = bug.ts || NOW();
     bug.status = bug.status || "pending";
-    s.projects = s.projects.map(p => p.id !== projectId ? p : ({
-      ...p, bugs: [bug, ...(p.bugs || [])].slice(0, 100),
-    }));
+    s.projects = s.projects.map(p => {
+      if (p.id !== projectId) return p;
+      // FIX #6: dedup nur wenn BEIDE seiten description haben.
+      // Vorher: undef===undef → wahr → alle bugs ohne description wurden geschluckt.
+      const newDescr = (bug.description || "").trim().toLowerCase();
+      const newLoc = (bug.location || "").trim();
+      const existing = (p.bugs || []).find(b => {
+        if (b.status === "resolved") return false;
+        const bDescr = (b.description || "").trim().toLowerCase();
+        const bLoc = (b.location || "").trim();
+        // Match 1: exact description (beide nicht-leer)
+        if (newDescr && bDescr && newDescr === bDescr) return true;
+        // Match 2: gleiche location + ähnlicher description-anfang
+        if (newLoc && bLoc && newLoc === bLoc && newDescr && bDescr) {
+          if (newDescr.slice(0, 40) === bDescr.slice(0, 40)) return true;
+        }
+        return false;
+      });
+      if (existing) return p; // skip duplicate
+      return { ...p, bugs: [bug, ...(p.bugs || [])].slice(0, 100) };
+    });
   },
   SET_BUG_STATUS(s, { projectId, bugId, status }) {
     s.projects = s.projects.map(p => p.id !== projectId ? p : ({
@@ -917,10 +1216,12 @@ const _NON_PROJECT_MUTATIONS = new Set([
 function _projectIdForOp(type, payload) {
   if (_NON_PROJECT_MUTATIONS.has(type)) return null;
   if (type === "ADD_PROJECT") {
-    // Beim ADD_PROJECT hat das gerade angelegte project schon eine id, weil
-    // MUT.ADD_PROJECT sie inline generiert. State ist bereits gespeichert.
-    const last = state.projects[state.projects.length - 1];
-    return last ? last.id : null;
+    // payload.project ist dieselbe object-ref, die MUT.ADD_PROJECT in
+    // state.projects gepusht hat — id ist inline gesetzt (siehe MUT.ADD_PROJECT).
+    // Race-fix: state.projects[length-1] ist bei parallelen ADD_PROJECT
+    // fragil und kann auf ein anderes gleichzeitig angelegtes projekt zeigen.
+    const created = payload && payload.project;
+    return created && created.id ? created.id : null;
   }
   if (type === "REMOVE_PROJECT") return payload && payload.projectId;
   return (payload && payload.projectId) || null;
@@ -941,10 +1242,17 @@ function recordAndBroadcastOp(type, payload, ctx) {
   // dann nur loggen, kein broadcast.
   if (typeof wss === "undefined" || !wss || !wss.clients) return;
   const data = JSON.stringify(frame);
+  // Fix C · membership-filter: pair-tokens (kein userId) sehen alles (legacy).
+  // user-tokens sehen OP_APPEND nur wenn sie membership im projekt haben.
+  // Vorher: jeder client kriegte ALLE ops aller projekte → spam.
   for (const client of wss.clients) {
-    if (client.readyState === 1) {
-      try { client.send(data); } catch (_) {}
+    if (client.readyState !== 1) continue;
+    const sess = client._session;
+    if (sess && sess.userId && memberships) {
+      const role = memberships.getRole(projectId, sess.userId);
+      if (!role) continue; // kein zugriff, kein broadcast
     }
+    try { client.send(data); } catch (_) {}
   }
 }
 
@@ -961,7 +1269,18 @@ app.use(express.json({ limit: "8mb" }));
 const DESKTOP_APP_DIR = path.join(__dirname, "..", "desktop-app");
 const desktopUiAvailable = fs.existsSync(path.join(DESKTOP_APP_DIR, "index.html"));
 if (desktopUiAvailable) {
-  app.use(express.static(DESKTOP_APP_DIR, { index: "index.html", extensions: ["html"] }));
+  // no-cache headers — sonst zeigt browser nach update.bat noch alte JS/CSS
+  // weil chrome ohne expliziten cache-bust JS-files aggressiv cached.
+  // mit 'no-cache' lädt browser bei jedem reload neu (revalidation per
+  // ETag) — bandwidth-overhead ist minimal weil 304 zurückkommt wenn
+  // sich nichts geändert hat. team-clients sehen update beim nächsten F5.
+  app.use(express.static(DESKTOP_APP_DIR, {
+    index: "index.html",
+    extensions: ["html"],
+    setHeaders: (res, p) => {
+      res.setHeader("Cache-Control", "no-cache, must-revalidate");
+    },
+  }));
   console.log("[ui] desktop-app static serving von", DESKTOP_APP_DIR);
 } else {
   console.log("[ui] desktop-app folder nicht gefunden — static serving deaktiviert");
@@ -991,6 +1310,10 @@ app.get("/health", (req, res) => {
     sessions: sessions.size,
     pairings: pairings.size,
     projects: state.projects.length,
+    // isLocal: false → der client erreicht den server über tunnel/FQDN, NICHT
+    // direkt über localhost/LAN. BootPairing darf dann KEIN auto-selfInit
+    // versuchen (würde 403 geben) → user muss team-beitreten wählen.
+    isLocal: isLocalRequest(req),
   });
 });
 
@@ -1008,6 +1331,28 @@ function _rankLanIp(ip) {
   if (/^172\.(1[6-9]|2[0-9]|3[01])\./.test(ip)) return 20; // 172.16-31
   return 10;
 }
+// Setup-check: erste user merken sofort wenn deps fehlen. Public-endpoint
+// (kein auth) damit UI vor pairing pingen kann. Resultat wird 30s gecached
+// damit der UI-poll nicht jede prüfung erneut spawned (~1s pro check).
+let _setupCache = null;
+let _setupCacheTs = 0;
+const SETUP_CACHE_MS = 30 * 1000;
+app.get("/api/setup-check", async (req, res) => {
+  const force = req.query.force === "1";
+  const now = NOW();
+  if (!force && _setupCache && (now - _setupCacheTs) < SETUP_CACHE_MS) {
+    return res.json({ ...{}, ..._setupCache, cached: true });
+  }
+  try {
+    const result = await runSetupCheck({ baseDir: path.resolve(__dirname, "..") });
+    _setupCache = result;
+    _setupCacheTs = now;
+    res.json({ ...result, cached: false });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 app.get("/api/network-info", (req, res) => {
   const ifaces = require("os").networkInterfaces();
   const lanIps = [];
@@ -1041,14 +1386,27 @@ app.get("/api/network-info", (req, res) => {
   res.json({ port: PORT, ips: lanIps, routes, tunnel: cf });
 });
 
-// Cloudflare Tunnel control — desktop-only (lokal/trusted).
+// Cloudflare Tunnel control — desktop-pair-session ODER user-account mit
+// owner-rolle in mindestens einem projekt (server-administration darf nur,
+// wer auch lokal oder als account-admin auf dem server registriert ist —
+// `/api/auth/register` ist beim ersten user localhost-gated).
+function _canControlTunnel(session) {
+  if (!session) return false;
+  if (isDesktopSession(session)) return true;
+  // user-token: owner irgendeines projekts?
+  if (session.userId && memberships) {
+    const list = memberships.listProjectsForUser(session.userId) || [];
+    return list.some(m => m.role === ROLES.OWNER);
+  }
+  return false;
+}
 app.post("/api/tunnel/start", authMw, async (req, res) => {
-  if (!isDesktopSession(req.session)) return res.status(403).json({ error: "desktop session required" });
+  if (!_canControlTunnel(req.session)) return res.status(403).json({ error: "desktop-session oder owner-account erforderlich" });
   const r = await cloudflareTunnel.start();
   res.json(r);
 });
 app.post("/api/tunnel/stop", authMw, (req, res) => {
-  if (!isDesktopSession(req.session)) return res.status(403).json({ error: "desktop session required" });
+  if (!_canControlTunnel(req.session)) return res.status(403).json({ error: "desktop-session oder owner-account erforderlich" });
   const r = cloudflareTunnel.stop();
   res.json(r);
 });
@@ -1097,15 +1455,40 @@ app.post("/api/pair/init", (req, res) => {
   });
 });
 
+// Helper: prüft ob ein Request WIRKLICH vom localhost kommt — nicht nur per
+// socket-IP, sondern auch per host-header. Sonst kann ein cloudflare-tunnel
+// (cloudflared läuft auf dem server und forwarded an 127.0.0.1) den localhost-
+// gate umgehen: socket-IP wäre 127.0.0.1, aber der originale request kam aus
+// dem internet. Verifiziert: über tunnel war /api/pair/desktop-init aufrufbar
+// und gab pair-tokens mit vollzugriff aus.
+function isLocalRequest(req) {
+  const ip = req.ip || req.connection?.remoteAddress || "";
+  const ipIsLocal =
+    ip === "127.0.0.1" || ip === "::1" || ip === "::ffff:127.0.0.1" ||
+    ip.startsWith("127.");
+  if (!ipIsLocal) return false;
+  // host-header muss localhost oder eine LAN-IP sein. Tunnel-hostnames
+  // (*.trycloudflare.com, *.ngrok.io, eigene FQDNs) → block.
+  const host = (req.hostname || "").toLowerCase();
+  return (
+    host === "localhost" ||
+    host === "127.0.0.1" ||
+    host === "::1" ||
+    host === "[::1]" ||
+    /^192\.168\./.test(host) ||
+    /^10\./.test(host) ||
+    /^172\.(1[6-9]|2[0-9]|3[01])\./.test(host)
+  );
+}
+
 // Desktop-Self-Init: nur über localhost erreichbar, erzeugt Desktop-Session
 // ohne Pairing-Code (Desktop ist Trust-Boundary). Idempotent: wenn schon eine
 // Desktop-Session mit gleichem Namen existiert, wird der bestehende Token zurückgegeben.
 app.post("/api/pair/desktop-init", (req, res) => {
-  const ip = req.ip || req.connection?.remoteAddress || "";
-  const isLocal =
-    ip === "127.0.0.1" || ip === "::1" || ip === "::ffff:127.0.0.1" ||
-    ip.startsWith("127.") || req.hostname === "localhost";
-  if (!isLocal) return res.status(403).json({ error: "nur lokal erreichbar" });
+  if (!isLocalRequest(req)) {
+    console.warn("[pair] desktop-init blocked: non-local request host=" + req.hostname + " ip=" + req.ip);
+    return res.status(403).json({ error: "nur lokal erreichbar — für team-collab nutze account-login (team beitreten)" });
+  }
 
   const deviceName = (req.body && req.body.deviceName) || "desktop";
 
@@ -1201,9 +1584,11 @@ app.post("/api/auth/register", async (req, res) => {
   // bestehenden projekte. Damit ein angreifer auf einem öffentlich
   // erreichbaren server nicht den account klauen kann: erste registrierung
   // muss von localhost kommen.
-  const isLocal =
-    ip === "127.0.0.1" || ip === "::1" || ip === "::ffff:127.0.0.1" ||
-    ip.startsWith("127.") || req.hostname === "localhost";
+  // SECURITY-FIX: vorher inline-check mit ||-or-logik konnte über
+  // cloudflare-tunnel umgangen werden (req.ip = 127.0.0.1 via cloudflared
+  // → isLocal=true trotz fremdem origin). Jetzt zentraler helper der
+  // ip+host BEIDES prüft.
+  const isLocal = isLocalRequest(req);
   let anyMembership = false;
   if (memberships) {
     for (const p of (state.projects || [])) {
@@ -1242,10 +1627,25 @@ app.post("/api/auth/register", async (req, res) => {
         } catch (e) { /* foreign-key falls user nicht gefunden — unwahrscheinlich */ }
       }
       console.log("[auth] bootstrap: erster user → owner aller bestehenden projekte");
+    } else {
+      // Kein bootstrap: prüfe ob es pre-invite gibt (owner hat vor register
+      // schon eingeladen). Übernehmen + cleanup.
+      try {
+        const claimed = memberships.claimPendingForEmail(user.email, user.id);
+        if (claimed.length > 0) {
+          console.log("[auth] register:", user.email, "claimed", claimed.length, "pending invite(s)");
+        }
+      } catch (e) {
+        console.log("[auth] claim-pending failed for", user.email, "-", e.message);
+      }
     }
   }
   const sess = usersStore.createSession({ userId: user.id, ttlMs: USER_SESSION_TTL_MS });
   console.log("[auth] register:", user.email);
+  // Nach claim: broadcast neuen state, damit owner-tabs die neue
+  // membership in /api/projects/:id/members sehen + invitee bei WS-connect
+  // direkt seine projekte bekommt.
+  broadcastState();
   res.status(201).json({
     token: sess.token,
     user: { id: user.id, email: user.email, createdAt: user.createdAt },
@@ -1256,25 +1656,37 @@ app.post("/api/auth/register", async (req, res) => {
 app.post("/api/auth/login", async (req, res) => {
   if (!usersStore) return res.status(503).json({ error: "multi-user nicht aktiv" });
   const ip = req.ip || req.connection?.remoteAddress || "unknown";
-  const gate = loginRateLimiter.check(ip);
-  if (!gate.allowed) {
-    res.set("Retry-After", String(gate.retryAfterSec));
-    return res.status(429).json({
-      error: "zu viele fehlversuche, später erneut probieren",
-      retryAfterSec: gate.retryAfterSec,
-    });
+  // Owner auf localhost umgeht den rate-limiter — sonst sperrt er sich
+  // selbst aus bei vertippern. Nur fremde IPs (über tunnel/LAN) sind
+  // limit-relevant (brute-force-schutz).
+  const isLocal = isLocalRequest(req);
+  if (!isLocal) {
+    const gate = loginRateLimiter.check(ip);
+    if (!gate.allowed) {
+      res.set("Retry-After", String(gate.retryAfterSec));
+      return res.status(429).json({
+        error: "zu viele fehlversuche, später erneut probieren",
+        retryAfterSec: gate.retryAfterSec,
+      });
+    }
   }
   const { email, password } = req.body || {};
   if (!_emailValid(email) || !password || typeof password !== "string") {
-    loginRateLimiter.recordFailure(ip);
+    if (!isLocal) loginRateLimiter.recordFailure(ip);
     return res.status(400).json({ error: "email + passwort erforderlich" });
   }
   const user = usersStore.findUserByEmail(email);
-  // timing-anfällige antwort vermeiden: bei unbekanntem user trotzdem hash-cost
-  // simulieren wäre overkill; wir geben einfach „ungültige zugangsdaten".
-  if (!user || !verifyPassword(password, user.passwordHash)) {
-    loginRateLimiter.recordFailure(ip);
-    return res.status(401).json({ error: "ungültige zugangsdaten" });
+  // Bessere fehler-unterscheidung: wenn die email nicht registriert ist,
+  // sagen wir das. Sonst sagen wir 'passwort falsch'. Auf einem öffentlichen
+  // server wäre das email-enumeration risiko — auf einem personal-server
+  // mit single-digit users ist die klarheit für den user wichtiger.
+  if (!user) {
+    if (!isLocal) loginRateLimiter.recordFailure(ip);
+    return res.status(404).json({ error: "email nicht registriert — erst auf 'registrieren' klicken oder vertippt?" });
+  }
+  if (!verifyPassword(password, user.passwordHash)) {
+    if (!isLocal) loginRateLimiter.recordFailure(ip);
+    return res.status(401).json({ error: "passwort falsch" });
   }
   const sess = usersStore.createSession({ userId: user.id, ttlMs: USER_SESSION_TTL_MS });
   console.log("[auth] login:", user.email);
@@ -1283,6 +1695,35 @@ app.post("/api/auth/login", async (req, res) => {
     user: { id: user.id, email: user.email, createdAt: user.createdAt },
     expiresAt: sess.expiresAt,
   });
+});
+
+// Admin-reset-password — localhost-only. Owner kann am desktop einen
+// vergessenen account-password zurücksetzen (eigenen oder eingeladenen).
+// Schutz: nur von 127.0.0.1 + localhost-hostname (isLocalRequest).
+app.post("/api/auth/admin-reset-password", async (req, res) => {
+  if (!usersStore) return res.status(503).json({ error: "multi-user nicht aktiv" });
+  if (!isLocalRequest(req)) {
+    return res.status(403).json({ error: "passwort-reset nur vom desktop/localhost — auf deinem rechner einloggen, dort resetten" });
+  }
+  const { email, newPassword } = req.body || {};
+  if (!_emailValid(email)) return res.status(400).json({ error: "email ungültig" });
+  if (!newPassword || typeof newPassword !== "string" || newPassword.length < 8) {
+    return res.status(400).json({ error: "neues passwort muss mind. 8 zeichen sein" });
+  }
+  if (!usersStore.findUserByEmail(email)) {
+    return res.status(404).json({ error: "email nicht registriert" });
+  }
+  let hash;
+  try { hash = hashPassword(newPassword); }
+  catch (e) { return res.status(400).json({ error: e.message }); }
+  try {
+    const ok = usersStore.adminResetPassword({ email, passwordHash: hash });
+    if (!ok) return res.status(404).json({ error: "reset fehlgeschlagen" });
+    console.log("[auth] admin-reset password:", email);
+    res.json({ ok: true, email: String(email).trim().toLowerCase() });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.post("/api/auth/logout", (req, res) => {
@@ -1459,9 +1900,11 @@ app.post("/api/mutate", authMw, (req, res) => {
   if (!access.ok) return res.status(access.status || 403).json({ error: access.reason });
   try {
     applyMutation(type, payload, { session: req.session });
-    // ADD_PROJECT: anlegenden user automatisch als owner zum projekt hinzufügen
+    // ADD_PROJECT: anlegenden user automatisch als owner zum projekt hinzufügen.
+    // Analog WS-handler: payload.project ist dieselbe object-ref wie in s.projects
+    // gepusht (MUT.ADD_PROJECT setzt id inline). Robuster als length-1-zugriff.
     if (type === "ADD_PROJECT" && req.session && req.session.userId && memberships) {
-      const created = state.projects[state.projects.length - 1];
+      const created = payload && payload.project;
       if (created && created.id) {
         try {
           memberships.addMember({
@@ -1562,6 +2005,47 @@ app.get("/api/projects/:id/ops", authMw, (req, res) => {
   const ops = opLogStore.opsSince(project.id, since).slice(0, limit);
   const head = opLogStore.head(project.id);
   res.json({ projectId: project.id, since, ops, head });
+});
+
+// ─── Git-History + Rollback (Task 7) ──────────────────────────
+// Listet die letzten cc-commits aus git log. Read-only, session-scoped.
+app.get("/api/projects/:id/git/commits", authMw, async (req, res) => {
+  const project = state.projects.find(p => p.id === req.params.id);
+  if (!project) return res.status(404).json({ error: "projekt nicht gefunden" });
+  if (req.session?.userId && memberships &&
+      !memberships.hasRole(project.id, req.session.userId, ROLES.VIEWER)) {
+    return res.status(403).json({ error: "keine berechtigung" });
+  }
+  if (!project.path || !gitIsRepo(project.path)) {
+    return res.json({ projectId: project.id, isGitRepo: false, commits: [] });
+  }
+  const limit = Math.min(Math.max(Number(req.query.limit) || 20, 1), 100);
+  const commits = await gitListCcCommits(project.path, limit);
+  res.json({ projectId: project.id, isGitRepo: true, commits });
+});
+
+// Rollback letzter cc-commit. Nur owner. Hard-reset HEAD~1. Lokal, kein push.
+app.post("/api/projects/:id/git/rollback", authMw, async (req, res) => {
+  const project = state.projects.find(p => p.id === req.params.id);
+  if (!project) return res.status(404).json({ error: "projekt nicht gefunden" });
+  if (req.session?.userId && memberships &&
+      !memberships.hasRole(project.id, req.session.userId, ROLES.OWNER)) {
+    return res.status(403).json({ error: "nur owner darf rollback" });
+  }
+  if (!project.path || !gitIsRepo(project.path)) {
+    return res.status(400).json({ error: "kein git-repo" });
+  }
+  const r = await gitRollbackLast(project.path);
+  if (!r.ok) return res.status(500).json({ error: r.error || "rollback fehlgeschlagen" });
+  applyMutation("ADD_ACTIVITY", { projectId: project.id, event: {
+    type: "warn", text: "git rollback (HEAD~1)",
+  }});
+  applyMutation("ADD_SYNC_LOG", { entry: {
+    source: "system", projectId: project.id,
+    text: "git rollback durch user · HEAD~1 hard-reset",
+  }});
+  broadcastState();
+  res.json({ ok: true });
 });
 
 // ─── Attachments (bilder + files für chat) ────────────────────
@@ -1715,7 +2199,14 @@ app.get("/api/projects/:id/members", authMw, (req, res) => {
     const u = usersStore && usersStore.findUserById(m.userId);
     return { userId: m.userId, email: u ? u.email : null, role: m.role, addedAt: m.addedAt };
   });
-  res.json({ projectId: project.id, members: out });
+  // Pending invites (vor-eingeladene emails ohne registrierten user) ebenfalls
+  // ausgeben — UI kann sie als "wartet auf registrierung" anzeigen.
+  const pending = memberships.listPendingForProject
+    ? memberships.listPendingForProject(project.id).map(p => ({
+        email: p.email, role: p.role, addedAt: p.addedAt, pending: true,
+      }))
+    : [];
+  res.json({ projectId: project.id, members: out, pending });
 });
 
 app.post("/api/projects/:id/members", authMw, (req, res) => {
@@ -1725,9 +2216,29 @@ app.post("/api/projects/:id/members", authMw, (req, res) => {
   if (!_requireProjectAccess(req, res, project, ROLES.OWNER)) return;
   const { email, role } = req.body || {};
   if (!email || typeof email !== "string") return res.status(400).json({ error: "email fehlt" });
-  const target = usersStore.findUserByEmail(email);
-  if (!target) return res.status(404).json({ error: "user nicht gefunden" });
   const r = (role && [ROLES.OWNER, ROLES.MEMBER, ROLES.VIEWER].includes(role)) ? role : ROLES.MEMBER;
+  const target = usersStore.findUserByEmail(email);
+
+  // Pending-invite-flow: wenn user noch nicht registriert ist, speichern wir
+  // die einladung. Beim register wird sie automatisch als membership übernommen.
+  // Behebt das "user nicht gefunden"-friction wenn owner einlädt, bevor der
+  // kollege auf der tunnel-URL einen account angelegt hat.
+  if (!target) {
+    try {
+      const inv = memberships.addPendingInvite({
+        projectId: project.id, email, role: r,
+        addedBy: req.session?.userId || null,
+      });
+      console.log("[membership] pending invite:", inv.email, "->", project.id, r);
+      broadcastState();
+      return res.status(202).json({
+        pending: true, email: inv.email, projectId: project.id, role: r,
+        message: "einladung gespeichert — wird aktiv sobald sich der user mit dieser email registriert.",
+      });
+    } catch (e) {
+      return res.status(400).json({ error: e.message });
+    }
+  }
   try {
     const m = memberships.addMember({
       projectId: project.id, userId: target.id, role: r,
@@ -1750,6 +2261,23 @@ app.post("/api/projects/:id/members", authMw, (req, res) => {
       inviter: req.session?.deviceName || "owner",
     });
     res.status(201).json({ ...m, email: target.email });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+// Pending-invite entfernen: owner kann seine wartende einladung zurücknehmen.
+// userId-prefix "pending:<email>" damit der existierende DELETE-handler die
+// zwei fälle (echter user vs pending) unterscheidet.
+app.delete("/api/projects/:id/pending/:email", authMw, (req, res) => {
+  if (!memberships) return res.status(503).json({ error: "multi-user nicht aktiv" });
+  const project = state.projects.find(p => p.id === req.params.id);
+  if (!project) return res.status(404).json({ error: "projekt nicht gefunden" });
+  if (!_requireProjectAccess(req, res, project, ROLES.OWNER)) return;
+  try {
+    memberships.removePendingInvite(project.id, decodeURIComponent(req.params.email));
+    broadcastState();
+    res.json({ ok: true });
   } catch (e) {
     res.status(400).json({ error: e.message });
   }
@@ -1821,12 +2349,26 @@ app.get("/api/updates/apk/download", authMw, (req, res) => {
 
 app.post("/api/logout", authMw, (req, res) => {
   sessions.delete(req.token);
+  idleTracker.removeSession(req.token);
   persistSessions();
   // Trenne ggf. offene WS für diesen Token
   for (const c of wss.clients) {
     if (c._token === req.token) try { c.close(); } catch (e) {}
   }
   res.json({ ok: true });
+});
+
+// Idle-status melden. Body: { idle: boolean, since?: number (ms epoch) }.
+// Mobile clients schicken idle=true wenn screen >5min off war, desktop bei
+// lock/idle. allIdle-übergang triggert autopump sofort (siehe idleTracker).
+app.post("/api/idle", authMw, (req, res) => {
+  const { idle, since } = req.body || {};
+  if (typeof idle !== "boolean") {
+    return res.status(400).json({ error: "idle muss boolean sein" });
+  }
+  const safeSince = typeof since === "number" && since > 0 ? since : NOW();
+  idleTracker.setIdle(req.token, idle, safeSince);
+  res.json({ ok: true, allIdle: idleTracker.allIdle(), idleCount: idleTracker.idleCount() });
 });
 
 // Device entfernen (vom Desktop initiiert, betrifft anderen Token).
@@ -1839,6 +2381,7 @@ app.delete("/api/sessions/:token", authMw, (req, res) => {
 
   const target = sessions.get(targetToken);
   sessions.delete(targetToken);
+  idleTracker.removeSession(targetToken);
   persistSessions();
 
   // WebSocket des entfernten Geräts schließen → Phone merkt es und zeigt Pairing-Screen
@@ -1875,7 +2418,7 @@ function ccStatus(projectId) {
 async function triggerCc(projectId, taskId, prompt) {
   const project = state.projects.find(p => p.id === projectId);
   if (!project) { const e = new Error("projekt nicht gefunden"); e.status = 404; throw e; }
-  if (ccJobs.has(projectId)) { const e = new Error("cloud-code läuft bereits"); e.status = 409; throw e; }
+  if (_isProjectBusy(projectId)) { const e = new Error("cloud-code läuft bereits"); e.status = 409; throw e; }
   // Regel-Linter vor jedem Cloud-Code-Run (errors blockieren, warnings nur loggen)
   const lint = lintCcRules(project);
   console.log("[cc] " + formatCcLint(lint));
@@ -1912,33 +2455,177 @@ app.post("/api/cc/run", authMw, async (req, res) => {
 function _startCcJob(project, taskId, prompt) {
   const projectId = project.id;
 
-  const cwd = project.path && fs.existsSync(project.path) ? project.path : process.cwd();
+  // Bug-fix: vorher fiel cwd silent auf process.cwd() (= sync-server/) zurück,
+  // wenn project.path fehlte/nicht existierte. cc lief dann im server-folder
+  // und sah nur sync-server-files — symptom: "cc liest/grept, schreibt aber
+  // nichts". Jetzt: klarer fehler mit activity-log statt fake-run.
+  if (!project.path || !fs.existsSync(project.path)) {
+    applyMutation("ADD_ACTIVITY", { projectId, event: {
+      type: "warn",
+      text: "cloud-code blockiert: projekt-pfad fehlt oder existiert nicht — bitte in den projekt-einstellungen setzen " +
+            "(<code>" + escapeHtml(project.path || "(leer)") + "</code>)",
+    }});
+    broadcastState();
+    const e = new Error("projekt-pfad fehlt oder existiert nicht auf diesem rechner: " +
+      JSON.stringify(project.path || "") + " — setze ihn in den projekt-einstellungen");
+    e.status = 412;
+    throw e;
+  }
+  const cwd = project.path;
   const task = taskId ? project.tasks.find(t => t.id === taskId) : null;
 
   // Prompt zusammenstellen aus Projekt-Kontext (Regeln, Ziele, Aufgabe).
   // Bitte claude am Ende einen JSON-Block mit Regel-Vorschlägen auszugeben,
   // den der Server parsed und als „cc-vorschlag"-Regeln erstellt (inaktiv).
-  const activeRules = project.rules.filter(r => r.active).map(r => "- " + r.text);
-  const inactiveRules = project.rules.filter(r => !r.active).map(r => "- " + r.text);
-  // Tombstones: regeln, die der user kürzlich entfernt hat. Damit cc nicht
-  // unbedacht dieselben texte als RULE_SUGGESTIONS wieder vorschlägt.
-  const removedRules = (project.removedRules || []).slice(0, 10).map(r => "- " + r.text);
+  // ─── SMART CONTEXT (BM25 retrieval) ─────────────────────────
+  // Statt alle rules/activity/bugs in den prompt zu dumpen, picken wir die
+  // task-relevantesten via BM25-keyword-überlappung. Query = task.title +
+  // optionaler prompt-text. Spart 50-80% prompt-tokens bei projekten mit
+  // vielen rules ohne kontext-verlust für den aktuellen task.
+  // (master-spec items: smart context loading, semantic retrieval,
+  // multi-memory — domains: rules=semantic, activity=long-term, bugs=project)
+  const _query = ((task && task.title) || prompt || "").slice(0, 500);
+
+  // Active rules: IMMER alle einhalten (kein retrieval), aber wenn projekt
+  // viele hat → nur top-N relevante prominent zeigen + rest als "+N weitere".
+  const _activeAll = project.rules.filter(r => r.active);
+  let activeRules;
+  if (_activeAll.length <= 8) {
+    activeRules = _activeAll.map(r => "- " + r.text);
+  } else {
+    const topActive = _pickContextTopK({
+      query: _query, corpus: _activeAll, k: 6, idKey: "id", textKey: "text",
+    });
+    activeRules = [
+      ...topActive.map(r => "- " + r.text),
+      `- (+ ${_activeAll.length - topActive.length} weitere aktive regeln — wenn relevant, im projekt-state schauen)`,
+    ];
+  }
+
+  // Inactive rules + removed rules: nur die task-relevantesten (BM25, k=3).
+  const inactiveRules = _pickContextTopK({
+    query: _query,
+    corpus: project.rules.filter(r => !r.active),
+    k: 3, idKey: "id", textKey: "text",
+  }).map(r => "- " + String(r.text || "").slice(0, 100));
+  const removedRules = _pickContextTopK({
+    query: _query,
+    corpus: project.removedRules || [],
+    k: 3, idKey: "id", textKey: "text",
+  }).map(r => "- " + String(r.text || "").slice(0, 80));
   const goals = project.goals || [];
+
+  // Activity: BM25 über letzte 30 events (long-term memory), top-3 relevante.
+  // Bugs: BM25 über alle pending bugs (project memory), top-3 relevante.
+  const recentActivity = _pickContextTopK({
+    query: _query,
+    corpus: (project.activity || [])
+      .filter(a => ["check","write","warn","edit","rule"].includes(a.type))
+      .slice(0, 30)
+      .map((a, i) => ({ id: a.id || "_a" + i, text: stripHtml(a.text || "") })),
+    k: 3, idKey: "id", textKey: "text",
+  }).map(a => "- " + String(a.text).slice(0, 100));
+  const openBugs = _pickContextTopK({
+    query: _query,
+    corpus: (project.bugs || [])
+      .filter(b => b.status === "pending")
+      .map(b => ({ id: b.id, text: b.description || "", severity: b.severity })),
+    k: 3, idKey: "id", textKey: "text",
+  }).map(b => "- [" + (b.severity || "?") + "] " + String(b.text).slice(0, 80));
+  const lastCcCheck = (project.activity || [])
+    .find(a => a.type === "check" && /cc auto-checkmark/.test(a.text || ""));
+  const lastCcSummary = lastCcCheck ? stripHtml(lastCcCheck.text).slice(0, 200) : null;
+
+  // Failure-context: wenn dieser run ein retry ist (vorheriger build/test
+  // fehlgeschlagen), fügen wir die fehlerausgabe in den prompt ein, damit
+  // cc gezielt den fehler fixt statt blind nochmal zu versuchen.
+  const retryContext = _ccRetryContext.get(taskId || "");
+
   const fullPrompt = [
     "Arbeite am Projekt: " + project.name + " (" + project.tech + ").",
+    "PROJEKT-PFAD: " + cwd,
+    "WICHTIG: alle datei-operationen (Read/Edit/Write/Glob/Grep/Bash) müssen",
+    "in diesem pfad oder darunter stattfinden. Das ist KEIN sync-server-projekt,",
+    "es ist das echte ziel-projekt — schreibe wirklich code, nicht nur lesen.",
     "",
     goals.length ? "PROJEKTZIELE:\n" + goals.map(g => "- " + g).join("\n") : "",
     activeRules.length ? "AKTIVE REGELN (immer einhalten):\n" + activeRules.join("\n") : "",
     inactiveRules.length ? "INAKTIVE REGELN (zur info):\n" + inactiveRules.join("\n") : "",
     removedRules.length ? "KÜRZLICH ENTFERNTE REGELN (NICHT erneut vorschlagen):\n" + removedRules.join("\n") : "",
+    recentActivity.length ? "LETZTE PROJEKT-AKTIVITÄT (kontext, was kürzlich passierte):\n" + recentActivity.join("\n") : "",
+    openBugs.length ? "OFFENE BUGS (höhere prio falls passt):\n" + openBugs.join("\n") : "",
+    lastCcSummary ? "LETZTER CC-CHECKMARK: " + lastCcSummary : "",
     "",
     "AUFGABE:",
     task ? task.title : (prompt || "Was wäre als nächstes sinnvoll? Gib einen kurzen Plan in 3-5 Punkten."),
     task && prompt ? "\nZUSATZ: " + prompt : "",
+    retryContext ? "\n⚠️ DIES IST EIN RETRY (versuch " + retryContext.attempt + "/" + MAX_CC_RETRIES + "). VORHERIGER VERSUCH FEHLGESCHLAGEN:\n" +
+      "Gate: " + retryContext.kind + " (exit " + (retryContext.exitCode ?? "?") + ")\n" +
+      "Fehlerausgabe (letzte zeilen):\n```\n" + retryContext.output.split(/\r?\n/).slice(-30).join("\n") + "\n```\n" +
+      "FIX den konkreten fehler, mach den task NICHT von vorne. " +
+      "ABSOLUT VERBOTEN als 'fix': --no-verify, --skip-tests, eslint-disable, " +
+      "@ts-ignore, test-xfail/skip, regeln deaktivieren, `as any`/`dynamic`. " +
+      (retryContext.attempt >= 2
+        ? "ZWEITER+ retry: wenn du den fehler nicht klar verstanden hast, lies " +
+          "die relevanten files NEU (auch tests), und erkläre im summary WAS der " +
+          "root cause war, bevor du fixt. Symptom-fix akzeptieren wir nicht."
+        : "")
+      : "",
     "",
-    "WICHTIG: Halte deine Antwort kurz (max. 250 Wörter). Du DARFST und SOLLST",
-    "Dateien lesen und schreiben (bypassPermissions ist aktiv) um die Aufgabe",
-    "zu erledigen. Halte alle aktiven Regeln strikt ein.",
+    "Du DARFST und SOLLST Dateien lesen und schreiben (bypassPermissions ist aktiv)",
+    "um die Aufgabe zu erledigen. Halte alle aktiven Regeln strikt ein.",
+    "",
+    "OUTPUT-BUDGET (wichtig — token + zeit sparen):",
+    "  - TASK_PLAN: max 6 schritte, je ein satz.",
+    "  - tool-aufrufe: kein meta-talk vor/nach. einfach machen.",
+    "  - TASK_STATUS.summary: max 200 zeichen (was du getan hast).",
+    "  - kein 'lass mich das jetzt tun…' / 'ich werde nun…' — direkt handeln.",
+    "  - keine wiederholungen vom prompt-content im output.",
+    "  - bei großen file-changes: NICHT den ganzen file-content zitieren.",
+    "",
+    "BLOCKER-RESOLUTION (wichtig wenn du auf hindernisse stößt):",
+    "  - Build/test/lint fehler → fixe die URSACHE im code, NICHT umgehen.",
+    "    NIEMALS: `--no-verify`, `// eslint-disable`, test-skip/xfail ohne",
+    "    bug-ticket, `@ts-ignore` ohne kommentar warum, regeln deaktivieren.",
+    "  - Fehlende dependency → installieren (npm/pub/cargo add), commit mit pkg.",
+    "  - Type-error → echten typ fixen, kein `as any` / `dynamic` ohne grund.",
+    "  - Test failt → erst test lesen + verstehen WAS er prüft, dann production",
+    "    code anpassen. Test ÄNDERN nur wenn du erklären kannst warum die",
+    "    erwartung falsch war (summary muss das nennen).",
+    "  - Konflikt mit einer aktiven REGEL → halte die regel ein, finde anderen",
+    "    weg. NIEMALS regel deaktivieren um deinen weg zu rechtfertigen.",
+    "  - Hard-block (z.b. fehlende API, externe service down) → done=false mit",
+    "    KLARER fehler-beschreibung im summary. NICHT vorgaukeln.",
+    "",
+    "SELBST-VERIFIKATION (du SOLLST nach jeder änderung verifizieren):",
+    "  - code-änderung → Bash-tool: passenden test/lint/build laufen lassen",
+    "    (npm test, flutter analyze, cargo check, pytest, etc.)",
+    "  - server-/backend-änderung → Bash: server kurz starten + curl /health",
+    "  - UI-/frontend-änderung → puppeteer-MCP: page öffnen + screenshot/dom-check",
+    "  - script-/CLI-änderung → code-runner-MCP oder Bash: echtes execution-result",
+    "  - dependencies → Bash: install + import-check",
+    "Ohne verifikation darfst du NICHT done=true melden. Wenn die verifikation",
+    "fehlschlägt, fixe den fehler im selben turn und verifiziere nochmal — keine",
+    "done=true mit 'sollte gehen'.",
+    "Server fährt automatisch build-gate (analyze/test) UND runtime-test",
+    "(server-spawn + /health) NACH deinem done=true. Wenn dein code DAS nicht",
+    "übersteht, kommt der retry mit fehler-context zurück.",
+    "",
+    "VERFÜGBARE MCP-tools (zusätzlich zu Read/Edit/Write/Bash/Glob/Grep):",
+    "  filesystem, sequential-thinking, context7 (lib-docs), puppeteer (browser),",
+    "  code-runner (run snippets), fetch (HTTP), github (issues/PRs falls token),",
+    "  memory (knowledge-graph cross-session).",
+    "",
+    "SUB-AGENTS (Task-tool): bei großem scope DARFST + SOLLST du sub-agenten",
+    "  parallel dispatchen statt linear selber abzuarbeiten. Use-cases:",
+    "  - mehrere unabhängige files refactoren → 1 sub-agent pro file",
+    "  - parallele recherche (grep + read in vielen modulen) → Explore-agent",
+    "  - großes feature mit klar trennbaren teilen (backend+frontend+tests)",
+    "    → je 1 sub-agent, du integrierst danach",
+    "  - audit über viele dateien → general-purpose-agent mit klarem scope",
+    "  Wichtig: jeder sub-agent-prompt MUSS self-contained sein (kein 'wie",
+    "  besprochen'), exakte file-paths + erwartetes ergebnis. Bei unabhängigen",
+    "  sub-tasks: alle Task-calls IN EINER message parallelisieren.",
     "",
     "Gib AM ANFANG deiner Antwort einen Plan aus (3-6 konkrete Schritte),",
     "AM ENDE den Status. Format (keine Markdown-Fencing):",
@@ -1967,33 +2654,30 @@ function _startCcJob(project, taskId, prompt) {
     "",
     'done=true: aufgabe ist fertig. done=false: blockiert/teilweise. Falls keine Regel-Vorschläge: {"add":[]}.',
     "",
-    "4) WENN du eine wichtige rückfrage zum projekt hast (z.B. unklare anforderung,",
-    "   technologie-entscheidung, naming-konflikt), darfst du EINE frage stellen:",
+    "4) RÜCKFRAGEN sind STARK eingeschränkt. NIEMALS fragen für:",
+    "   - „aufgabe zu groß, wo soll ich anfangen?\" → ZERLEGE SELBST: wähle",
+    "     den kleinsten konkreten teilschritt (max 1-2h arbeit), arbeite daran,",
+    "     markiere im summary welchen teilschritt du gerade gemacht hast.",
+    "     ODER: dispatch sub-agenten (Task-tool) parallel für klar trennbare",
+    "     teile — siehe SUB-AGENTS oben. NIE wegen scope fragen.",
+    "   - tech-stack / naming / file-struktur → nimm die offensichtliche option",
+    "     (das was schon im projekt ist, sonst flutter/dart-defaults), commit",
+    "     dich + mach.",
+    "   - „soll ich a, b oder c machen?\" → wähle a, mach a, fertig.",
+    "",
+    "   Du DARFST eine QUESTION stellen NUR wenn du eine EXTERNE entscheidung",
+    "   brauchst, die der user wirklich beantworten muss (z.B. API-key, design-",
+    "   richtung, business-logik die nicht aus rules/goals ableitbar ist):",
     "<<<QUESTION",
     "Deine konkrete frage in 1-3 sätzen.",
     ">>>",
-    "Stelle KEINE rückfragen für triviale entscheidungen — wenn du das selbst",
-    "entscheiden kannst, mach es. Frage NUR wenn die wahl signifikant ist und",
-    "der user wahrscheinlich eine meinung hat. Falls du fragst: kennzeichne",
-    "TASK_STATUS done=false und beschreibe was du noch nicht entschieden hast.",
+    "   Wenn du fragst: done=false UND beschreibe im summary WAS du bis dahin",
+    "   schon erledigt hast (kein leerer commit!).",
   ].filter(Boolean).join("\n");
 
-  // Versuche claude CLI zu starten. Auf Windows den vollen Pfad zur npm-globalen
-  // claude.cmd suchen, falls "claude" nicht im PATH ist.
-  function resolveClaudeBin() {
-    if (process.platform !== "win32") return "claude";
-    const tryPaths = [
-      path.join(process.env.APPDATA || "", "npm", "claude.cmd"),
-      path.join(process.env.APPDATA || "", "npm", "claude.ps1"),
-      "claude.cmd",
-      "claude",
-    ];
-    for (const p of tryPaths) {
-      if (p && fs.existsSync(p)) return p;
-    }
-    return "claude.cmd";
-  }
-  const claudeBin = resolveClaudeBin();
+  // Claude CLI binary über zentralen helper resolven (deckt npm-global UND
+  // Anthropic-standalone-installer in ~/.local/bin/claude.exe ab).
+  const claudeBin = resolveClaudeBinary();
   console.log("[cc] using claude bin:", claudeBin);
 
   // Prompt in temporärer Datei → claude mit -p "@file" oder via stdin pipe.
@@ -2001,15 +2685,28 @@ function _startCcJob(project, taskId, prompt) {
   // MCP-Konfig: gibt claude Zugriff auf filesystem, sequential-thinking,
   // context7 (lib-docs), puppeteer (browser-automation), code-runner,
   // ref-tools. Konfig liegt neben server.js.
-  // MCP-Konfig dynamisch auflösen: server ohne gesetzte env-vars (z.b.
-  // ref-tools ohne REF_API_KEY) werden gefiltert, sonst hängt claude beim
-  // tool-call.
-  const mcpConfigPath = resolveMcpConfig({ baseDir: __dirname });
+  // Model-routing: sonnet-4-6 default (schnell+billig), opus-4-7 nur wenn
+  // big-signatur (architektur, refactor, retry, hohe priority). spart bei
+  // 80%+ der tasks token-cost-ratio von ~3× (opus zu sonnet).
+  const selectedModel = selectModelForTask({
+    task,
+    retryAttempt: retryContext?.attempt || 0,
+    prompt: fullPrompt,
+  });
+  // MCP-Konfig dynamisch auflösen: tier-basierte allowlist (kleine tasks
+  // brauchen nicht puppeteer+github+code-runner+fetch — spart 6-8 server
+  // × ~1s startup + ~7000 schema-tokens pro spawn). standard für sonnet-4.6,
+  // full für opus-4.7.
+  const mcpTier = selectedModel === "claude-opus-4-7" ? "full" : "standard";
+  const mcpConfigPath = resolveMcpConfig({ baseDir: __dirname, tier: mcpTier });
   const args = [
     "--print",
+    "--output-format", "stream-json",
+    "--verbose",
     "--permission-mode", "bypassPermissions",
     "--dangerously-skip-permissions",
     "--tools", "default",
+    "--model", selectedModel,
     "--add-dir", cwd,
     // Hard-Budget pro Task (Sicherung gegen Runaway)
     "--max-budget-usd", String(state.ccBudget?.perTaskUsd ?? 2.0),
@@ -2039,14 +2736,28 @@ function _startCcJob(project, taskId, prompt) {
     throw err;
   }
 
-  const job = { proc, startedAt: NOW(), taskId, prompt: fullPrompt, lines: [], cwd };
+  // Task 3: parser für stream-json. Hält line-buffer, liefert events.
+  const streamParser = createStreamJsonParser();
+  const job = {
+    // FIX #3: projectId direkt am job-objekt — _handleCcStreamEvent braucht
+    // ihn ohne ccJobs-iteration. Auch bug-resistant gegen flush nach delete.
+    projectId, proc, startedAt: NOW(), taskId, prompt: fullPrompt, lines: [], cwd,
+    model: selectedModel, // für metrics + activity-log
+    // Stream-json gefiltert: nur assistant text-content → für regex-parser
+    // (TASK_PLAN/TASK_STATUS/RULE_SUGGESTIONS/QUESTION) am ende.
+    assistantText: "",
+    // Tool-use-events für UI-history (begrenzt auf 200, älteste fliegen).
+    toolEvents: [],
+    realUsage: null, // wird aus result-event gefüllt
+  };
   ccJobs.set(projectId, job);
   console.log("[cc] start", projectId, "in", cwd, "task:", task?.title || prompt);
 
   // Activity-Eintrag „Cloud-Code gestartet"
   applyMutation("ADD_ACTIVITY", { projectId, event: {
     type: "info",
-    text: "cloud-code gestartet" + (task ? ": <i>" + escapeHtml(task.title) + "</i>" : ""),
+    text: "cloud-code gestartet" + (task ? ": <i>" + escapeHtml(task.title) + "</i>" : "") +
+          " · model: <code>" + (selectedModel === "claude-opus-4-7" ? "opus-4.7" : "sonnet-4.6") + "</code>",
   }});
   applyMutation("ADD_SYNC_LOG", { entry: {
     source: "cloud", projectId,
@@ -2065,57 +2776,15 @@ function _startCcJob(project, taskId, prompt) {
   }, 1500);
   job._thinkingTimer = thinkingTimer;
 
+  // Task 3: stream-json stdout-handler. Pro event entscheiden wir was zu tun
+  // ist; alles strukturiert, kein regex-fishing mehr im rohstream.
   proc.stdout.on("data", (chunk) => {
-    const text = chunk.toString();
-    job.lines.push(text);
-    // Bugfix (UI): protocol-marker (<<<TASK_PLAN, <<<TASK_STATUS,
-    // <<<RULE_SUGGESTIONS, <<<QUESTION) NICHT als rohtext ins UI streamen.
-    job.inProtocolBlock = job.inProtocolBlock || false;
-    const cleanLines = [];
-    for (const raw of text.split(/\r?\n/)) {
-      if (/^<<<(TASK_PLAN|TASK_STATUS|RULE_SUGGESTIONS|QUESTION)/.test(raw)) {
-        job.inProtocolBlock = true; continue;
-      }
-      if (job.inProtocolBlock) {
-        if (raw.trim() === ">>>") job.inProtocolBlock = false;
-        continue;
-      }
-      if (raw.trim() === ">>>") continue; // safety
-      cleanLines.push(raw);
+    job.lines.push(chunk.toString()); // raw fallback für debug
+    const events = streamParser.feed(chunk.toString());
+    for (const ev of events) {
+      _handleCcStreamEvent(job, ev);
     }
-    const cleanText = cleanLines.join("\n");
-    broadcastForProject({ type: "CC_OUTPUT", projectId, chunk: cleanText }, projectId);
-    cleanLines.filter(Boolean).slice(0, 3).forEach(line => {
-      applyMutation("ADD_ACTIVITY", { projectId, event: {
-        type: "write",
-        text: "cc: " + escapeHtml(line.slice(0, 200)),
-      }});
-    });
-
-    // TASK_PLAN parsen sobald sichtbar (einmalig pro Job): zeigt Sub-Tasks
-    // schon während claude noch arbeitet. Wir merken planParsed=true im Job.
-    if (!job.planParsed && taskId) {
-      const fullSoFar = job.lines.join("");
-      const planM = fullSoFar.match(/<<<TASK_PLAN\s*([\s\S]*?)\s*>>>/);
-      if (planM) {
-        job.planParsed = true;
-        try {
-          const plan = JSON.parse(planM[1].trim());
-          if (Array.isArray(plan.steps)) {
-            const cleanSteps = plan.steps.map(s => String(s).replace(/^\s*\d+[.)]\s*/, "").trim()).filter(Boolean).slice(0, 8);
-            cleanSteps.forEach(stepText => {
-              applyMutation("ADD_SUBTASK", { projectId, taskId, subtask: { title: stepText, done: false } });
-            });
-            applyMutation("ADD_ACTIVITY", { projectId, event: {
-              type: "info",
-              text: `cc plan: ${cleanSteps.length} schritte`,
-            }});
-          }
-        } catch (e) { console.log("[cc] task_plan parse failed:", e.message); }
-      }
-    }
-
-    broadcastState();
+    if (events.length > 0) broadcastState();
   });
 
   proc.stderr.on("data", (chunk) => {
@@ -2125,31 +2794,82 @@ function _startCcJob(project, taskId, prompt) {
   });
 
   proc.on("close", (code) => {
-    ccJobs.delete(projectId);
+    // FIX #2+#3: flush VOR ccJobs.delete machen wir nicht mehr nötig
+    // (job.projectId ist jetzt direkt am job), aber thinking-timer kann weg.
     if (job._thinkingTimer) { clearInterval(job._thinkingTimer); job._thinkingTimer = null; }
+
+    // Flush parser FIRST damit letzte events (oft result mit echten tokens)
+    // noch ankommen. _handleCcStreamEvent nutzt job.projectId, daher
+    // unabhängig von ccJobs-state.
+    for (const ev of streamParser.flush()) _handleCcStreamEvent(job, ev);
+
+    ccJobs.delete(projectId);
     cleanupResolvedConfig(mcpConfigPath);
     console.log("[cc] done", projectId, "exit", code);
+    // Wenn KEIN done=true tail folgt (z.b. done=false, crash, question),
+    // wird der release weiter unten nicht hinkommen. Daher hier proaktiv
+    // den autopump anstoßen — wenn ein tail folgt, locked _ccPostChecks
+    // den autopump weiter.
+    _triggerAutoPumpNow();
 
-    const fullOutput = job.lines.join("");
+    // FIX #9: pending tool_use-events ohne result → "cancelled" markieren,
+    // sonst bleiben sie für immer "running" in der UI.
+    for (const te of (job.toolEvents || [])) {
+      if (te.state === "running") {
+        te.state = "cancelled";
+        broadcastForProject({
+          type: "CC_TOOL_EVENT", projectId,
+          phase: "result", id: te.id, tool: te.tool,
+          isError: false, brief: "cancelled (cc beendet)", ts: NOW(),
+        }, projectId);
+      }
+    }
+    // FIX #18: thinking-text clearen damit UI nicht ewig „💭 …" zeigt
+    broadcastForProject({ type: "CC_THINKING_TEXT", projectId, text: "" }, projectId);
 
-    // Claude-API-Limit erkennen → Auto-Pump für 10 Minuten pausieren
-    // damit nicht endlos fehlgeschlagene Calls gefeuert werden.
-    if (/hit your limit|rate limit|usage limit/i.test(fullOutput)) {
+    // Für die regex-parser unten: assistant-text aus stream-json
+    // (statt rohstdout — der ist jetzt jsonl, regex würde fehlschlagen)
+    const fullOutput = job.assistantText || job.lines.join("");
+
+    // Claude-API-Limit erkennen → Auto-Pump für 10 Minuten pausieren.
+    // BUG-FIX: die alte regex /hit your limit|rate limit|usage limit/i
+    // hat false-positive auf normalen cc-output gematcht — z.B. tasks
+    // mit titel "add rate-limit middleware" oder code-kommentare über
+    // rate-limiting → autopump pausiert ohne grund 10min. jetzt nur noch
+    // unzweideutige Anthropic-API-error-patterns (json error-type,
+    // 429-status, spezifische CLI-fehlermeldungen).
+    // Auch wichtig: stderr (lines) prüfen ist sinnvoll — assistantText
+    // (fullOutput) ist content, der cc generiert hat → enthält bei
+    // normalen tasks oft "rate limit" als ganz normalen begriff.
+    const stderrText = job.lines.join("");
+    const apiLimitRegex = /("type"\s*:\s*"rate_limit_error")|(\brate_limit_error\b)|(\b429\s+(too many|rate)\b)|(\bhit your (usage|API|monthly) limit\b)|(\bquota exceeded\b)|(\byou.?ve (used|reached) your (usage|monthly|API)\b)/i;
+    if (apiLimitRegex.test(stderrText) || (job.realUsage === null && apiLimitRegex.test(fullOutput))) {
       _ccApiLimitedUntil = NOW() + 10 * 60 * 1000;
       console.log("[autopump] claude API limited — pausiere bis", new Date(_ccApiLimitedUntil).toLocaleTimeString());
       applyMutation("ADD_ACTIVITY", { projectId, event: {
         type: "warn",
-        text: "claude-api limit erreicht · auto-pump pausiert für 10min",
+        text: "claude-api limit erreicht · auto-pump pausiert für 10min — im cloud-code-tab gibt es einen 'fortsetzen jetzt'-button",
       }});
+      // ccApiLimitedUntil wird in publicState() injiziert (transient,
+      // NICHT persistent), damit nach server-restart kein stale-flag bleibt.
     }
 
-    // Token-Schätzung (claude --output-format text → wir parsen nicht direkt
-    // sondern schätzen 1 token ≈ 4 chars). Cost: Sonnet-4 Pricing als Default.
-    const inputTokens = Math.round(fullPrompt.length / 4);
-    const outputTokens = Math.round(fullOutput.length / 4);
-    const PRICE_IN = 3.0 / 1_000_000;   // $3/MTok input  (Sonnet 4.x)
-    const PRICE_OUT = 15.0 / 1_000_000; // $15/MTok output
-    const estCostUsd = inputTokens * PRICE_IN + outputTokens * PRICE_OUT;
+    // Task 3: ECHTE token-zahlen aus result-event statt char/4-schätzung.
+    // Fallback: alte schätzung wenn result fehlte (z.b. crash vor result).
+    let inputTokens, outputTokens, estCostUsd, cacheCreated, cacheRead;
+    if (job.realUsage) {
+      inputTokens = job.realUsage.tokensIn;
+      outputTokens = job.realUsage.tokensOut;
+      cacheCreated = job.realUsage.cacheCreated;
+      cacheRead = job.realUsage.cacheRead;
+      estCostUsd = typeof job.realUsage.costUsd === "number" ? job.realUsage.costUsd : 0;
+    } else {
+      inputTokens = Math.round(fullPrompt.length / 4);
+      outputTokens = Math.round(fullOutput.length / 4);
+      cacheCreated = 0; cacheRead = 0;
+      const PRICE_IN = 3.0 / 1_000_000, PRICE_OUT = 15.0 / 1_000_000;
+      estCostUsd = inputTokens * PRICE_IN + outputTokens * PRICE_OUT;
+    }
     const durationMs = NOW() - job.startedAt;
 
     // Globaler Tracker
@@ -2158,13 +2878,18 @@ function _startCcJob(project, taskId, prompt) {
     state.ccBudget.totalTokensOut += outputTokens;
     state.ccBudget.totalCostUsd += estCostUsd;
     state.ccBudget.jobs = [
-      { projectId, taskId, ts: NOW(), inputTokens, outputTokens, costUsd: estCostUsd, durationMs, ok: code === 0 },
+      { projectId, taskId, ts: NOW(), inputTokens, outputTokens,
+        cacheCreated, cacheRead, costUsd: estCostUsd, durationMs,
+        ok: code === 0, real: !!job.realUsage, model: job.model || null },
       ...(state.ccBudget.jobs || []),
     ].slice(0, 100);
 
+    const cacheTxt = cacheCreated || cacheRead
+      ? ` · cache: ${(cacheCreated/1000).toFixed(1)}k created · ${(cacheRead/1000).toFixed(1)}k read`
+      : "";
     applyMutation("ADD_ACTIVITY", { projectId, event: {
       type: "info",
-      text: `tokens: ${inputTokens.toLocaleString("de")} in · ${outputTokens.toLocaleString("de")} out · ~$${estCostUsd.toFixed(4)} · ${(durationMs/1000).toFixed(1)}s`,
+      text: `tokens: ${inputTokens.toLocaleString("de")} in · ${outputTokens.toLocaleString("de")} out · $${estCostUsd.toFixed(4)}${job.realUsage ? "" : " (geschätzt)"} · ${(durationMs/1000).toFixed(1)}s${cacheTxt}`,
     }});
 
     // QUESTION-Block: claude hat rückfrage → in project.pendingQuestion speichern,
@@ -2172,7 +2897,7 @@ function _startCcJob(project, taskId, prompt) {
     const qm = fullOutput.match(/<<<QUESTION\s*([\s\S]*?)\s*>>>/);
     if (qm && qm[1].trim()) {
       const qText = qm[1].trim().slice(0, 1000);
-      applyMutation("SET_PENDING_QUESTION", { projectId, question: qText });
+      applyMutation("SET_PENDING_QUESTION", { projectId, question: qText, taskId });
       applyMutation("ADD_ACTIVITY", { projectId, event: {
         type: "info", text: "claude fragt zurück: <i>" + escapeHtml(qText.slice(0, 120)) + "</i>",
       }});
@@ -2196,43 +2921,330 @@ function _startCcJob(project, taskId, prompt) {
     }
 
     if (parsedStatus && parsedStatus.done === true && taskId) {
-      // Self-Review starten (async, blockiert nicht)
-      runSelfReview(project, taskId, parsedStatus, fullOutput).then(review => {
-        const taskNow = state.projects.find(p=>p.id===projectId)?.tasks.find(t=>t.id===taskId);
-        if (!taskNow) return;
-        if (review.ok) {
-          // Alle offenen Sub-Tasks abhaken (vom TASK_PLAN erstellt)
-          (taskNow.subtasks || []).filter(s => !s.done).forEach(s => {
+      // ─── BUILD-GATE + FAILURE-LOOP ─────────────────────────
+      // Lock: autopump soll während build-gate/runtime/review NICHT einen
+      // neuen task auf diesem projekt picken (sonst crasht der retry mit
+      // "läuft bereits"). _ccPostChecks.delete passiert in der release-
+      // funktion am ende aller pfade (success, retry, max-retry).
+      _ccPostChecks.add(projectId);
+      _ccPostCheckStartedAt.set(projectId, NOW());
+      const releasePostCheck = () => {
+        _ccPostChecks.delete(projectId);
+        _ccPostCheckStartedAt.delete(projectId);
+        // sofort den nächsten task starten — kein 25s-warten mehr
+        _triggerAutoPumpNow();
+      };
+
+      // OPTIMIERUNG: skip build-gate komplett wenn cc 0 dateien geändert
+      // hat. read-only/analyse-tasks brauchen keine echte verifikation —
+      // genau wie self-review schon geskippt wird. spart 30-180s pro task.
+      const filesChangedList = Array.isArray(parsedStatus.filesChanged) ? parsedStatus.filesChanged : [];
+      if (filesChangedList.length === 0) {
+        applyMutation("ADD_ACTIVITY", { projectId, event: {
+          type: "info",
+          text: "build-gate + runtime-test übersprungen (0 dateien geändert)",
+        }});
+        // Direkt zu auto-checkmark (review wird intern auch geskippt da
+        // filesChanged.length === 0 → siehe skipReview branch unten).
+        // Wir simulieren build-gate=ok + runtime=skipped um den bestehenden
+        // flow nicht neu zu schreiben.
+        // → einfacher: jetzt direkt auto-mark-done aufrufen.
+        const tn = state.projects.find(p=>p.id===projectId)?.tasks.find(t=>t.id===taskId);
+        if (tn) {
+          (tn.subtasks || []).filter(s => !s.done).forEach(s => {
             applyMutation("TOGGLE_SUBTASK", { projectId, taskId, subtaskId: s.id });
           });
           applyMutation("TOGGLE_TASK", { projectId, taskId });
           applyMutation("ADD_ACTIVITY", { projectId, event: {
             type: "check",
-            text: `cc auto-checkmark: <i>${escapeHtml(taskNow.title)}</i>` +
+            text: `cc auto-checkmark: <i>${escapeHtml(tn.title)}</i>` +
                   (parsedStatus.summary ? ` · ${escapeHtml(parsedStatus.summary)}` : "") +
-                  ` · review ok (${Math.round(review.confidence * 100)}%)`,
+                  " · (read-only, gates übersprungen)",
+          }});
+          _ccRetryContext.delete(taskId);
+          broadcastState();
+        }
+        releasePostCheck();
+        return;
+      }
+
+      applyMutation("ADD_ACTIVITY", { projectId, event: {
+        type: "info",
+        text: `build-gate läuft (${project.tech || "?"}) …`,
+      }});
+      broadcastState();
+
+      // OPTIMIERUNG: build-gate + runtime-test parallel laufen (statt
+      // sequentiell). build-gate prüft lint/typecheck, runtime-test prüft
+      // ob der server hochkommt — unabhängige checks. Wenn beide fehlen
+      // schlagen, wird der retry-counter nur EINMAL inkrementiert (build
+      // hat priorität als fehler-context, weil aussagekräftiger).
+      Promise.all([
+        runBuildGate({ projectPath: project.path }),
+        runRuntimeTest({
+          projectPath: project.path,
+          filesChanged: parsedStatus.filesChanged || [],
+        }).catch(e => ({ ok: true, skipped: true, kind: "error", output: e && e.message })),
+      ]).then(async ([gate, rtResult]) => {
+        const projNow = state.projects.find(p => p.id === projectId);
+        const taskNow = projNow && projNow.tasks.find(t => t.id === taskId);
+        if (!taskNow) {
+          // BUG-FIX: vorher kein release → autopump für immer skip auf das
+          // projekt. jetzt: release + log warum.
+          console.log("[cc-tail] task verschwunden — release lock", projectId, taskId);
+          releasePostCheck();
+          return;
+        }
+
+        if (gate.skipped) {
+          applyMutation("ADD_ACTIVITY", { projectId, event: {
+            type: "info",
+            text: "build-gate übersprungen (keine bekannte project-tech)",
+          }});
+        } else if (gate.ok) {
+          // Gate grün → retry-state clearen, self-review startet
+          _ccRetryContext.delete(taskId);
+          applyMutation("ADD_ACTIVITY", { projectId, event: {
+            type: "check",
+            text: `build-gate ok (${gate.kind}, ${(gate.durationMs/1000).toFixed(1)}s)`,
           }});
         } else {
+          // Gate rot → failure-loop
+          const prev = _ccRetryContext.get(taskId);
+          const attempt = (prev?.attempt || 0) + 1;
+          const reason = gate.timedOut ? "timeout"
+                       : gate.commandMissing ? "tool fehlt (" + gate.kind + ")"
+                       : "exit " + gate.exitCode;
           applyMutation("ADD_ACTIVITY", { projectId, event: {
             type: "warn",
-            text: `cc self-review fand issues bei <i>${escapeHtml(taskNow.title)}</i>: ` +
-                  review.issues.slice(0, 3).map(escapeHtml).join(" · "),
+            text: `build-gate <strong>FAIL</strong> (${gate.kind} · ${reason}, ${(gate.durationMs/1000).toFixed(1)}s)`,
+          }});
+          if (attempt < MAX_CC_RETRIES && !gate.commandMissing) {
+            // Retry: error-context speichern, gleichen task nochmal triggern.
+            // _ccPostChecks bleibt LOCKED bis triggerCc seine ccJobs.set
+            // gemacht hat — so kann autopump in den 3s nicht einen
+            // konkurrierenden task auf demselben projekt starten.
+            _ccRetryContext.set(taskId, {
+              attempt, kind: gate.kind, exitCode: gate.exitCode,
+              output: gate.output, projectId,
+            });
+            applyMutation("ADD_ACTIVITY", { projectId, event: {
+              type: "info",
+              text: `cc retry ${attempt}/${MAX_CC_RETRIES} startet in 3s mit fehler-context…`,
+            }});
+            broadcastState();
+            setTimeout(() => {
+              if (!state.ccRunning) {
+                console.log("[cc-retry] skip — cc inzwischen pausiert");
+                releasePostCheck();
+                return;
+              }
+              triggerCc(projectId, taskId, null)
+                .then(() => { _ccPostChecks.delete(projectId); }) // ccJobs hat den lock jetzt
+                .catch((e) => {
+                  console.log("[cc-retry] trigger fehler:", e.message);
+                  releasePostCheck();
+                });
+            }, 3000);
+            return; // KEIN self-review, kein checkmark
+          }
+          // Max retries (oder tool fehlt) → task bleibt offen, in_progress, mit warnung
+          _ccRetryContext.delete(taskId);
+          applyMutation("EDIT_TASK", { projectId, taskId, patch: {
+            meta: (taskNow.meta ? taskNow.meta + " · " : "") + `blockiert (build-gate fail ${attempt}×)`,
           }});
           applyMutation("ADD_SYNC_LOG", { entry: {
             source: "cloud", projectId,
-            text: `cc self-review BLOCKIERT auto-checkmark (${review.issues.length} issue(s))`,
+            text: `cc max-retries auf <i>${escapeHtml(taskNow.title)}</i>: build-gate ${attempt}× rot`,
+          }});
+          broadcastState();
+          releasePostCheck();
+          return; // wieder kein self-review
+        }
+
+        // ─── RUNTIME-TEST (Task 4) ────────────────────────────
+        // ist bereits via Promise.all parallel zum build-gate gelaufen (siehe oben),
+        // rtResult ist im destructuring schon enthalten. Hier nur noch auswerten.
+        if (rtResult.skipped) {
+          // skip → kein log-eintrag (würde nur spammen)
+        } else if (rtResult.ok) {
+          applyMutation("ADD_ACTIVITY", { projectId, event: {
+            type: "check",
+            text: `runtime ok (${rtResult.kind}, ${(rtResult.durationMs/1000).toFixed(1)}s)`,
+          }});
+        } else {
+          // runtime fail → identische failure-loop wie build-gate
+          const prev = _ccRetryContext.get(taskId);
+          const attempt = (prev?.attempt || 0) + 1;
+          applyMutation("ADD_ACTIVITY", { projectId, event: {
+            type: "warn",
+            text: `runtime <strong>FAIL</strong> (${rtResult.kind}, ${(rtResult.durationMs/1000).toFixed(1)}s)`,
+          }});
+          if (attempt < MAX_CC_RETRIES) {
+            _ccRetryContext.set(taskId, {
+              attempt, kind: "runtime-" + rtResult.kind, exitCode: null,
+              output: rtResult.output, projectId,
+            });
+            applyMutation("ADD_ACTIVITY", { projectId, event: {
+              type: "info",
+              text: `cc retry ${attempt}/${MAX_CC_RETRIES} startet in 3s (runtime-fail)…`,
+            }});
+            broadcastState();
+            setTimeout(() => {
+              if (!state.ccRunning) {
+                console.log("[cc-runtime-retry] skip — cc inzwischen pausiert");
+                releasePostCheck();
+                return;
+              }
+              triggerCc(projectId, taskId, null)
+                .then(() => { _ccPostChecks.delete(projectId); })
+                .catch((e) => {
+                  console.log("[cc-runtime-retry] trigger fehler:", e.message);
+                  releasePostCheck();
+                });
+            }, 3000);
+            return; // kein self-review, kein checkmark
+          }
+          // FIX #1: `tn` war nicht im scope — `taskNow` ist die richtige variable
+          _ccRetryContext.delete(taskId);
+          applyMutation("EDIT_TASK", { projectId, taskId, patch: {
+            meta: (taskNow.meta ? taskNow.meta + " · " : "") + `blockiert (runtime fail ${attempt}×)`,
+          }});
+          applyMutation("ADD_SYNC_LOG", { entry: {
+            source: "cloud", projectId,
+            text: `cc max-retries auf <i>${escapeHtml(taskNow.title)}</i>: runtime ${attempt}× rot`,
+          }});
+          broadcastState();
+          releasePostCheck();
+          return;
+        }
+
+        // ─── SELF-REVIEW (gate grün, runtime grün) ────────────
+        // Optimierung: skip self-review wenn cc 0 dateien geändert hat —
+        // bei reinen analyse-tasks (research/summary) ist review redundant
+        // und kostet einen zweiten claude-call (~5-15s + tokens).
+        const filesChanged = Array.isArray(parsedStatus.filesChanged) ? parsedStatus.filesChanged : [];
+        const skipReview = filesChanged.length === 0;
+        const reviewPromise = skipReview
+          ? Promise.resolve({ ok: true, issues: [], confidence: 0.9, skipped: true })
+          : runSelfReview(project, taskId, parsedStatus, fullOutput);
+        if (skipReview) {
+          applyMutation("ADD_ACTIVITY", { projectId, event: {
+            type: "info",
+            text: "self-review übersprungen (0 dateien geändert)",
           }});
         }
-        broadcastState();
+        reviewPromise.then(review => {
+          const tn = state.projects.find(p=>p.id===projectId)?.tasks.find(t=>t.id===taskId);
+          if (!tn) return;
+          if (review.ok) {
+            (tn.subtasks || []).filter(s => !s.done).forEach(s => {
+              applyMutation("TOGGLE_SUBTASK", { projectId, taskId, subtaskId: s.id });
+            });
+            applyMutation("TOGGLE_TASK", { projectId, taskId });
+            applyMutation("ADD_ACTIVITY", { projectId, event: {
+              type: "check",
+              text: `cc auto-checkmark: <i>${escapeHtml(tn.title)}</i>` +
+                    (parsedStatus.summary ? ` · ${escapeHtml(parsedStatus.summary)}` : "") +
+                    ` · review ok (${Math.round(review.confidence * 100)}%)`,
+            }});
+            // Per-task git-commit (Task 7) — rollback-fähig, audit-trail.
+            // Async, blockiert nicht; ergebnis als activity-event.
+            if (gitIsRepo(project.path)) {
+              gitCommitChanges({
+                projectPath: project.path,
+                message: "[cc] " + tn.title +
+                  (parsedStatus.summary ? " · " + parsedStatus.summary.slice(0, 80) : ""),
+                authorName: "cloud-code",
+                authorEmail: "cc@projectgamma.local",
+              }).then((g) => {
+                if (g.committed) {
+                  applyMutation("ADD_ACTIVITY", { projectId, event: {
+                    type: "info",
+                    text: `git commit <code>${escapeHtml(g.sha)}</code>`,
+                  }});
+                  broadcastState();
+                } else if (g.error) {
+                  applyMutation("ADD_ACTIVITY", { projectId, event: {
+                    type: "warn", text: `git-commit fehler: ${escapeHtml(g.error.slice(0, 200))}`,
+                  }});
+                  broadcastState();
+                }
+                // g.skipped: silent — kein commit, kein log-spam
+              }).catch((e) => { console.log("[git] commit-error:", e && e.message); });
+            }
+            // Bug-auto-resolve: wenn cc files berührt hat, die auf eine pending-bug-location passen,
+            // markiere die bugs als "potentially-fixed". User kann via UI bestätigen oder reopen.
+            // 0 LLM-tokens — reine heuristik auf filesChanged ∩ bug.location.
+            //
+            // FIX #5: substring-match war zu greedy ("a.js" matchte alles mit ".js").
+            // Jetzt: pfad-segment-vergleich (endsWith oder exact-match) + min-länge 6.
+            if (Array.isArray(parsedStatus.filesChanged) && parsedStatus.filesChanged.length) {
+              const proj = state.projects.find(p => p.id === projectId);
+              const pendingBugs = (proj?.bugs || []).filter(b => b.status === "pending");
+              const changedNorm = parsedStatus.filesChanged
+                .map(f => String(f).replace(/\\/g, "/").toLowerCase().trim())
+                .filter(f => f.length > 0);
+              let resolved = 0;
+              for (const b of pendingBugs) {
+                if (!b.location) continue;
+                // bug.location kann „file.js:42" sein → nur file-teil
+                const locFile = b.location.replace(/\\/g, "/").toLowerCase().trim().split(":")[0];
+                if (!locFile || locFile.length < 6) continue; // zu kurz → too-many-false-positives
+                // Match wenn:
+                //   - exakter pfad-match, ODER
+                //   - changed-file endet mit "/" + locFile (locFile ist eine path-tail)
+                //   - locFile endet mit "/" + changed-file (changed ist eine path-tail vom bug)
+                const hit = changedNorm.some(f => {
+                  if (f === locFile) return true;
+                  if (f.endsWith("/" + locFile)) return true;
+                  if (locFile.endsWith("/" + f) && f.length >= 6) return true;
+                  return false;
+                });
+                if (hit) {
+                  applyMutation("SET_BUG_STATUS", { projectId, bugId: b.id, status: "potentially-fixed" });
+                  resolved++;
+                }
+              }
+              if (resolved > 0) {
+                applyMutation("ADD_ACTIVITY", { projectId, event: {
+                  type: "check",
+                  text: `${resolved} bug(s) als potentiell-fixed markiert (datei-overlap mit cc-änderung)`,
+                }});
+                broadcastState();
+              }
+            }
+          } else {
+            applyMutation("ADD_ACTIVITY", { projectId, event: {
+              type: "warn",
+              text: `cc self-review fand issues bei <i>${escapeHtml(tn.title)}</i>: ` +
+                    review.issues.slice(0, 3).map(escapeHtml).join(" · "),
+            }});
+            applyMutation("ADD_SYNC_LOG", { entry: {
+              source: "cloud", projectId,
+              text: `cc self-review BLOCKIERT auto-checkmark (${review.issues.length} issue(s))`,
+            }});
+          }
+          broadcastState();
+          releasePostCheck(); // erfolgs-pfad: tail komplett, autopump kann nächsten task starten
+        }).catch(e => {
+          console.log("[selfreview] error:", e.message);
+          applyMutation("TOGGLE_TASK", { projectId, taskId });
+          applyMutation("ADD_ACTIVITY", { projectId, event: {
+            type: "check",
+            text: `cc auto-checkmark (review skipped: ${escapeHtml(e.message)})`,
+          }});
+          broadcastState();
+          releasePostCheck();
+        });
       }).catch(e => {
-        console.log("[selfreview] error:", e.message);
-        // Bei Fehler: Task trotzdem mark done (fallback auf altes Verhalten)
-        applyMutation("TOGGLE_TASK", { projectId, taskId });
+        // build-gate selbst crashed → fall through zu self-review (fail-open)
+        console.log("[build-gate] error, fall-through:", e && e.message);
         applyMutation("ADD_ACTIVITY", { projectId, event: {
-          type: "check",
-          text: `cc auto-checkmark (review skipped: ${escapeHtml(e.message)})`,
+          type: "warn", text: `build-gate crash, übersprungen: ${escapeHtml(e.message || "?")}`,
         }});
         broadcastState();
+        releasePostCheck();
       });
     }
 
@@ -2336,6 +3348,118 @@ function _startCcJob(project, taskId, prompt) {
   return { ok: true, projectId, startedAt: job.startedAt };
 }
 
+// Task 3 · Pro stream-json-event: state-update + broadcast.
+// Keine LLM-tokens — alles deterministisch aus dem cli-output abgeleitet.
+function _handleCcStreamEvent(job, ev) {
+  // FIX #2+#3: projectId direkt aus job-objekt — funktioniert auch wenn
+  // ccJobs.delete bereits gelaufen ist (z.B. nach proc.close → flush()).
+  // Vorher: O(jobs×projects)-iteration die nach delete leere result lieferte.
+  const projectId = job.projectId;
+  if (!projectId) return;
+  if (ev.kind === "init") {
+    applyMutation("ADD_ACTIVITY", { projectId, event: {
+      type: "info",
+      text: `claude-session start · ${(ev.mcpServers || []).filter(m => m.status === "connected").map(m => m.name).join(", ") || "(keine MCPs)"}`,
+    }});
+    return;
+  }
+  if (ev.kind === "text") {
+    job.assistantText += ev.text;
+    // Stream nur clean-text (ohne protocol-blöcke) an UI
+    const clean = ev.text
+      .replace(/<<<(TASK_PLAN|TASK_STATUS|RULE_SUGGESTIONS|QUESTION)[\s\S]*?>>>/g, "");
+    if (clean.trim()) {
+      broadcastForProject({ type: "CC_OUTPUT", projectId, chunk: clean }, projectId);
+    }
+    // TASK_PLAN sobald komplett: subtasks anlegen (war im alten flow auch so).
+    if (!job.planParsed && job.taskId) {
+      const planM = job.assistantText.match(/<<<TASK_PLAN\s*([\s\S]*?)\s*>>>/);
+      if (planM) {
+        job.planParsed = true;
+        try {
+          const plan = JSON.parse(planM[1].trim());
+          if (Array.isArray(plan.steps)) {
+            const steps = plan.steps.map(s => String(s).replace(/^\s*\d+[.)]\s*/, "").trim())
+              .filter(Boolean).slice(0, 8);
+            steps.forEach(stepText => {
+              applyMutation("ADD_SUBTASK", { projectId, taskId: job.taskId,
+                subtask: { title: stepText, done: false } });
+            });
+            applyMutation("ADD_ACTIVITY", { projectId, event: {
+              type: "info", text: `cc plan: ${steps.length} schritte`,
+            }});
+          }
+        } catch (e) { /* swallow */ }
+      }
+    }
+    return;
+  }
+  if (ev.kind === "tool_use") {
+    // Live-tool-event: broadcast für UI + activity (für persistente history)
+    job.toolEvents.push({
+      id: ev.id, tool: ev.tool, glyph: ev.glyph,
+      summary: ev.summary, ts: NOW(), state: "running",
+    });
+    if (job.toolEvents.length > 200) job.toolEvents.shift();
+    broadcastForProject({
+      type: "CC_TOOL_EVENT", projectId,
+      phase: "use", id: ev.id, tool: ev.tool, glyph: ev.glyph, summary: ev.summary, ts: NOW(),
+    }, projectId);
+    // Activity-event nur für „interessante" tools (sonst log-spam):
+    // Read/Glob/Grep sind read-only, machen 80% der events aus → nur „write" events ins log.
+    if (["Edit", "Write", "MultiEdit", "Bash", "PowerShell"].includes(ev.tool)) {
+      applyMutation("ADD_ACTIVITY", { projectId, event: {
+        type: ev.tool === "Bash" || ev.tool === "PowerShell" ? "info" : "write",
+        text: `${ev.glyph} <code>${escapeHtml(ev.tool)}</code> ${escapeHtml(ev.summary || "")}`.slice(0, 200),
+      }});
+    }
+    return;
+  }
+  if (ev.kind === "tool_result") {
+    const te = job.toolEvents.find(t => t.id === ev.id);
+    if (te) { te.state = ev.isError ? "error" : "ok"; te.brief = ev.brief; }
+    broadcastForProject({
+      type: "CC_TOOL_EVENT", projectId,
+      phase: "result", id: ev.id, tool: ev.tool, isError: ev.isError, brief: ev.brief, ts: NOW(),
+    }, projectId);
+    if (ev.isError) {
+      applyMutation("ADD_ACTIVITY", { projectId, event: {
+        type: "warn",
+        text: `⚠ ${escapeHtml(ev.tool)} fehler: ${escapeHtml((ev.brief || "").slice(0, 120))}`,
+      }});
+    }
+    return;
+  }
+  if (ev.kind === "thinking") {
+    // Optional sichtbar machen — kompakt
+    broadcastForProject({
+      type: "CC_THINKING_TEXT", projectId, text: ev.text.slice(0, 200),
+    }, projectId);
+    return;
+  }
+  if (ev.kind === "result") {
+    job.realUsage = {
+      tokensIn: ev.tokensIn || 0,
+      tokensOut: ev.tokensOut || 0,
+      cacheCreated: ev.cacheCreated || 0,
+      cacheRead: ev.cacheRead || 0,
+      costUsd: ev.costUsd,
+      durationMs: ev.durationMs,
+    };
+    return;
+  }
+}
+
+// Auto-pump pause sofort beenden — falls die rate-limit-detection fälschlich
+// getriggert hat oder das echte limit vorbei ist + man nicht warten will.
+app.post("/api/cc/resume-now", authMw, (req, res) => {
+  const wasLimited = _ccApiLimitedUntil > NOW();
+  _ccApiLimitedUntil = 0;
+  console.log("[autopump] manual resume — limit-pause geleert (war aktiv:", wasLimited, ")");
+  broadcastState();
+  res.json({ ok: true, wasLimited });
+});
+
 app.post("/api/cc/stop", authMw, (req, res) => {
   const { projectId } = req.body || {};
   const project = state.projects.find(p => p.id === projectId);
@@ -2343,7 +3467,9 @@ app.post("/api/cc/stop", authMw, (req, res) => {
   if (!_requireProjectAccess(req, res, project, ROLES.MEMBER)) return;
   const job = ccJobs.get(projectId);
   if (!job) return res.status(404).json({ error: "kein job läuft" });
-  try { job.proc.kill("SIGTERM"); } catch (e) {}
+  // windows: SIGTERM an top-process verwaist sub-prozesse. killTreeGraceful
+  // → taskkill /T /F (windows) bzw. SIGTERM → SIGKILL fallback (posix).
+  killTreeGraceful(job.proc, { gracefulMs: 1500 });
   ccJobs.delete(projectId);
   applyMutation("ADD_ACTIVITY", { projectId, event: { type: "info", text: "cloud-code abgebrochen" }});
   broadcastState();
@@ -2372,6 +3498,173 @@ app.post("/api/cc/suggest", authMw, async (req, res) => {
   if (!_requireProjectAccess(req, res, project, ROLES.MEMBER)) return;
   runSuggestionAnalysis(project).catch(e => console.log("[suggest] error:", e.message));
   res.json({ ok: true });
+});
+
+// Task 6 · Task-Dekomposition: cc zerlegt einen großen task vorab in 3-8
+// subtasks. User-getriggert (button-klick), nicht auto. Cap budget 0.20$.
+app.post("/api/cc/decompose", authMw, async (req, res) => {
+  const { projectId, taskId } = req.body || {};
+  const project = state.projects.find(p => p.id === projectId);
+  if (!project) return res.status(404).json({ error: "projekt nicht gefunden" });
+  if (!_requireProjectAccess(req, res, project, ROLES.MEMBER)) return;
+  const task = (project.tasks || []).find(t => t.id === taskId);
+  if (!task) return res.status(404).json({ error: "task nicht gefunden" });
+  res.json({ ok: true });
+  runTaskDecompose(project, task).catch(e => console.log("[decompose] error:", e.message));
+});
+
+// Goal-Based Planning: nimmt project.goals → cc generiert milestones + tasks.
+// Async (fire-and-forget); UI sieht tasks erscheinen via state-broadcast.
+app.post("/api/projects/:id/plan-from-goals", authMw, async (req, res) => {
+  const project = state.projects.find(p => p.id === req.params.id);
+  if (!project) return res.status(404).json({ error: "projekt nicht gefunden" });
+  if (!_requireProjectAccess(req, res, project, ROLES.MEMBER)) return;
+  res.json({ ok: true, goalsCount: (project.goals || []).length });
+  runAutoPlanFromGoals(project).catch(e => console.log("[auto-plan] error:", e.message));
+});
+
+// CC-Metrics: aggregierte stats über die letzten N jobs (token-/cost-/zeit-
+// durchschnitte, model-routing-hit-rate). Read-only — UI kann sie nutzen
+// für "live self-optimization"-dashboard. Master-spec item 1, ohne
+// automatische rule-mutation (das wäre risikoreich + braucht user-approval).
+app.get("/api/cc/metrics", authMw, (req, res) => {
+  const jobs = (state.ccBudget && state.ccBudget.jobs) || [];
+  if (jobs.length === 0) {
+    return res.json({
+      total: 0, last24h: 0,
+      avgDurationMs: 0, avgInputTokens: 0, avgOutputTokens: 0, avgCostUsd: 0,
+      modelMix: {}, successRate: 0,
+      slowestJobs: [], expensiveJobs: [],
+    });
+  }
+  const now = NOW();
+  const last24h = jobs.filter(j => now - j.ts < 24 * 60 * 60 * 1000);
+  const recent = last24h.length > 0 ? last24h : jobs;
+  const sum = (arr, f) => arr.reduce((a, j) => a + (f(j) || 0), 0);
+  const avg = (arr, f) => arr.length ? sum(arr, f) / arr.length : 0;
+  const modelMix = {};
+  for (const j of recent) {
+    const m = j.model || "unknown";
+    modelMix[m] = (modelMix[m] || 0) + 1;
+  }
+  const successRate = recent.length ? recent.filter(j => j.ok).length / recent.length : 0;
+  const slowest = [...recent].sort((a, b) => (b.durationMs || 0) - (a.durationMs || 0)).slice(0, 5);
+  const expensive = [...recent].sort((a, b) => (b.costUsd || 0) - (a.costUsd || 0)).slice(0, 5);
+  res.json({
+    total: jobs.length,
+    last24h: last24h.length,
+    avgDurationMs: Math.round(avg(recent, j => j.durationMs)),
+    avgInputTokens: Math.round(avg(recent, j => j.inputTokens)),
+    avgOutputTokens: Math.round(avg(recent, j => j.outputTokens)),
+    avgCostUsd: avg(recent, j => j.costUsd),
+    modelMix,
+    successRate,
+    slowestJobs: slowest.map(j => ({
+      taskId: j.taskId, ts: j.ts, durationMs: j.durationMs,
+      model: j.model, ok: j.ok,
+    })),
+    expensiveJobs: expensive.map(j => ({
+      taskId: j.taskId, ts: j.ts, costUsd: j.costUsd,
+      model: j.model, outputTokens: j.outputTokens,
+    })),
+  });
+});
+
+// M2 · Cleanup: existing cc-vorgeschlagene regeln + pending rule_diffs,
+// die nach dem strengeren classifier eigentlich Ideen sind, rückwirkend
+// umrouten. 0 LLM-tokens — reine classifier-anwendung.
+//
+// Drei stufen:
+//   1) inactive cc-rules → ideas (waren nie vom user approved)
+//   2) pending rule_diffs für ideen-artige rules → rejected + idea
+//   3) optional `aggressive`: auch active cc-rules → ideas (war approve war
+//      irrtum; user bestätigt via dialog vorher)
+app.post("/api/projects/:id/rules/cleanup", authMw, (req, res) => {
+  const project = state.projects.find(p => p.id === req.params.id);
+  if (!project) return res.status(404).json({ error: "projekt nicht gefunden" });
+  if (!_requireProjectAccess(req, res, project, ROLES.OWNER)) return;
+  const aggressive = !!(req.body && req.body.aggressive);
+  const before = (project.rules || []).length;
+  const beforeDiffs = ((project.ruleDiffs || []).filter(d => d.status === "pending")).length;
+
+  const movedToIdea = [];
+  const kept = [];
+  for (const r of (project.rules || [])) {
+    const kind = classifyRuleOrIdea(r.text || "");
+    const isCc = r.suggestedBy === "cloud-code";
+    const move = kind === "idea" && isCc && (r.active === false || aggressive);
+    if (move) movedToIdea.push(r);
+    else kept.push(r);
+  }
+
+  // Pending rule_diffs: bei ideen-artigen referenz-rules → reject + zu idea
+  const diffsKept = [];
+  let rejectedDiffs = 0;
+  for (const d of (project.ruleDiffs || [])) {
+    if (d.status !== "pending") { diffsKept.push(d); continue; }
+    const kind = classifyRuleOrIdea(d.text || "");
+    if (kind === "idea") {
+      diffsKept.push({ ...d, status: "rejected" });
+      // Auch zu idea machen
+      movedToIdea.push({ text: d.text, suggestedBy: "cloud-code" });
+      rejectedDiffs++;
+    } else {
+      diffsKept.push(d);
+    }
+  }
+
+  // FIX #10: bei aggressive auch active-rules zu removedRules (tombstone)
+  // pushen, damit rückgängig möglich + audit-trail in state existiert.
+  // Default (active=false only) ist sowieso harmlos da diese rules nie
+  // vom user genehmigt wurden.
+  let removedRulesTomb = project.removedRules ? [...project.removedRules] : [];
+  if (aggressive) {
+    const cleanupTs = NOW();
+    for (const r of movedToIdea) {
+      // Nur active-rules ins tombstone (sind die wo data-loss-risiko da ist)
+      const wasActive = (project.rules || []).some(x => x.id === r.id && x.active === true);
+      if (wasActive && r.text) {
+        removedRulesTomb.unshift({
+          text: r.text, ts: cleanupTs,
+          reason: "cleanup-aggressive",
+          category: r.category || null,
+        });
+      }
+    }
+    removedRulesTomb = removedRulesTomb.slice(0, 50);
+  }
+
+  // State mutieren: ideen anhängen (dedup), rules ersetzen, rule_diffs ersetzen
+  const ideaTexts = new Set((project.ideas || []).map(i => (i.text || "").trim().toLowerCase()));
+  let addedIdeas = 0;
+  for (const r of movedToIdea) {
+    const txt = (r.text || "").trim();
+    if (!txt || ideaTexts.has(txt.toLowerCase())) continue;
+    ideaTexts.add(txt.toLowerCase());
+    applyMutation("ADD_IDEA", { projectId: project.id, idea: {
+      text: txt, status: "unprocessed", source: "cloud-code", createdAt: NOW(),
+    }});
+    addedIdeas++;
+  }
+  applyMutation("PATCH_PROJECT", { projectId: project.id,
+    patch: { rules: kept, ruleDiffs: diffsKept, removedRules: removedRulesTomb } });
+  applyMutation("ADD_ACTIVITY", { projectId: project.id, event: {
+    type: "rule",
+    text: `regel-cleanup${aggressive ? " (aggressive)" : ""}: ${movedToIdea.length - rejectedDiffs} task-artige cc-regeln + ${rejectedDiffs} pending-diffs → ideen (${addedIdeas} neu)`,
+  }});
+  applyMutation("ADD_SYNC_LOG", { entry: {
+    source: "system", projectId: project.id,
+    text: `regel-cleanup ausgeführt · rules ${before}→${kept.length} · ${addedIdeas} ideen erzeugt${aggressive ? " (aggressive, rückgängig via removedRules)" : ""}`,
+  }});
+  broadcastState();
+  res.json({
+    ok: true, projectId: project.id, aggressive,
+    rulesBefore: before, rulesAfter: kept.length,
+    diffsBefore: beforeDiffs, diffsRejected: rejectedDiffs,
+    movedToIdea: movedToIdea.length, addedAsNewIdea: addedIdeas,
+    // Genaue texte zurückgeben — UI kann „rückgängig" anzeigen
+    movedTexts: movedToIdea.map(r => r.text).slice(0, 50),
+  });
 });
 
 // AI-Summarize: kürzt eine lange beschreibung auf max ~120 chars (eine zeile).
@@ -2424,11 +3717,7 @@ app.post("/api/cc/summarize", authMw, async (req, res) => {
 // Kein projekt-bezug, läuft als ein-shot read-only claude-call.
 function _spawnClaudeOneShot(prompt) {
   const cwd = process.cwd();
-  const claudeBin = (function () {
-    if (process.platform !== "win32") return "claude";
-    const p = path.join(process.env.APPDATA || "", "npm", "claude.cmd");
-    return fs.existsSync(p) ? p : "claude.cmd";
-  })();
+  const claudeBin = resolveClaudeBinary();
   const args = [
     "--print",
     "--permission-mode", "bypassPermissions",
@@ -2564,27 +3853,65 @@ app.post("/api/cc/bughunt", authMw, async (req, res) => {
 // publicState: pair-sessions sehen alles (legacy); user-sessions nur projekte,
 // in denen sie member sind. `session` undefined = full state (z.b. internes
 // logging, autopump). Verwendet pure-helper aus lib/project_access.
+// Cache für path-existenz-checks: fs.existsSync auf jedem broadcast wäre
+// teuer (lots of syscalls). 10s TTL ist genug — pfad-änderungen sind selten.
+const _pathValidCache = new Map(); // projectId -> { valid, checkedAt }
+function projectPathValid(project) {
+  if (!project || !project.path) return false;
+  const cached = _pathValidCache.get(project.id);
+  const now = NOW();
+  if (cached && now - cached.checkedAt < 10_000) return cached.valid;
+  let valid = false;
+  try { valid = fs.existsSync(project.path); } catch (_) { valid = false; }
+  _pathValidCache.set(project.id, { valid, checkedAt: now });
+  return valid;
+}
+
+// Boot-ts: bei jedem server-start neu. Clients merken sich den ts und
+// vergleichen mit dem neuen. Wenn neuer (= server wurde neu gestartet,
+// vermutlich via update.bat), zeigen wir banner "neue version — F5".
+// Keine force-reload, damit user-drafts (chat-eingabe, task-titel im
+// editor) erhalten bleiben.
+const SERVER_BOOT_TS = NOW();
+
 function publicState(session) {
-  if (!session || !memberships) return state;
-  return filterStateForSession(state, session, memberships);
+  const base = (!session || !memberships)
+    ? state
+    : filterStateForSession(state, session, memberships);
+  // Annotate jedes projekt mit pathValid — desktop+mobile UI können warnen
+  // wenn der pfad fehlt oder auf diesem rechner nicht existiert (cross-network
+  // collab-szenario).
+  return {
+    ...base,
+    projects: (base.projects || []).map(p => ({ ...p, pathValid: projectPathValid(p) })),
+    // Transient: auto-pump-pause-flag. Wenn _ccApiLimitedUntil in der zukunft
+    // liegt, war kurz vorher ein API-limit. UI zeigt warnung + resume-button.
+    ccApiLimitedUntil: _ccApiLimitedUntil > NOW() ? _ccApiLimitedUntil : 0,
+    serverBootTs: SERVER_BOOT_TS,
+  };
 }
 
 // ─── Vorschläge + Bug-Hunt (claude-Analyse-Pässe) ──────────
-function _spawnClaudeReadOnly(project, prompt) {
-  const cwd = project.path && fs.existsSync(project.path) ? project.path : process.cwd();
-  const claudeBin = (function () {
-    if (process.platform !== "win32") return "claude";
-    const p = path.join(process.env.APPDATA || "", "npm", "claude.cmd");
-    return fs.existsSync(p) ? p : "claude.cmd";
-  })();
+function _spawnClaudeReadOnly(project, prompt, opts) {
+  // Bug-fix: kein silent fallback auf process.cwd() (sync-server/) — sonst
+  // analysiert cc den server statt das echte projekt. Wenn pfad fehlt:
+  // leer zurück (caller behandelt "" als no-result), kein fake-run.
+  if (!project.path || !fs.existsSync(project.path)) {
+    console.log("[cc-readonly] skip: project.path fehlt/invalid für " + project.name + " (" + JSON.stringify(project.path) + ")");
+    return Promise.resolve("");
+  }
+  const cwd = project.path;
+  const claudeBin = resolveClaudeBinary();
   const mcpConfigPath = resolveMcpConfig({ baseDir: __dirname });
+  // Token-spar: caller darf budget runtersetzen (z.B. decompose nur 0.20$).
+  const budget = (opts && typeof opts.maxBudgetUsd === "number") ? String(opts.maxBudgetUsd) : "1.0";
   const args = [
     "--print",
     "--permission-mode", "bypassPermissions",
     "--dangerously-skip-permissions",
     "--tools", "default",
     "--add-dir", cwd,
-    "--max-budget-usd", "1.0",
+    "--max-budget-usd", budget,
   ];
   if (mcpConfigPath) args.push("--mcp-config", mcpConfigPath);
 
@@ -2605,6 +3932,61 @@ function _spawnClaudeReadOnly(project, prompt) {
     proc.stdin.write(prompt);
     proc.stdin.end();
   });
+}
+
+// Task 6 · Dekomposition: ein epic-task → 3-8 subtasks vorab anlegen.
+// Token-spar-design: ein einziger readonly-call, kurzer prompt, output cap.
+// User-getriggert (decompose-button), läuft nicht automatisch.
+async function runTaskDecompose(project, task) {
+  const projectId = project.id;
+  if ((task.subtasks || []).length >= 3) {
+    applyMutation("ADD_ACTIVITY", { projectId, event: {
+      type: "info", text: `dekompose übersprungen — task hat schon ${task.subtasks.length} subtasks`,
+    }});
+    broadcastState();
+    return;
+  }
+  applyMutation("ADD_ACTIVITY", { projectId, event: {
+    type: "info", text: `dekompose startet: <i>${escapeHtml(task.title)}</i>`,
+  }});
+  broadcastState();
+
+  const activeRules = (project.rules || []).filter(r => r.active).slice(0, 8).map(r => "- " + r.text);
+  const prompt = [
+    "Zerlege diese aufgabe in 3-8 konkrete, umsetzbare unterschritte.",
+    "Projekt: " + project.name + " (" + project.tech + ").",
+    "Aktive regeln (auswahl):\n" + activeRules.join("\n"),
+    "",
+    "AUFGABE: " + task.title + (task.meta ? "\nMeta: " + task.meta : ""),
+    "",
+    "Antworte NUR mit dem JSON-block (keine erklärung davor/danach):",
+    "<<<SUBTASKS",
+    '["1. Konkreter schritt", "2. Nächster schritt", "..."]',
+    ">>>",
+  ].join("\n");
+
+  const out = await _spawnClaudeReadOnly(project, prompt, { maxBudgetUsd: 0.2 });
+  const m = out.match(/<<<SUBTASKS\s*([\s\S]*?)\s*>>>/);
+  let count = 0;
+  if (m) {
+    try {
+      const list = JSON.parse(m[1].trim());
+      if (Array.isArray(list)) {
+        for (const raw of list.slice(0, 8)) {
+          const clean = String(raw).replace(/^\s*\d+[.)]\s*/, "").trim();
+          if (!clean) continue;
+          applyMutation("ADD_SUBTASK", { projectId, taskId: task.id,
+            subtask: { title: clean.slice(0, 200), done: false } });
+          count++;
+        }
+      }
+    } catch (e) { console.log("[decompose] parse fail:", e.message); }
+  }
+  applyMutation("ADD_ACTIVITY", { projectId, event: {
+    type: count > 0 ? "check" : "warn",
+    text: `dekompose fertig · ${count} subtasks erzeugt`,
+  }});
+  broadcastState();
 }
 
 async function runSuggestionAnalysis(project) {
@@ -2656,8 +4038,101 @@ async function runSuggestionAnalysis(project) {
   broadcastState();
 }
 
+// Goal-based planning: nimmt project.goals → fragt cc nach einer roadmap
+// (3-5 milestones × je 3-5 tasks). Tasks landen als group="next" mit
+// "milestone:<name>" im meta-feld. Spart dem user manuelles task-brainstorm.
+//
+// (master-spec item: "Goal-Based Planning · idea → roadmap → milestones →
+// tasks vollautomatisch")
+async function runAutoPlanFromGoals(project) {
+  const projectId = project.id;
+  if (!project.goals || project.goals.length === 0) {
+    applyMutation("ADD_ACTIVITY", { projectId, event: {
+      type: "warn",
+      text: "auto-plan abgebrochen: keine projektziele gesetzt — bitte erst ziele in den projekt-einstellungen pflegen",
+    }});
+    broadcastState();
+    return { ok: false, error: "keine ziele" };
+  }
+  applyMutation("ADD_ACTIVITY", { projectId, event: {
+    type: "info", text: `auto-plan gestartet (${project.goals.length} ziele) …`,
+  }});
+  broadcastState();
+
+  const existingTitles = new Set((project.tasks || []).map(t => (t.title || "").toLowerCase().trim()));
+
+  const prompt = [
+    "PROJEKT-ROADMAP-PLANUNG für: " + project.name + " (" + project.tech + ").",
+    "",
+    "PROJEKTZIELE:",
+    ...project.goals.map((g, i) => `${i+1}. ${g}`),
+    "",
+    "Zerlege diese ziele in eine umsetzbare roadmap mit 3-5 milestones,",
+    "jedes milestone mit 3-5 konkreten tasks (max 15 tasks gesamt).",
+    "",
+    "Regeln:",
+    "- tasks sind konkret + umsetzbar in 1-4 stunden (kein 'projekt fertig bauen').",
+    "- keine doppelten oder bereits vorhandenen tasks (titel-überlapping).",
+    "- priorität 5=must-have, 3=should, 1=nice. Default 3.",
+    "- meta: kurz erklären warum dieser task wichtig ist (max 80 zeichen).",
+    "",
+    "Antworte NUR mit dem JSON-Block (keine erklärung davor/danach):",
+    "<<<PLAN",
+    '{"milestones":[{"name":"M1 …","tasks":[{"title":"...","meta":"...","priority":3}]}]}',
+    ">>>",
+  ].join("\n");
+
+  const out = await _spawnClaudeReadOnly(project, prompt, { maxBudgetUsd: 0.5 });
+  const m = out.match(/<<<PLAN\s*([\s\S]*?)\s*>>>/);
+  if (!m) {
+    applyMutation("ADD_ACTIVITY", { projectId, event: {
+      type: "warn", text: "auto-plan: claude hat kein gültiges JSON geliefert",
+    }});
+    broadcastState();
+    return { ok: false, error: "no JSON" };
+  }
+  let plan;
+  try { plan = JSON.parse(m[1].trim()); }
+  catch (e) {
+    applyMutation("ADD_ACTIVITY", { projectId, event: {
+      type: "warn", text: "auto-plan: JSON parse fehler: " + e.message,
+    }});
+    broadcastState();
+    return { ok: false, error: e.message };
+  }
+  const milestones = Array.isArray(plan.milestones) ? plan.milestones : [];
+  let created = 0;
+  let skipped = 0;
+  for (const ms of milestones) {
+    if (!ms || !Array.isArray(ms.tasks)) continue;
+    const msName = String(ms.name || "milestone").slice(0, 60);
+    for (const t of ms.tasks) {
+      if (!t || !t.title) continue;
+      const title = String(t.title).slice(0, 200).trim();
+      const key = title.toLowerCase().trim();
+      if (existingTitles.has(key)) { skipped++; continue; }
+      existingTitles.add(key);
+      const priority = Math.max(1, Math.min(5, Number(t.priority) || 3));
+      const meta = (t.meta ? String(t.meta).slice(0, 80) + " · " : "") + msName;
+      applyMutation("ADD_TASK", { projectId, task: {
+        title, meta, priority, group: "next", done: false, subtasks: [],
+      }});
+      created++;
+    }
+  }
+  applyMutation("ADD_ACTIVITY", { projectId, event: {
+    type: created > 0 ? "check" : "warn",
+    text: `auto-plan fertig · ${created} tasks erzeugt` + (skipped ? ` · ${skipped} duplikate übersprungen` : ""),
+  }});
+  broadcastState();
+  return { ok: true, created, skipped, milestones: milestones.length };
+}
+
 async function runBugHunt(project) {
   const projectId = project.id;
+  // Mark scan-start, damit der auto-hunt-watchdog nicht parallel doppelt
+  // einen scan startet während dieser noch läuft.
+  applyMutation("PATCH_PROJECT", { projectId, patch: { lastBugHuntAt: NOW(), bugHuntRunning: true } });
   applyMutation("ADD_ACTIVITY", { projectId, event: { type: "info", text: "bug-hunt gestartet…" }});
   broadcastState();
 
@@ -2735,12 +4210,38 @@ async function runBugHunt(project) {
     if (opened) {
       applyMutation("ADD_ACTIVITY", { projectId, event: {
         type: "info",
-        text: `auto-fix: ${opened} bug-tasks angelegt`,
+        text: `auto-fix: ${opened} bug-tasks angelegt — cloud-code arbeitet sie automatisch ab`,
       }});
     }
   }
+  // Run komplett, hunt-flag zurücksetzen damit auto-scan den nächsten cycle macht.
+  applyMutation("PATCH_PROJECT", { projectId, patch: { bugHuntRunning: false } });
   broadcastState();
 }
+
+// Auto-Bug-Hunt-Watchdog: scannt projekte mit bugAutoFix=on periodisch,
+// damit der user nicht jedes mal manuell '🐞 hunt' klicken muss.
+// Intervall 30min, skipped wenn bugHuntRunning oder cc gerade busy ist
+// auf diesem projekt.
+const BUG_AUTOSCAN_INTERVAL_MS = 30 * 60 * 1000; // 30min zwischen scans
+setInterval(() => {
+  if (!state.ccRunning) return; // cc paused → nicht autoscanen
+  if (NOW() < _ccApiLimitedUntil) return; // api-limit aktiv
+  const now = NOW();
+  for (const project of state.projects) {
+    if (!project.bugAutoFix) continue;
+    if (project.bugHuntRunning) continue; // bereits am scannen
+    if (_isProjectBusy(project.id)) continue; // cc arbeitet gerade
+    if (!project.path || !fs.existsSync(project.path)) continue;
+    const last = project.lastBugHuntAt || 0;
+    if (now - last < BUG_AUTOSCAN_INTERVAL_MS) continue;
+    console.log("[auto-bughunt] starte für", project.name, "(letzter scan:", last ? new Date(last).toLocaleString() : "nie", ")");
+    runBugHunt(project).catch(e => {
+      console.log("[auto-bughunt] error:", e.message);
+      applyMutation("PATCH_PROJECT", { projectId: project.id, patch: { bugHuntRunning: false } });
+    });
+  }
+}, 5 * 60 * 1000); // alle 5min checken, gescant wird aber nur alle 30min
 
 // ─── Self-Review ────────────────────────────────────────────
 // Zweiter claude-Pass: lässt den eigenen Output kritisch prüfen. Liefert
@@ -2750,12 +4251,14 @@ async function runSelfReview(project, taskId, taskStatus, originalOutput) {
   const task = project.tasks.find(t => t.id === taskId);
   if (!task) return { ok: true, issues: [], confidence: 0.5 };
 
-  const cwd = project.path && fs.existsSync(project.path) ? project.path : process.cwd();
-  const claudeBin = (function () {
-    if (process.platform !== "win32") return "claude";
-    const p = path.join(process.env.APPDATA || "", "npm", "claude.cmd");
-    return fs.existsSync(p) ? p : "claude.cmd";
-  })();
+  // Bug-fix: kein silent fallback auf sync-server/. Wenn der projekt-pfad
+  // weg ist, ist review eh sinnlos (keine files zum nachlesen) → fail-open.
+  if (!project.path || !fs.existsSync(project.path)) {
+    console.log("[review] skip: project.path fehlt/invalid für " + project.name);
+    return { ok: true, issues: [], confidence: 0.5 };
+  }
+  const cwd = project.path;
+  const claudeBin = resolveClaudeBinary();
 
   const filesChanged = (taskStatus.filesChanged || []).slice(0, 10);
   const reviewPrompt = [
@@ -3003,6 +4506,13 @@ wss.on("connection", (ws, req) => {
   ws.on("message", (raw) => {
     try {
       const msg = JSON.parse(raw.toString());
+      // Bug-fix: jede WS-nachricht muss lastSeen der pair-session bumpen,
+      // sonst zeigt das device-panel "offline" obwohl die WS-verbindung
+      // lebendig pingt. Pair-sessions liegen in der sessions-map und werden
+      // sonst nur durch HTTP-requests aktualisiert (nicht durch WS).
+      if (ws._token && sessions.has(ws._token)) {
+        sessions.get(ws._token).lastSeen = NOW();
+      }
       if (msg.type === "PING") {
         ws.send(JSON.stringify({ type: "PONG", ts: NOW() }));
         return;
@@ -3040,9 +4550,13 @@ wss.on("connection", (ws, req) => {
           return;
         }
         applyMutation(msg.mutation.type, msg.mutation.payload, { session: liveSess });
-        // ADD_PROJECT via WS: anlegenden user als owner setzen
+        // ADD_PROJECT via WS: anlegenden user als owner setzen.
+        // Bugfix: state.projects[length-1] war fragil — bei parallelen ADD_PROJECT
+        // (oder künftigem async-refactor) könnte ein anderes projekt erwischt
+        // werden. MUT.ADD_PROJECT pusht dieselbe object-ref aus payload.project
+        // und setzt id inline → direkter payload-zugriff ist eindeutig.
         if (msg.mutation.type === "ADD_PROJECT" && liveSess.userId && memberships) {
-          const created = state.projects[state.projects.length - 1];
+          const created = msg.mutation.payload && msg.mutation.payload.project;
           if (created && created.id) {
             try {
               memberships.addMember({
@@ -3097,7 +4611,15 @@ function broadcastForProject(msg, projectId) {
 // Pro-client gefilterter STATE-broadcast. Pair-clients bekommen full state,
 // user-clients nur projekte, in denen sie member sind. Wird statt
 // `broadcast({type:"STATE",state:publicState()})` aufgerufen.
-function broadcastState() {
+// Fix A · broadcastState 50ms-debounce + coalesce:
+// Bei cc-runs werden ~50 broadcastState() pro stream-job ausgelöst.
+// Mit debounce wird daraus EIN broadcast pro 50ms-fenster → 10-20× weniger
+// WS-traffic + react/flutter-renders. Final-events sind sync (immediate)
+// damit der user kein lag bei task-completion fühlt.
+let _broadcastTimer = null;
+let _broadcastQueued = false;
+function _doBroadcastState() {
+  _broadcastQueued = false;
   for (const client of wss.clients) {
     if (client.readyState !== 1) continue;
     try {
@@ -3106,6 +4628,20 @@ function broadcastState() {
       }));
     } catch (_) {}
   }
+}
+function broadcastState(opts) {
+  // opts.immediate: für final-events (task-complete, login etc.) ohne lag
+  if (opts && opts.immediate) {
+    if (_broadcastTimer) { clearTimeout(_broadcastTimer); _broadcastTimer = null; }
+    _doBroadcastState();
+    return;
+  }
+  _broadcastQueued = true;
+  if (_broadcastTimer) return; // schon im flight
+  _broadcastTimer = setTimeout(() => {
+    _broadcastTimer = null;
+    if (_broadcastQueued) _doBroadcastState();
+  }, 50);
 }
 
 // ─── Boot ──────────────────────────────────────────────────

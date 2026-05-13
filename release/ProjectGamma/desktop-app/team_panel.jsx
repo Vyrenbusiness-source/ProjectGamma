@@ -31,17 +31,84 @@
 
   function ChatSection({ project, sync, myEmail }) {
     const [draft, setDraft] = useState("");
+    const [uploading, setUploading] = useState(false);
+    const [pendingAttachment, setPendingAttachment] = useState(null); // { fileId, name, kind, url }
+    const [error, setError] = useState(null);
+    const [authedEmail, setAuthedEmail] = useState(null);
     const messages = project.messages || [];
     const listRef = useRef(null);
+    const fileInputRef = useRef(null);
     useEffect(() => {
       if (listRef.current) listRef.current.scrollTop = listRef.current.scrollHeight;
     }, [messages.length]);
+    // Bug-fix: sync.deviceName kann pair-token "desktop" sein während posts
+    // via account-login mit email gemacht wurden — match-failure → alles links.
+    useEffect(() => {
+      let cancelled = false;
+      sync.getMe?.().then(m => {
+        if (!cancelled && m && m.user && m.user.email) setAuthedEmail(m.user.email);
+      }).catch(() => {});
+      return () => { cancelled = true; };
+    }, []);
+    const effectiveMyEmail = authedEmail || myEmail;
 
     const send = () => {
       const t = draft.trim();
-      if (!t) return;
-      sync.mutate("ADD_MESSAGE", { projectId: project.id, message: { text: t } });
+      // Nachricht braucht text ODER attachment
+      if (!t && !pendingAttachment) return;
+      const message = { text: t };
+      if (pendingAttachment) message.attachment = pendingAttachment;
+      sync.mutate("ADD_MESSAGE", { projectId: project.id, message });
       setDraft("");
+      setPendingAttachment(null);
+      setError(null);
+    };
+
+    const onPickFile = () => {
+      if (fileInputRef.current) fileInputRef.current.click();
+    };
+    const onFileSelected = async (e) => {
+      const file = e.target.files && e.target.files[0];
+      e.target.value = ""; // reset für re-pick selber datei
+      if (!file) return;
+      // 8 MB cap (gleicher cap wie server)
+      if (file.size > 8 * 1024 * 1024) {
+        setError("datei zu groß (max 8 MB)");
+        return;
+      }
+      setUploading(true); setError(null);
+      try {
+        const buf = await file.arrayBuffer();
+        // base64 encode — chunkweise um stack-overflow bei großen files zu vermeiden
+        const bytes = new Uint8Array(buf);
+        let bin = "";
+        const CHUNK = 0x8000;
+        for (let i = 0; i < bytes.length; i += CHUNK) {
+          bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+        }
+        const base64 = btoa(bin);
+        const r = await fetch(sync.serverUrl + "/api/projects/" + encodeURIComponent(project.id) + "/attachments", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "authorization": "Bearer " + sync.token,
+          },
+          body: JSON.stringify({
+            name: file.name,
+            contentType: file.type || "application/octet-stream",
+            base64,
+          }),
+        });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(data.error || ("upload fehler " + r.status));
+        setPendingAttachment({
+          fileId: data.fileId, name: data.name, kind: data.kind, url: data.url,
+        });
+      } catch (e) {
+        setError(e.message || "upload fehlgeschlagen");
+      } finally {
+        setUploading(false);
+      }
     };
 
     return (
@@ -58,7 +125,9 @@
               noch keine nachrichten. schreib was, deine team-mitglieder sehen es live.
             </div>
           ) : messages.map(m => {
-            const isOwn = myEmail && authorLabel(m) === myEmail;
+            const lbl = authorLabel(m);
+            const isOwn = !!((effectiveMyEmail && lbl === effectiveMyEmail) ||
+                            (myEmail && lbl === myEmail));
             return (
               <div key={m.id} style={{
                 marginBottom: 8,
@@ -111,15 +180,44 @@
             );
           })}
         </div>
+        {pendingAttachment && (
+          <div style={{
+            marginBottom: 6, padding: 8,
+            border: "1.5px dashed var(--ink)", borderRadius: 6,
+            display: "flex", alignItems: "center", gap: 8,
+            fontSize: 12, background: "rgba(0,0,0,0.03)",
+          }}>
+            <span>{pendingAttachment.kind === "image" ? "🖼" : "📎"}</span>
+            <span style={{ flex: 1, fontFamily: "monospace", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              {pendingAttachment.name}
+            </span>
+            <button className="btn tiny" onClick={() => setPendingAttachment(null)}>entfernen</button>
+          </div>
+        )}
+        {error && (
+          <div style={{
+            marginBottom: 6, padding: 6, fontSize: 11.5,
+            color: "var(--danger, #c33)",
+            border: "1.5px solid var(--danger, #c33)", borderRadius: 6,
+          }}>⚠ {error}</div>
+        )}
+        <input ref={fileInputRef} type="file" style={{ display: "none" }}
+          onChange={onFileSelected}
+          accept="image/*,application/pdf,application/zip,text/*,audio/*,video/*" />
         <div style={{ display: "flex", gap: 6 }}>
+          <button className="btn" onClick={onPickFile} disabled={uploading} title="anhang">
+            {uploading ? "…" : "📎"}
+          </button>
           <textarea className="input" placeholder="nachricht an team…"
             value={draft} onChange={(e) => setDraft(e.target.value)}
             onKeyDown={(e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) send(); }}
             rows={2} style={{ flex: 1 }} />
-          <button className="btn primary" disabled={!draft.trim()} onClick={send}>senden</button>
+          <button className="btn primary"
+            disabled={(!draft.trim() && !pendingAttachment) || uploading}
+            onClick={send}>senden</button>
         </div>
         <div style={{ fontSize: 10.5, color: "var(--ink-faint)", marginTop: 4 }}>
-          ⌘/Strg+Enter = senden
+          ⌘/Strg+Enter = senden · 📎 anhang (max 8 MB)
         </div>
       </div>
     );
@@ -310,7 +408,7 @@
     if (!project) return null;
     return (
       <div>
-        <ChatSection project={project} sync={sync} />
+        <ChatSection project={project} sync={sync} myEmail={myEmail} />
         <NotesSection project={project} sync={sync} />
         <AppointmentsSection project={project} sync={sync} myEmail={myEmail} />
       </div>

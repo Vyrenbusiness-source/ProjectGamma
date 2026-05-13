@@ -13,18 +13,20 @@
 <body>
   <div id="root"></div>
 
-  <script src="https://unpkg.com/react@18.3.1/umd/react.development.js" crossorigin></script>
-  <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" crossorigin></script>
+  <script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js" crossorigin></script>
   <script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js"></script>
 
   <script src="https://unpkg.com/qrcode-generator@1.4.4/qrcode.js"></script>
   <script src="notifications_inbox.js"></script>
   <script src="offline_queue.js"></script>
   <script src="heartbeat.js"></script>
+  <script src="parse_http_response.js"></script>
   <script src="sync-client.js"></script>
   <script src="pair_qr.js"></script>
   <script src="rule_diffs_view_helpers.js"></script>
   <script src="conflict_view_helpers.js"></script>
+  <script src="conflict_diff.js"></script>
   <script src="device_view_helpers.js"></script>
   <script src="swipe_undo.js"></script>
   <script src="ai_suggest_task.js"></script>
@@ -40,6 +42,7 @@
   <script type="text/babel" src="project_settings_modal.jsx"></script>
   <script type="text/babel" src="team_panel.jsx"></script>
   <script type="text/babel" src="more_menu.jsx"></script>
+  <script type="text/babel" src="setup_banner.jsx"></script>
   <script type="text/babel" src="app.jsx"></script>
 </body>
 </html>

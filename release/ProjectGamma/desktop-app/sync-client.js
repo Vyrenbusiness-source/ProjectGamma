@@ -40,6 +40,8 @@ class SyncClient {
     this.listeners   = new Set();
     this.ccStatus    = {}; // projectId -> { state, ... }
     this.ccOutput    = {}; // projectId -> string (last cc output)
+    this.ccToolEvents = {}; // projectId -> array (last ~50 tool-uses für UI-history)
+    this.ccThinkingText = {}; // projectId -> letzte 200 char thinking snippet
     this._reconnectAttempt = 0;
     this._heartbeat  = null;
     this._reconnectTimer = null;
@@ -77,14 +79,11 @@ class SyncClient {
       body: body ? JSON.stringify(body) : undefined,
     });
     const text = await res.text();
-    let data;
-    try { data = text ? JSON.parse(text) : {}; } catch (e) { data = { raw: text }; }
-    if (!res.ok) {
-      const err = new Error(data.error || ("http " + res.status));
-      err.status = res.status; err.data = data;
-      throw err;
-    }
-    return data;
+    // parseHttpResponse wirft bei !ok ODER bei nicht-JSON body — beides mit
+    // klarem err.message + err.status. Frühere version hat parse-fehler in
+    // ein stilles {raw: text} verwandelt; das UI bekam dann ein objekt mit
+    // unbekanntem feld statt einer echten fehlermeldung.
+    return window.parseHttpResponse({ text, status: res.status, ok: res.ok });
   }
 
   /// Desktop-Self-Init (lokal, ohne Code) — bekommt Token zurück.
@@ -203,8 +202,27 @@ class SyncClient {
         break;
       case "CC_OUTPUT":
         this.ccOutput[msg.projectId] = (this.ccOutput[msg.projectId] || "") + (msg.chunk || "");
-        this._emit();
         break;
+      case "CC_TOOL_EVENT": {
+        // Live-tool-events: pro projekt eine list of {id, tool, glyph, summary, state, ts}
+        const arr = this.ccToolEvents[msg.projectId] || (this.ccToolEvents[msg.projectId] = []);
+        let mutated = false;
+        if (msg.phase === "use") {
+          arr.push({ id: msg.id, tool: msg.tool, glyph: msg.glyph,
+                     summary: msg.summary || "", state: "running", ts: msg.ts });
+          if (arr.length > 50) arr.shift();
+          mutated = true;
+        } else if (msg.phase === "result") {
+          const e = arr.find(x => x.id === msg.id);
+          if (e) { e.state = msg.isError ? "error" : "ok"; e.brief = msg.brief; mutated = true; }
+        }
+        if (mutated) this._emit();
+        return;
+      }
+      case "CC_THINKING_TEXT":
+        this.ccThinkingText[msg.projectId] = msg.text || "";
+        this._emit();
+        return;
       case "ERROR":
         this.lastError = msg.error;
         this._emit();
