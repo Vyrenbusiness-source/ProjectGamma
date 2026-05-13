@@ -2774,6 +2774,21 @@ function _startCcJob(project, taskId, prompt) {
     "- wenn 60s vergangen sind ohne dass die file geschrieben ist:",
     "  STOP, schreibe sie jetzt, dann TASK_STATUS — du bist abgedriftet.",
     "",
+    "🚨 NIEMALS nur einen plan abgeben als ergebnis:",
+    "- wenn der task ein WRITE-verb hat (aufsetzen, anlegen, erstellen,",
+    "  initialisieren, implementieren, scaffold, bootstrap, ...) → du MUSST",
+    "  files schreiben. KEIN 'Empfehlung', KEIN 'sinnvolle nächste schritte',",
+    "  KEIN markdown-bullet-list als output. SCHREIB DEN CODE.",
+    "- task zu groß für einen run? → mach den KLEINSTMÖGLICHEN ersten schritt:",
+    "  z.B. nur package.json + leeres lib/main.dart + tests-skeleton. NICHT alles",
+    "  auf einmal — aber WAS DU TUST schreibst du als ECHTE files. Der nächste",
+    "  cc-run macht weiter. niemals 'plan only'.",
+    "- TASK_STATUS done=true MIT filesChanged=[] bei einem write-task = AUTOMATISCH",
+    "  FAIL, server retried mit härterem prompt. spar dir die schleife: schreibe",
+    "  von anfang an files.",
+    "- leeres projekt-directory ist KEIN grund für 'plan only' — im gegenteil:",
+    "  da MUSST du die ersten files anlegen, sonst kommt nie was zustande.",
+    "",
     "🚫 HARTE VERBOTE (sofort done=false + summary 'verboten: ...'):",
     "- `git commit`, `git push`, `git tag`, `git rebase`, `git reset --hard`,",
     "  `git checkout -- <file>`, `git stash` — der SERVER commitet selber nach",
@@ -3250,7 +3265,7 @@ function _startCcJob(project, taskId, prompt) {
         // done obwohl die geforderte datei nie geschrieben wurde.
         const tnPre = state.projects.find(p => p.id === projectId)?.tasks.find(t => t.id === taskId);
         const taskText = ((tnPre?.title || "") + " " + (tnPre?.description || "")).toLowerCase();
-        const requiresWrite = /\b(erstelle|erstellen|schreibe|schreib|schreiben|lege an|anlegen|generiere|generieren|create|write|implement|implementiere|implementieren|baue|bauen|hinzuf[uü]gen|hinzuf[uü]ge|add )\b/.test(taskText);
+        const requiresWrite = /(erstelle|erstellen|schreibe|schreib|schreiben|lege an|anlegen|generiere|generieren|create|write|implement|implementiere|implementieren|baue|bauen|hinzuf[uü]gen|hinzuf[uü]ge|add |aufsetzen|aufsetz|initialisieren|initialisier|scaffold|bootstrap|setup |migrate|migration|portiere|portieren|refactor|refaktor|fixe|fix |entwerfen|entwurf|skeleton|gerüst|baseline|endpoint|endpoints|dokumentier|dokumentation|dokumentieren|flow|crud|api-|api |module|modul )/i.test(taskText);
         if (requiresWrite) {
           applyMutation("ADD_ACTIVITY", { projectId, event: {
             type: "warn",
