@@ -69,6 +69,7 @@ const TLS_INFO = bootstrapTls({ enabled: TLS_ENABLED, dir: TLS_DIR });
 const STORE_FILE = path.join(__dirname, "store.json");
 const STORE_DB_FILE = path.join(__dirname, "store.sqlite");
 const { createSqliteStore } = require("./lib/sqlite_store");
+const { createIdleTracker } = require("./lib/idle_tracker");
 const PAIRING_TTL_MS = 10 * 60 * 1000;
 const TOKEN_TTL_MS = 30 * 24 * 3600 * 1000;
 
@@ -403,6 +404,12 @@ function _isProjectBusy(projectId) {
 function _triggerAutoPumpNow() {
   setTimeout(() => { autoPumpTick().catch(() => {}); }, 50);
 }
+
+// Idle-tracker für user-clients: mobile meldet idle wenn screen-off > 5min,
+// desktop wenn lock/idle-event. Wenn alle bekannten clients idle melden,
+// triggern wir sofort autopump (statt 25s-tick zu warten) — der user ist
+// gerade nicht aktiv, also können wir die zeit für cc-jobs nutzen.
+const idleTracker = createIdleTracker({ onAllIdle: _triggerAutoPumpNow });
 
 // Failure-loop state: pro task tracken wir wie oft cc retried hat + den
 // letzten fehler-output, damit der retry-prompt gezielt fixen kann statt
@@ -2220,12 +2227,26 @@ app.get("/api/updates/apk/download", authMw, (req, res) => {
 
 app.post("/api/logout", authMw, (req, res) => {
   sessions.delete(req.token);
+  idleTracker.removeSession(req.token);
   persistSessions();
   // Trenne ggf. offene WS für diesen Token
   for (const c of wss.clients) {
     if (c._token === req.token) try { c.close(); } catch (e) {}
   }
   res.json({ ok: true });
+});
+
+// Idle-status melden. Body: { idle: boolean, since?: number (ms epoch) }.
+// Mobile clients schicken idle=true wenn screen >5min off war, desktop bei
+// lock/idle. allIdle-übergang triggert autopump sofort (siehe idleTracker).
+app.post("/api/idle", authMw, (req, res) => {
+  const { idle, since } = req.body || {};
+  if (typeof idle !== "boolean") {
+    return res.status(400).json({ error: "idle muss boolean sein" });
+  }
+  const safeSince = typeof since === "number" && since > 0 ? since : NOW();
+  idleTracker.setIdle(req.token, idle, safeSince);
+  res.json({ ok: true, allIdle: idleTracker.allIdle(), idleCount: idleTracker.idleCount() });
 });
 
 // Device entfernen (vom Desktop initiiert, betrifft anderen Token).
@@ -2238,6 +2259,7 @@ app.delete("/api/sessions/:token", authMw, (req, res) => {
 
   const target = sessions.get(targetToken);
   sessions.delete(targetToken);
+  idleTracker.removeSession(targetToken);
   persistSessions();
 
   // WebSocket des entfernten Geräts schließen → Phone merkt es und zeigt Pairing-Screen
