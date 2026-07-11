@@ -1,5 +1,7 @@
 # ProjectGamma
 
+[![DevConnect](https://devconnectplatform.com/api/badge/vyren)](https://devconnectplatform.com/u/vyren)
+
 A personal project manager that lets an autonomous Cloud-Code agent work
 inside your projects while you capture ideas on the go. Mobile, desktop
 and the agent stay in sync through a local relay server.
